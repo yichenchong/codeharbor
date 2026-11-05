@@ -207,11 +207,11 @@ interface TerminalInputChunk {
 }
 
 /**
- * Keep one input chunk in the WebChannel call path at a time. There is no
- * acknowledgement slot on the frozen JS -> C++ bridge, so a microtask between
- * chunks is the honest pacing point: it lets Chromium flush the current call
- * and lets a large paste yield to output/resize events without reordering the
- * bytes. The chunker, rather than this queue, owns sequence integrity.
+ * Send one input chunk per event-loop turn while a paste is queued. A microtask
+ * does not yield to WebChannel delivery, resize or paint: recursively scheduling
+ * microtasks drains the entire paste before any of those tasks can run. A timer
+ * gives them an opportunity between chunks without reordering the bytes. The
+ * first chunk of otherwise idle input is still sent immediately.
  *
  * Text and binary share this ONE queue, and that is the point of routing binary
  * through here at all rather than calling the bridge directly. A mouse report
@@ -225,6 +225,7 @@ export class TerminalInputWriter {
     private readonly maxBytes: number;
     private readonly backlog: TerminalInputChunk[] = [];
     private inFlight = false;
+    private scheduled = false;
     private closed = false;
     constructor(sink: TerminalInputSink, maxBytes = kTerminalInputChunkBytes) {
         if (!Number.isFinite(maxBytes) || !Number.isInteger(maxBytes) || maxBytes < 1) {
@@ -291,7 +292,7 @@ export class TerminalInputWriter {
     }
 
     private pump(): void {
-        if (this.closed || this.inFlight || this.backlog.length === 0) {
+        if (this.closed || this.inFlight || this.scheduled || this.backlog.length === 0) {
             return;
         }
         const chunk = this.backlog.shift();
@@ -316,10 +317,16 @@ export class TerminalInputWriter {
             throw error;
         } finally {
             this.inFlight = false;
-            // Do not spin retrying a failed bridge call in microtasks. The
-            // next write is the explicit opportunity to retry.
+            // Do not spin retrying a failed bridge call. The next write is the
+            // explicit opportunity to retry. While a successful drain is
+            // scheduled, new writes must join the queue instead of bypassing
+            // the event-loop yield.
             if (sent && this.backlog.length > 0 && !this.closed) {
-                queueMicrotask(() => this.pump());
+                this.scheduled = true;
+                setTimeout(() => {
+                    this.scheduled = false;
+                    this.pump();
+                }, 0);
             }
         }
     }

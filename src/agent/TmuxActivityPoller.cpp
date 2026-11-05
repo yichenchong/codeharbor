@@ -24,6 +24,7 @@ void TmuxActivityPoller::setRpcClient(CodeharbordClient* client)
     if (m_client == client)
         return;
     m_client = client;
+    ++m_clientGeneration;
     // The answer the previous client still owes us can never arrive for THIS
     // one, and its callback below refuses to touch the guard once the client
     // has moved on. Clearing it here is therefore the only thing that keeps a
@@ -82,19 +83,18 @@ void TmuxActivityPoller::pollNow()
 
     m_inFlight = true;
     QPointer<TmuxActivityPoller> self(this);
-    QPointer<CodeharbordClient> askedOf(m_client);
+    const quint64 clientGeneration = m_clientGeneration;
     m_client->call(QString::fromLatin1(rpc::kMethodPaneActivity),
                    QJsonObject{{QStringLiteral("devSessionIds"), ids}},
-                   [self, askedOf](QJsonValue result,
+                   [self, clientGeneration](QJsonValue result,
                                    std::optional<RpcError> error) {
                        if (!self)
                            return;
-                       // An answer from a peer this poller has since been moved
-                       // off describes somebody else's host, and clearing the
-                       // guard on its behalf would let two requests be in flight
-                       // on the CURRENT client at once. setRpcClient() has
-                       // already cleared the guard for the new one.
-                       if (self->m_client != askedOf)
+                       // Rebinding even the SAME client starts a new polling
+                       // lifetime. Its older callbacks must neither publish
+                       // stale activity nor clear a newer request's guard.
+                       if (!self->m_client
+                           || self->m_clientGeneration != clientGeneration)
                            return;
                        self->m_inFlight = false;
                        // A failure is not evidence about any pane: the panes
@@ -103,11 +103,12 @@ void TmuxActivityPoller::pollNow()
                        // the user — a sidebar badge is not worth a toast.
                        if (error)
                            return;
-                       self->publishActivity(result.toObject());
+                       self->publishActivity(result.toObject(), clientGeneration);
                    });
 }
 
-void TmuxActivityPoller::publishActivity(const QJsonObject& result)
+void TmuxActivityPoller::publishActivity(const QJsonObject& result,
+                                        quint64 clientGeneration)
 {
     // The server's own wall clock at listing time. Everything below is
     // differenced against THIS and never against the local clock, which is the
@@ -126,14 +127,14 @@ void TmuxActivityPoller::publishActivity(const QJsonObject& result)
         // Each emit reaches ch::AgentStatusMonitor and from there the sidebar
         // and QML, any of which may tear this poller down; the rest of the
         // listing is not worth a use-after-free.
-        if (!self)
+        if (!self || !m_client || m_clientGeneration != clientGeneration)
             return;
         const QJsonObject pane = entry.toObject();
         const QString devSessionId =
             pane.value(QStringLiteral("devSessionId")).toString();
         const QString terminalId =
             pane.value(QStringLiteral("terminalId")).toString();
-        if (devSessionId.isEmpty() || terminalId.isEmpty())
+        if (!m_devSessionIds.contains(devSessionId) || terminalId.isEmpty())
             continue;
         // A null (or absent, or non-numeric) activity time is the daemon saying
         // it could not date this pane — tmux renders a format name it does not

@@ -863,15 +863,16 @@ Item {
             pane.probePath = "";
             pane.openRemotePath(path);
         }
-        // Same rule as the probe above: `viewers` is shared by every pane, so a
-        // reply is only this pane's if it names the path this pane asked about.
-        function onPathResolved(path, resolvedPath, insideRepositoryRoot) {
-            if (path !== pane.repoCheckPath)
+        // Containment depends on both the path and the repository root. The
+        // shared model can still deliver a result requested before a session
+        // switch, including one for the same file under a different root.
+        function onPathResolved(path, base, resolvedPath, insideRepositoryRoot) {
+            if (path !== pane.repoCheckPath || base !== pane.repoCheckBase)
                 return;
             pane.repoRootState = insideRepositoryRoot ? "inside" : "outside";
         }
-        function onPathResolveError(path, message) {
-            if (path !== pane.repoCheckPath)
+        function onPathResolveError(path, base, message) {
+            if (path !== pane.repoCheckPath || base !== pane.repoCheckBase)
                 return;
             // Undetermined. Shown as nothing at all: claiming "inside" would
             // hide a real out-of-project file and claiming "outside" would

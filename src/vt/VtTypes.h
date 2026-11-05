@@ -94,13 +94,13 @@ using VtLine = QVector<VtCell>;
 
 namespace vt {
 
-// Display width of a code point in terminal cells: 0 for a combining mark or a
-// format character, 2 for an East Asian Wide/Fullwidth character, 1 otherwise.
+// Display width of a code point in terminal cells: 0 for a combining mark,
+// format character or Hangul medial/final Jamo, 2 for an East Asian
+// Wide/Fullwidth character, 1 otherwise.
 //
-// The zero-width answer comes from Qt's own Unicode tables (QChar::category),
-// so no data is duplicated and no dependency is added. The double-width answer
-// cannot: QtCore exposes no East Asian Width property, so the W/F ranges live
-// in a sorted table in VtTypes.cpp.
+// Zero-width categories come from Qt's Unicode tables, with explicit terminal
+// exceptions for soft hyphen and Hangul Jamo. QtCore exposes no East Asian Width
+// property, so the W/F ranges live in a sorted table in VtTypes.cpp.
 int charWidth(char32_t codePoint);
 
 // The xterm 256-colour palette: 0-7 standard, 8-15 bright, 16-231 the 6x6x6

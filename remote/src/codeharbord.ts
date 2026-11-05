@@ -8,11 +8,7 @@
 // (SPEC 10.2) are implemented in files.ts, workspace.ts and tmux.ts and spread
 // into the method table below.
 
-// pathToFileURL, not string concatenation: process.argv[1] is a filesystem
-// path, and a path containing a space (or any character a URL must
-// percent-encode) would never compare equal to import.meta.url, silently
-// turning the CLI entry point below into a no-op.
-import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "./tools/entrypoint.ts";
 import { homedir } from "node:os";
 import { isAbsolute, join as pathJoin } from "node:path";
 
@@ -1261,7 +1257,7 @@ export function runStdio(): StdioHandle {
     return { shutdown };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isEntrypoint(import.meta.url)) {
     const [mode, ...flags] = process.argv.slice(2);
     // The documented invocation is `codeharbord rpc --stdio` (SPEC 10.1), and
     // stdio is the only transport there has ever been, so the flag stays

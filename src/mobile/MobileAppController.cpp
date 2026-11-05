@@ -110,8 +110,6 @@ MobileAppController::MobileAppController(AppController* app,
         // waiting for the next transition would show "disconnected" over a
         // working server.
         syncConnectionState();
-        if (!m_app->activeSessionId().isEmpty())
-            adoptActiveSession();
     }
 
     if (m_layouts) {
@@ -126,6 +124,7 @@ MobileAppController::MobileAppController(AppController* app,
                     // still report itself finished, and onLayoutsLoaded() must
                     // not wipe the explanation on its way out.
                     m_layoutErrorReported = true;
+                    m_layoutErrorGeneration = m_layouts->generation();
                     setStatusText(message);
                 });
     }
@@ -144,6 +143,11 @@ MobileAppController::MobileAppController(AppController* app,
                             .arg(host));
                 });
     }
+    // A shell created over an already-active spine missed its original loaded
+    // signal. Request a fresh load only after all completion/error handlers are
+    // connected, including the synchronous no-transport failure path.
+    if (m_app && !m_app->activeSessionId().isEmpty())
+        selectSession(m_app->activeSessionId());
 }
 
 void MobileAppController::setNavStage(NavStage stage)
@@ -333,25 +337,38 @@ void MobileAppController::adoptActiveSession()
     // and activateSession() drives it before it announces the switch, so the
     // reply can genuinely arrive before this handler does. Re-arming here would
     // then park the shell on a load that had already finished.
-    if (devSessionId == m_shownSessionId && m_pendingSessionId.isEmpty())
+    if (devSessionId == m_shownSessionId && m_pendingSessionId.isEmpty()
+        && m_layouts && m_shownLayoutGeneration == m_layouts->generation())
         return;
 
     // Whatever we were waiting for is history: this is the newest load, and it
     // is the only one whose reply may touch the pane list.
     m_pendingSessionId = devSessionId;
     m_shownSessionId.clear();
-    m_layoutErrorReported = false;
+    const bool alreadyLoaded = m_layouts
+        && m_lastCompletedLayoutGeneration != 0
+        && m_lastCompletedLayoutGeneration == m_layouts->generation()
+        && m_layouts->devSessionId() == devSessionId;
+    m_layoutErrorReported = m_layouts && m_layoutErrorGeneration != 0
+        && m_layoutErrorGeneration == m_layouts->generation();
     setLayoutPending(true);
     // Both are the previous session's, and neither survives the switch. Clearing
     // BEFORE the reply lands is what keeps a tap during the round trip from
     // opening a pane of the session being left.
     setNavStage(Sessions);
     m_panes->setTrees({}, {});
-    setStatusText(tr("Opening session…"));
+    if (!m_layoutErrorReported)
+        setStatusText(tr("Opening session…"));
+    if (alreadyLoaded)
+        onLayoutsLoaded(devSessionId);
 }
 
 void MobileAppController::onLayoutsLoaded(const QString& devSessionId)
 {
+    // AppController sets its active id before load(), but announces the switch
+    // afterwards. Remember synchronous completion even before that announcement.
+    if (m_layouts && m_layouts->devSessionId() == devSessionId)
+        m_lastCompletedLayoutGeneration = m_layouts->generation();
     // The stale-load discard. A superseded load never reports at all (see
     // SessionLayouts::loaded), so the only reply that can arrive for a session
     // that is not the pending one is a load somebody else started - the
@@ -365,6 +382,7 @@ void MobileAppController::onLayoutsLoaded(const QString& devSessionId)
 
     m_pendingSessionId.clear();
     m_shownSessionId = devSessionId;
+    m_shownLayoutGeneration = m_layouts->generation();
     setLayoutPending(false);
     // setTrees BEFORE the stage moves: setNavStage(Panes) is what makes the
     // picker visible, and it must never be visible over the previous session's
@@ -541,6 +559,10 @@ void MobileAppController::selectSession(QString devSessionId)
         return;
     }
 
+    const QString previousPendingSessionId = m_pendingSessionId;
+    const bool wasLayoutPending = m_layoutPending;
+    const bool previousLayoutErrorReported = m_layoutErrorReported;
+
     // The load stamp is armed BEFORE the call, not from the activeSessionChanged
     // that follows it. activateSession() drives SessionLayouts::load() and only
     // THEN announces the switch, and a load can complete synchronously - with no
@@ -568,8 +590,9 @@ void MobileAppController::selectSession(QString devSessionId)
         // say so instead of waiting for a load that was never issued. Nothing
         // was disturbed: no activeSessionChanged was emitted, so the pane the
         // user is looking at (if any) is untouched.
-        m_pendingSessionId.clear();
-        setLayoutPending(false);
+        m_pendingSessionId = previousPendingSessionId;
+        m_layoutErrorReported = previousLayoutErrorReported;
+        setLayoutPending(wasLayoutPending);
         setStatusText(tr("That Dev Session is no longer in the workspace."));
         return;
     }

@@ -332,6 +332,9 @@ private slots:
     void aPaneRetargetedMidLookupNeverReportsUnderTheSupersededPanesIdentity();
     void aFailedResolutionLeavesThePaneWithNoIdentity();
     void targetCannotCrossAWorkspaceServerSwitch();
+    void oldResolutionsCannotCompleteANewServerRequest_data();
+    void oldResolutionsCannotCompleteANewServerRequest();
+    void aServerSwitchDuringResolutionDeliveryCancelsTheOtherWaiters();
     void aServerAnswerWithAnUnusableTmuxTargetFailsTheResolution();
     void changingTheWorkspaceServerForgetsRememberedRowIdentities();
     void aChangedHarnessSurvivesTheResolutionCache();
@@ -346,6 +349,7 @@ private slots:
     void anOrdinaryReconnectToASessionThatWasStillThereStaysSilent();
     void aFailedOrEmptyListingReportsNothingAndRaisesNoError();
     void aRetargetWhileTheProbeIsInFlightReportsNothing();
+    void anOlderAttachmentProbeCannotReportForANewerChannel();
     void aPaneThatNeverHadASessionStaysSilentWhenOneIsFinallyCreated();
 };
 
@@ -1760,6 +1764,114 @@ void TstTerminalFactory::targetCannotCrossAWorkspaceServerSwitch()
     QVERIFY(errors.count() >= 1);
 }
 
+void TstTerminalFactory::oldResolutionsCannotCompleteANewServerRequest_data()
+{
+    QTest::addColumn<bool>("cached");
+    QTest::addColumn<bool>("returnToOriginalServer");
+    QTest::newRow("queued-cache-other-server") << true << false;
+    QTest::newRow("queued-cache-returned-server") << true << true;
+    QTest::newRow("rpc-returned-server") << false << true;
+}
+
+void TstTerminalFactory::oldResolutionsCannotCompleteANewServerRequest()
+{
+    QFETCH(bool, cached);
+    QFETCH(bool, returnToOriginalServer);
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy rows(&factory, &TerminalFactory::paneRowResolved);
+    const auto resolve = [&]() {
+        return factory.resolveTarget(controller, QStringLiteral("s1"),
+                                     QStringLiteral("terminal-1"), QString(),
+                                     QStringLiteral("/repo"));
+    };
+
+    QVERIFY(resolve());
+    const QJsonObject oldRequest = rpc.takeRequest();
+    QVERIFY(!oldRequest.isEmpty());
+    if (cached) {
+        rpc.answerWithRow(oldRequest.value(QStringLiteral("id")).toInt(),
+                          QStringLiteral("old-row"), QStringLiteral("s1"),
+                          QStringLiteral("terminal-1"), QStringLiteral("old-target"),
+                          QStringLiteral("generic"));
+        QTRY_COMPARE(resolved.count(), 1);
+        // Leave the cache completion queued while profiles change.
+        QVERIFY(resolve());
+    }
+    factory.setServerId(QStringLiteral("srv-2"));
+    if (returnToOriginalServer)
+        factory.setServerId(QStringLiteral("srv-1"));
+    resolved.clear();
+    rows.clear();
+
+    // The same address is now owned by a different resolution flight.
+    QVERIFY(resolve());
+    const QJsonObject newRequest = rpc.takeRequest();
+    QVERIFY(!newRequest.isEmpty());
+    if (!cached) {
+        rpc.answerWithRow(oldRequest.value(QStringLiteral("id")).toInt(),
+                          QStringLiteral("old-row"), QStringLiteral("s1"),
+                          QStringLiteral("terminal-1"), QStringLiteral("old-target"),
+                          QStringLiteral("generic"));
+    }
+    rpc.answerWithRow(newRequest.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("new-row"), QStringLiteral("s1"),
+                      QStringLiteral("terminal-1"), QStringLiteral("new-target"),
+                      QStringLiteral("generic"));
+    QTRY_VERIFY(!resolved.isEmpty()
+                && resolved.last().at(1).toString() == QStringLiteral("new-target"));
+    QCOMPARE(resolved.count(), 1);
+    QCOMPARE(rows.count(), 1);
+    QCOMPARE(rows.first().at(2).toString(), QStringLiteral("new-row"));
+
+    // A reconnect must also reuse the new answer, not the retired flight.
+    QVERIFY(resolve());
+    QTRY_COMPARE(resolved.count(), 2);
+    QCOMPARE(resolved.last().at(1).toString(), QStringLiteral("new-target"));
+}
+
+void TstTerminalFactory::aServerSwitchDuringResolutionDeliveryCancelsTheOtherWaiters()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    QObject pane;
+    TerminalController* first = factory.create(&pane);
+    TerminalController* second = factory.create(&pane);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy rows(&factory, &TerminalFactory::paneRowResolved);
+    connect(&factory, &TerminalFactory::targetResolved, &factory,
+            [&](TerminalController* controller, const QString& target) {
+                if (controller == first && !target.isEmpty())
+                    factory.setServerId(QStringLiteral("srv-2"));
+            });
+    for (TerminalController* controller : {first, second}) {
+        QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"),
+                                      QStringLiteral("terminal-1"), QString(),
+                                      QStringLiteral("/repo")));
+    }
+    const QJsonObject request = rpc.takeRequest();
+    QVERIFY(!request.isEmpty());
+    rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("old-row"), QStringLiteral("s1"),
+                      QStringLiteral("terminal-1"), QStringLiteral("old-target"),
+                      QStringLiteral("generic"));
+    QTRY_COMPARE(resolved.count(), 2);
+    QCOMPARE(resolved.first().at(0).value<TerminalController*>(), first);
+    QCOMPARE(resolved.first().at(1).toString(), QStringLiteral("old-target"));
+    QCOMPARE(resolved.last().at(0).value<TerminalController*>(), second);
+    QVERIFY(resolved.last().at(1).toString().isEmpty());
+    QCOMPARE(rows.count(), 0);
+}
+
 // The other end of the same rule. A tmux target arrives as DATA, from a server,
 // and it is then used as tmux GRAMMAR. codeharbord validates what it mints and
 // repairs stored rows, so what is left is a row written by an older daemon or a
@@ -2104,6 +2216,7 @@ void TstTerminalFactory::aReattachThatCreatedTheSessionSaysTheOldOneIsGone()
     // The session the pane is working in, observed alive: this is the evidence
     // that there is something to lose.
     QVERIFY(answerSessionProbe(rpc, target, born));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
@@ -2148,6 +2261,7 @@ void TstTerminalFactory::anOrdinaryReconnectToASessionThatWasStillThereStaysSile
     const qint64 born = QDateTime::currentSecsSinceEpoch() + 86400;
     QVERIFY(resolveAndAttach(factory, rpc, controller, target));
     QVERIFY(answerSessionProbe(rpc, target, born));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
 
     // Two more reconnects to the very same session.
     for (int i = 0; i < 2; ++i) {
@@ -2235,6 +2349,7 @@ void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
     const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
     QVERIFY(resolveAndAttach(factory, rpc, controller, target));
     QVERIFY(answerSessionProbe(rpc, target, born));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
@@ -2299,6 +2414,7 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
     const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
     QVERIFY(resolveAndAttach(factory, rpc, controller, first));
     QVERIFY(answerSessionProbe(rpc, first, born));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
 
     QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
     QSignalSpy errors(&factory, &TerminalFactory::error);
@@ -2342,6 +2458,45 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
     QTest::qWait(150);
     QCOMPARE(recreated.count(), 0);
     QCOMPARE(errors.count(), 0);
+}
+
+void TstTerminalFactory::anOlderAttachmentProbeCannotReportForANewerChannel()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setRpcClient(rpc.client());
+    factory.setServerId(QStringLiteral("srv-1"));
+    QObject pane;
+    TerminalController* controller = factory.create(&pane);
+    const QString target = QStringLiteral("ch_s1_row-A");
+    const qint64 born = QDateTime::currentSecsSinceEpoch() - 3600;
+    QVERIFY(resolveAndAttach(factory, rpc, controller, target));
+    QVERIFY(answerSessionProbe(rpc, target, born));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
+    // A real replacement establishes that the first observation was consumed.
+    QSignalSpy recreated(&factory, &TerminalFactory::sessionRecreated);
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    QVERIFY(answerSessionProbe(rpc, target, born + 60));
+    QTRY_COMPARE(recreated.count(), 1);
+    recreated.clear();
+
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    const QJsonObject oldProbe = rpc.takeRequest();
+    QVERIFY(factory.attach(controller, target, QStringLiteral("/repo"), 80, 24));
+    const QJsonObject currentProbe = rpc.takeRequest();
+    QVERIFY(!oldProbe.isEmpty());
+    QVERIFY(!currentProbe.isEmpty());
+    rpc.answerWithSessions(oldProbe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(target, born + 120)});
+    // Observe a whole response turn: a retired channel must not raise a
+    // notice before the current attachment's own probe has answered.
+    QTest::qWait(50);
+    QCOMPARE(recreated.count(), 0);
+    rpc.answerWithSessions(currentProbe.value(QStringLiteral("id")).toInt(),
+                           QJsonArray{tmuxSession(target, born + 120)});
+    QTRY_COMPARE(recreated.count(), 1);
 }
 
 

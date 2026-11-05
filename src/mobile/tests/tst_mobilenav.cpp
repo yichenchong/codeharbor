@@ -146,6 +146,10 @@ private slots:
     void theShellFollowsASessionActivatedByAnybodyElse();
     void aSessionThatVanishesFromTheWorkspaceReleasesThePane();
     void reselectingTheSameSessionReloadsItRatherThanHanging();
+    void anExternalSameSessionReloadPublishesItsNewLayout();
+    void aSynchronousExternalLoadDoesNotLeaveTheShellWaiting();
+    void aReplacementShellLoadsTheAlreadyActiveSession();
+    void aRefusedSelectionDoesNotAbandonThePendingSession();
     void aSettledConnectionStopsClaimingToBeBusy();
     void aRefusedProfileEditIsReportedRatherThanDiallingTheOldOne();
     void anOwnerlessTerminalSessionIsRefused();
@@ -515,6 +519,29 @@ void TstMobileNav::aSessionTheWorkspaceNoLongerHoldsIsRefused()
     QVERIFY(f.takeLayoutRequests().isEmpty());
 }
 
+void TstMobileNav::aRefusedSelectionDoesNotAbandonThePendingSession()
+{
+    Fixture f;
+    f.listSessions({QStringLiteral("s1")});
+    f.mobile.selectSession(QStringLiteral("s1"));
+    const QVector<QJsonObject> pending = f.takeLayoutRequests();
+    QVERIFY(f.mobile.layoutPending());
+
+    f.mobile.selectSession(QStringLiteral("ghost"));
+    QVERIFY(f.mobile.layoutPending());
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QVERIFY(!f.mobile.statusText().isEmpty());
+    QVERIFY(f.takeLayoutRequests().isEmpty());
+    f.answerLayouts(pending,
+                    viewerTreeFor(QStringLiteral("viewer-1"),
+                                  QStringLiteral("file:///srv/s1/a.md")),
+                    terminalTreeFor(QStringLiteral("terminal-1"),
+                                    QStringLiteral("row-1")));
+    QVERIFY(!f.mobile.layoutPending());
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Panes);
+    QCOMPARE(f.mobile.panes()->rowCount(), 2);
+}
+
 // The active Dev Session is remembered under session/<serverId>/active - the key
 // AppController already owns and the desktop already writes. This controller adds
 // no key of its own, which is what lets AppController::restoreActiveSession()
@@ -775,6 +802,56 @@ void TstMobileNav::reselectingTheSameSessionReloadsItRatherThanHanging()
     QCOMPARE(paneKeys(f.mobile.panes()),
              QStringList({QStringLiteral("viewer:viewer-2"),
                           QStringLiteral("terminal:terminal-2")}));
+}
+
+void TstMobileNav::anExternalSameSessionReloadPublishesItsNewLayout()
+{
+    Fixture f;
+    f.listSessions({QStringLiteral("s1")});
+    f.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                  QStringLiteral("terminal-1"));
+    f.controller.activateSession(QStringLiteral("s1"));
+    QVERIFY(f.mobile.layoutPending());
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Sessions);
+    f.answerLayouts(f.takeLayoutRequests(),
+                    viewerTreeFor(QStringLiteral("viewer-2"),
+                                  QStringLiteral("file:///srv/s1/b.md")),
+                    terminalTreeFor(QStringLiteral("terminal-2"),
+                                    QStringLiteral("row-2")));
+    QVERIFY(!f.mobile.layoutPending());
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Panes);
+    QVERIFY(f.mobile.panes()->paneByKey(QStringLiteral("viewer:viewer-1")).isEmpty());
+    QVERIFY(!f.mobile.panes()->paneByKey(QStringLiteral("viewer:viewer-2")).isEmpty());
+}
+
+void TstMobileNav::aSynchronousExternalLoadDoesNotLeaveTheShellWaiting()
+{
+    Fixture f;
+    f.listSessions({QStringLiteral("s1")});
+    f.client.setTransport(nullptr);
+    f.controller.activateSession(QStringLiteral("s1"));
+    QVERIFY(!f.mobile.layoutPending());
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Panes);
+    QCOMPARE(f.mobile.panes()->rowCount(), 0);
+    QVERIFY(!f.mobile.statusText().isEmpty());
+}
+
+void TstMobileNav::aReplacementShellLoadsTheAlreadyActiveSession()
+{
+    Fixture f;
+    f.listSessions({QStringLiteral("s1")});
+    f.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                  QStringLiteral("terminal-1"));
+    MobileAppController replacement(&f.controller, &f.layouts, &f.pool);
+    QVERIFY(replacement.layoutPending());
+    f.answerLayouts(f.takeLayoutRequests(),
+                    viewerTreeFor(QStringLiteral("viewer-2"),
+                                  QStringLiteral("file:///srv/s1/b.md")),
+                    terminalTreeFor(QStringLiteral("terminal-2"),
+                                    QStringLiteral("row-2")));
+    QVERIFY(!replacement.layoutPending());
+    QCOMPARE(replacement.navStage(), MobileAppController::Panes);
+    QVERIFY(!replacement.panes()->paneByKey(QStringLiteral("viewer:viewer-2")).isEmpty());
 }
 
 // Every sentence written while an attempt is in flight ("Connecting…",

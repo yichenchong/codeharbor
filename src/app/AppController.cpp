@@ -314,6 +314,7 @@ void AppController::setConnection(SshConnectionPool* pool,
                                   SessionLayouts* layouts)
 {
     QPointer<AppController> self(this);
+    ++m_identityGeneration;
     // Re-injection must not stack a second set of connections onto the same
     // signals: a doubled stateChanged/wired/error handler would issue two
     // server.info calls per wire and show every connect failure twice. Severing
@@ -417,6 +418,8 @@ void AppController::setConnection(SshConnectionPool* pool,
         const auto mirrorState = [this, self](SessionBootstrap::State state) {
             if (!self)
                 return;
+            if (state != SessionBootstrap::State::Wired && !m_tearingDown)
+                ++m_identityGeneration;
             switch (state) {
             case SessionBootstrap::State::Connecting:
                 setConnectionState(QStringLiteral("connecting"));
@@ -648,6 +651,7 @@ void AppController::startConnect(const QString& profileId,
     }
 
     m_connecting = true;
+    ++m_identityGeneration;
     m_pendingProfileId = profileId;
     m_pendingFingerprint.clear();
     m_pendingHostKeyInfo = {};
@@ -983,6 +987,7 @@ void AppController::submitCredential(QString secret, QString kind)
 
 void AppController::disconnectServer()
 {
+    ++m_identityGeneration;
     // Deliberately NOT gated on m_bootstrap. Everything below the teardown call
     // is CLIENT-side state - a parked prompt, a gathered secret, the active Dev
     // Session - and it is just as wrong to keep any of it when there is no
@@ -1067,9 +1072,10 @@ void AppController::adoptServerIdentity()
     if (!m_client)
         return;
     QPointer<AppController> self(this);
+    const quint64 generation = ++m_identityGeneration;
     m_client->call(QStringLiteral("server.info"), QJsonObject{},
-                   [self](QJsonValue result, std::optional<RpcError> err) {
-                       if (!self)
+                   [self, generation](QJsonValue result, std::optional<RpcError> err) {
+                       if (!self || generation != self->m_identityGeneration)
                            return;
                        // reportIfError(), not a bare emit: a teardown WE
                        // started fails every in-flight call by design (the
@@ -1107,7 +1113,7 @@ void AppController::adoptServerIdentity()
                                             : remoteVersion)
                                    .arg(schema)
                                    .arg(kMinimumServerSchemaVersion);
-                           self->refuseServer(message);
+                           self->refuseServer(message, generation);
                            return;
                        }
                        // Forward the server's recovery directory to the editor
@@ -1140,7 +1146,8 @@ void AppController::adoptServerIdentity()
                            // so an empty value is a broken remote, not skew.
                            self->refuseServer(
                                tr("Server did not report an identity; refusing to "
-                                  "key this workspace to a client-side id."));
+                                  "key this workspace to a client-side id."),
+                               generation);
                            return;
                        }
                        if (self->m_serverId.value == id) {
@@ -1162,7 +1169,7 @@ void AppController::adoptServerIdentity()
                    });
 }
 
-void AppController::refuseServer(const QString& message)
+void AppController::refuseServer(const QString& message, quint64 generation)
 {
     QPointer<AppController> self(this);
     emit error(message);
@@ -1170,18 +1177,21 @@ void AppController::refuseServer(const QString& message)
     // them is allowed to destroy this controller. Everything below touches
     // `this` (QTimer::singleShot takes it as the context object), so the
     // guard has to be checked here and not only inside the deferred lambda.
-    if (!self)
+    if (!self || generation != m_identityGeneration)
         return;
     // Refuse rather than limp on. Deferred by one event-loop turn because both
     // callers run INSIDE a CodeharbordClient response callback and the teardown
     // drops that very client's transport. The QPointer keeps the deferred work
     // from touching a controller destroyed in the meantime; QTimer's context
     // overload would already cancel it, and the explicit check documents why.
-    QTimer::singleShot(0, this, [self, message] {
-        if (!self)
+    QTimer::singleShot(0, this, [self, message, generation] {
+        if (!self || generation != self->m_identityGeneration)
             return;
         self->disconnectServer();
-        self->setConnectionState(QStringLiteral("failed"), message);
+        // disconnectServer() invalidates this generation once. A synchronous
+        // observer may destroy us or begin a new connection during teardown.
+        if (self && self->m_identityGeneration == generation + 1)
+            self->setConnectionState(QStringLiteral("failed"), message);
     });
 }
 
@@ -1430,6 +1440,8 @@ void AppController::refresh()
         // pane as the tree describes it and the row still carries the wire state
         // no registration has touched yet.
         self->drainPendingObservedHarnesses(liveTerminalIds);
+        if (!self || generation != self->m_refreshGeneration)
+            return;
         // Only HERE: past the error return (an RpcError means "we do not know",
         // not "it is gone") and past the generation guard, so a stale list()
         // can never retire a session the newest tree still has.
@@ -1482,14 +1494,14 @@ void AppController::refresh()
             // poller exists for are exactly the ones with no channel, i.e. every
             // Dev Session the user is not currently looking at. A `self` guard
             // first, because retainDevSessions() above emits.
-            if (!self)
+            if (!self || generation != self->m_refreshGeneration)
                 return;
             self->m_activityPoller->setDevSessionIds(liveDevSessions);
             // Guarded BEFORE each dereference, not after it: a check that runs
             // once the call it is meant to guard has already returned has
             // nothing left to protect.
             for (const HarnessRegistration& registration : registrations) {
-                if (!self)
+                if (!self || generation != self->m_refreshGeneration)
                     return;
                 // The monitor vanishing mid-loop stops the REGISTRATIONS, but
                 // must not abandon the rest of this callback. m_lastNodes was
@@ -1505,6 +1517,8 @@ void AppController::refresh()
                     registration.devSessionId, registration.terminalPaneId,
                     registration.harness);
             }
+            if (!self || generation != self->m_refreshGeneration)
+                return;
             // The factory remembers the harness each pane RESOLVED with, and
             // that memory deliberately survives a disconnect. Left alone it
             // would re-apply the old value at the next rebind and quietly undo
@@ -1519,15 +1533,27 @@ void AppController::refresh()
                 }
             }
         }
-        if (!self)
+        if (!self || generation != self->m_refreshGeneration)
             return;
         const bool droppedActive = self->dropActiveSessionIfGone();
-        self->rebuildRows();
         if (!self)
             return;
-        if (droppedActive || self->activeSessionRepoRoot() != repoRootBefore) {
+        // Retirement has already changed the active-session property. A
+        // layout observer may request a newer refresh, but that request cannot
+        // take ownership of a notification for a change it did not make.
+        if (droppedActive) {
             emit self->activeSessionChanged();
             if (!self)
+                return;
+        }
+        if (generation != self->m_refreshGeneration)
+            return;
+        self->rebuildRows();
+        if (!self || generation != self->m_refreshGeneration)
+            return;
+        if (!droppedActive && self->activeSessionRepoRoot() != repoRootBefore) {
+            emit self->activeSessionChanged();
+            if (!self || generation != self->m_refreshGeneration)
                 return;
         }
         emit self->refreshed();
@@ -1843,6 +1869,8 @@ void AppController::drainPendingObservedHarnesses(
     // the workspace walk above is commented against.
     const QHash<QString, QHash<QString, QString>> pending =
         std::exchange(m_pendingObservedHarness, {});
+    QPointer<AppController> self(this);
+    const quint64 generation = m_refreshGeneration;
     for (auto sessionIt = pending.constBegin(); sessionIt != pending.constEnd();
          ++sessionIt) {
         const auto liveIt = liveTerminalIds.constFind(sessionIt.key());
@@ -1854,6 +1882,8 @@ void AppController::drainPendingObservedHarnesses(
             continue;
         for (auto paneIt = sessionIt.value().constBegin();
              paneIt != sessionIt.value().constEnd(); ++paneIt) {
+            if (!self || generation != m_refreshGeneration)
+                return;
             // The session IS listed and this pane is not among its panes: a
             // session's pane list is complete, so the pane is gone.
             if (!liveIt->contains(paneIt.key()))

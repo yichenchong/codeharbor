@@ -102,6 +102,7 @@ export interface ControlResponse {
 // orders of magnitude of headroom; anything past it is a producer that lost its
 // newline. Deliberately far smaller than the bridge's 1 MiB (which may carry a
 // summary) and than the RPC transport's 16 MiB (which carries file contents).
+// The bound measures the JSON payload, excluding its terminating newline.
 export const MAX_CONTROL_LINE_BYTES = 64 * 1024;
 
 // How long a relayed command may go unanswered by the desktop before the
@@ -296,7 +297,13 @@ export interface ControlListener {
 }
 
 function responseLine(response: ControlResponse): string {
-    return `${JSON.stringify(response)}\n`;
+    const payload = JSON.stringify(response);
+    if (Buffer.byteLength(payload) <= MAX_CONTROL_LINE_BYTES) return `${payload}\n`;
+    return `${JSON.stringify(refusal(
+        "failed",
+        `the viewer command's answer exceeded the ${MAX_CONTROL_LINE_BYTES}-byte control limit; ` +
+        "the operation may already have completed, so inspect the current viewer state before retrying",
+    ))}\n`;
 }
 
 function refusal(code: ControlErrorCode, message: string): ControlResponse {
@@ -397,13 +404,20 @@ export async function startControlListener(
     let closed = false;
 
     const answer = (socket: net.Socket, response: ControlResponse): void => {
+        if (socket.destroyed) return;
+        // Let the read side drain through the producer's FIN. destroySoon()
+        // closes it as soon as the reply flushes, which can reset the connection
+        // while a later ignored packet is still in transit and lose that reply.
+        // A peer that refuses to finish cannot retain the socket indefinitely.
+        const closeDeadline = setTimeout(() => socket.destroy(), CONTROL_HANDSHAKE_TIMEOUT_MS);
+        closeDeadline.unref();
+        socket.once("close", () => clearTimeout(closeDeadline));
         // A producer that vanished mid-flight makes this write raise
         // synchronously (EPIPE). Reached from a socket event handler and from a
         // timer, where an escaping exception is an uncaught exception that kills
         // the daemon and with it every terminal and editor of the session.
         try {
             socket.end(responseLine(response));
-            socket.destroySoon();
         } catch {
             socket.destroy();
         }
@@ -417,7 +431,9 @@ export async function startControlListener(
         return entry;
     };
 
-    const server = net.createServer();
+    // A producer may finish its request with FIN while continuing to read the
+    // desktop's asynchronous answer. Do not close our writable half on its FIN.
+    const server = net.createServer({ allowHalfOpen: true });
     const connections = new Set<net.Socket>();
     server.maxConnections = MAX_CONTROL_CONNECTIONS;
 
@@ -449,7 +465,9 @@ export async function startControlListener(
         socket.on("data", (chunk: string) => {
             if (received) return;
             buffer += chunk;
-            if (Buffer.byteLength(buffer) > MAX_CONTROL_LINE_BYTES) {
+            const newline = buffer.indexOf("\n");
+            const line = newline < 0 ? buffer : buffer.slice(0, newline);
+            if (Buffer.byteLength(line) > MAX_CONTROL_LINE_BYTES) {
                 finish(
                     refusal(
                         "bad_request",
@@ -458,7 +476,6 @@ export async function startControlListener(
                 );
                 return;
             }
-            const newline = buffer.indexOf("\n");
             if (newline < 0) return;
             received = true;
             if (handshake) {
@@ -468,7 +485,6 @@ export async function startControlListener(
             // ONE request per connection: everything after the first newline is
             // ignored rather than dispatched. The response is written on this
             // same socket, so a second command on it would have no way back.
-            const line = buffer.slice(0, newline);
             buffer = "";
 
             const parsed = parseControlRequest(line);
@@ -518,6 +534,12 @@ export async function startControlListener(
             if (!relayed && forget(commandId)) {
                 finish(refusal("failed", "the CodeHarbor desktop is not reachable"));
             }
+        });
+
+        socket.on("end", () => {
+            // There is no complete request to answer after a partial-line EOF.
+            // Complete requests keep the writable half until settlement/timeout.
+            if (!received) socket.destroy();
         });
 
         socket.on("close", () => {

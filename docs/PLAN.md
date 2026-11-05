@@ -589,10 +589,10 @@ with the drag-reorder regression it briefly introduced caught by `tst_sidebar` a
 fixed.
 
 > **Remaining known gaps — honest list.**
-> - **Groups cannot be renamed in the UI.** `renameGroup` has no reachable
->   affordance. Creating groups and Dev Sessions IS wired ("+ New group", "+ Session");
->   group deletion is wired with a confirmation that states how many sessions will
->   be destroyed.
+> - **Group renaming is implemented.** The group header's context menu offers
+>   Rename, and F2 opens the same dialog for the selected group. Creating groups
+>   and Dev Sessions is wired ("+ New group", "+ Session"); group deletion asks
+>   for confirmation and states how many sessions will be destroyed.
 > - **Crash recovery is implemented and tested.** `EditorController::recoveryAvailable`
 >   is consumed by `EditorPaneView.qml`, which offers Restore or Discard when a
 >   recovered file is reopened. This is no longer a remaining gap.
@@ -629,8 +629,10 @@ fixed.
 >   real fix is moving the session to a worker thread.
 > - **Pane focus is click-based**; focus moved purely by keyboard does not report, so a
 >   future "focus next pane" command must tell the region directly.
-> - **`tmux.*` discovery has no client consumer** — the RPC group exists and is tested
->   server-side, and nothing calls it.
+> - **Tmux discovery has client consumers.** `TerminalFactory` checks
+>   `tmux.listSessions` after an attach to detect a lost remote session.
+>   `TmuxActivityPoller` asks `tmux.paneActivity` for detached panes so their
+>   sidebar status can follow remote output. This is no longer a remaining gap.
 > - **The DEFAULT trust-store path is never exercised by a test.** In production the
 >   known-hosts file lives at `QStandardPaths::AppConfigLocation + "/known_hosts"`,
 >   which on Linux is `<config>/CodeHarbor/CodeHarbor/known_hosts` — org AND app, a

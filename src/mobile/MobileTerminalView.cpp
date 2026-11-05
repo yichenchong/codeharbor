@@ -530,7 +530,8 @@ void MobileTerminalView::paint(QPainter *painter)
         painter->fillRect(cell, m_defaultForeground);
         if (cursorAbsolute >= 0 && cursorAbsolute < total) {
             const VtLine &line = m_screen->lineAt(cursorAbsolute);
-            if (cursorColumn < line.size() && line.at(cursorColumn).width != 0) {
+            if (cursorColumn < line.size() && line.at(cursorColumn).width != 0
+                && !(line.at(cursorColumn).attrs & VtHidden)) {
                 painter->setFont(m_font);
                 painter->setPen(m_defaultBackground);
                 const char32_t code = line.at(cursorColumn).text;

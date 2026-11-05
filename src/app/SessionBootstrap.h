@@ -121,8 +121,9 @@ public:
     //
     // `repoRoot` no longer has to EXIST: when it holds no usable service, the
     // client installs one there before wiring anything (see
-    // ensureRemoteService()). Node.js on the server is still a prerequisite
-    // nothing here can install.
+    // ensureRemoteService()). Installing requires an absolute directory other
+    // than the filesystem root, including its dot/parent-path aliases. Node.js
+    // on the server is still a prerequisite nothing here can install.
     bool connectAndWire(const QString& host, quint16 port, const QString& user,
                         const QString& nodePath, const QString& repoRoot,
                         const QString& identityFile = QString());

@@ -38,9 +38,9 @@ public:
     // is a no-op, buffer included; a reconnect always supplies a NEW device.
     //
     // Anything already buffered on the new device is drained SYNCHRONOUSLY
-    // before this returns, so agentStateChanged/unseenChanged/notify can all
-    // fire from inside the call. A caller that installs its own connections
-    // must do so BEFORE binding the transport or it will miss those events.
+    // before this returns, except a rebind from an event-delivery slot: that
+    // drain waits until the current event's signals finish. Connect consumers
+    // BEFORE binding the transport or they will miss buffered events.
     void setTransport(QIODevice* transport);
     QIODevice* transport() const { return m_transport; }
 
@@ -340,6 +340,9 @@ private:
     // bytes up to the NEXT newline are that frame's tail, not an event, and are
     // dropped without being parsed. Cleared with m_readBuffer on rebind.
     bool m_discardingLine = false;
+    // Re-entrant readyRead may append bytes, but must not apply a later event
+    // before all signals for the current event have reached their consumers.
+    bool m_processingRead = false;
     // devSessionId -> (terminalId -> status). Evicted only in whole
     // Dev Session subtrees by retainDevSessions(), called after the sidebar is
     // rebuilt from the server: ids are server-minted and never reused, so a Dev

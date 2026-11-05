@@ -105,6 +105,7 @@ Item {
     // object is fully built, so exactly one path issues the request.
     property bool started: false
     onRemotePathChanged: if (root.started) root.reload()
+    onRepoRootChanged: if (root.started) root.reload()
     Component.onCompleted: {
         root.started = true;
         root.reload();
@@ -117,6 +118,10 @@ Item {
     function requestImage(writtenPath) {
         if (writtenPath.length === 0 || !root.service)
             return;
+        if (root.repoRoot.length === 0) {
+            root.refuseImage(writtenPath, qsTr("the project root is unavailable"));
+            return;
+        }
         if (root.imageSources[writtenPath] !== undefined
                 || root.imagePending[writtenPath] !== undefined
                 || root.imageRefused[writtenPath] !== undefined)
@@ -181,20 +186,24 @@ Item {
         }
 
         function onFileError(path, message) {
-            // Two conversations arrive on this signal: the document read, and
-            // every resolvePath failure. Both are matched, neither is guessed.
-            if (path === root.requestedPath) {
-                root.requestedPath = "";
-                root.loading = false;
-                root.errorText = message;
+            if (path !== root.requestedPath)
                 return;
-            }
+            root.requestedPath = "";
+            root.loading = false;
+            root.errorText = message;
+        }
+
+        function onPathResolveError(path, base, message) {
+            if (base !== root.repoRoot)
+                return;
             const key = root.pendingKeyFor(path);
             if (key.length > 0)
                 root.refuseImage(key, message);
         }
 
-        function onPathResolved(path, resolvedPath, insideRepositoryRoot) {
+        function onPathResolved(path, base, resolvedPath, insideRepositoryRoot) {
+            if (base !== root.repoRoot)
+                return;
             const key = root.pendingKeyFor(path);
             if (key.length === 0)
                 return;
@@ -332,7 +341,7 @@ Item {
     // wrapping working: Qt Quick's Text cannot style part of its own string
     // without rich text, and rich text is banned here, so several Text items are
     // the only honest way to show a bold word inside a wrapped paragraph.
-    component SpanText: Flow {
+    component SpanText: Column {
         id: spanFlow
         property string body: ""
         property var spans: []
@@ -364,75 +373,78 @@ Item {
             return out;
         }
 
-        // Words, so the Flow can break lines. A run of whitespace is APPENDED to
-        // the word before it rather than becoming an item of its own: a lone
-        // space item is a wrappable child, so the Flow could put it at the start
-        // of a line and indent that line by a space.
-        //
-        // Two exceptions, both to keep a space from inheriting a style it does
-        // not have: whitespace containing a newline stays its own item because
-        // that one has to FORCE a break, and whitespace after a link or a code
-        // run stays its own PLAIN item rather than being underlined or set in the
-        // monospace face.
-        readonly property var words: {
-            const out = [];
-            for (let i = 0; i < spanFlow.runs.length; ++i) {
-                const run = spanFlow.runs[i];
-                const pieces = run.text.split(/(\s+)/);
-                for (let j = 0; j < pieces.length; ++j) {
-                    if (pieces[j].length === 0)
-                        continue;
-                    if (/^\s+$/.test(pieces[j]) && pieces[j].indexOf("\n") < 0) {
-                        const prev = out.length > 0 ? out[out.length - 1] : null;
-                        if (prev && !prev.newline && prev.target.length === 0
-                                && !prev.code) {
-                            prev.text += pieces[j];
-                            continue;
-                        }
-                        out.push({ text: pieces[j], strong: false,
-                                   emphasis: false, code: false, target: "",
-                                   newline: false });
+        // One Flow per explicit line. A full-width fake newline child either
+        // adds a blank row or is ignored when its empty Text has zero height.
+        // Keeping lines separate preserves the file's line structure.
+        readonly property var lines: {
+            const out = [[]];
+            for (const run of spanFlow.runs) {
+                const pieces = run.text.match(/[^\s]+|[^\S\n]+|\n/g) || [];
+                for (const piece of pieces) {
+                    if (piece === "\n") {
+                        out.push([]);
                         continue;
                     }
-                    out.push({ text: pieces[j], strong: run.strong,
-                               emphasis: run.emphasis, code: run.code,
-                               target: run.target,
-                               newline: pieces[j].indexOf("\n") >= 0 });
+                    const line = out[out.length - 1];
+                    if (/^\s+$/.test(piece)) {
+                        const prev = line.length > 0 ? line[line.length - 1] : null;
+                        if (prev && prev.target.length === 0 && !prev.code) {
+                            prev.text += piece;
+                            continue;
+                        }
+                        line.push({ text: piece, strong: false,
+                                    emphasis: false, code: false, target: "" });
+                    } else {
+                        line.push({ text: piece, strong: run.strong,
+                                    emphasis: run.emphasis, code: run.code,
+                                    target: run.target });
+                    }
                 }
             }
             return out;
         }
 
+        TextMetrics {
+            id: lineMetrics
+            font.pixelSize: spanFlow.size
+            text: "M"
+        }
         Repeater {
-            model: spanFlow.words
-            delegate: Item {
+            model: spanFlow.lines
+            delegate: Flow {
+                id: lineFlow
                 required property var modelData
-                // A run containing a newline forces the Flow onto the next line
-                // by occupying the rest of this one.
-                width: modelData.newline ? spanFlow.width : label.implicitWidth
-                height: label.implicitHeight
-                Text {
-                    id: label
-                    textFormat: Text.PlainText
-                    // Whitespace preserved: the model joined a paragraph's lines
-                    // with '\n' and that is the only layout information the
-                    // author gave us.
-                    text: modelData.newline ? "" : modelData.text
-                    color: modelData.target.length > 0 ? MobileTheme.accent : spanFlow.textColor
-                    font.pixelSize: spanFlow.size
-                    font.bold: spanFlow.bold || modelData.strong
-                    font.italic: modelData.emphasis
-                    font.underline: modelData.target.length > 0
-                    // The application font, not a theme role: MobileTheme names
-                    // only the MONOSPACE family, and the proportional face is
-                    // whatever the platform gives Qt Quick.
-                    font.family: modelData.code ? MobileTheme.monoFamily
-                                                : Qt.application.font.family
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    enabled: modelData.target.length > 0
-                    onClicked: root.offerLink(modelData.target)
+                width: spanFlow.width
+                height: Math.max(implicitHeight, lineMetrics.height)
+                spacing: 0
+                Repeater {
+                    model: lineFlow.modelData
+                    delegate: Item {
+                        required property var modelData
+                        // A URL or identifier may exceed a phone's width. Wrap
+                        // it instead of clipping the only item that contains it.
+                        width: Math.min(label.implicitWidth, Math.max(0, lineFlow.width))
+                        height: label.implicitHeight
+                        Text {
+                            id: label
+                            width: parent.width
+                            textFormat: Text.PlainText
+                            wrapMode: Text.WrapAnywhere
+                            text: modelData.text
+                            color: modelData.target.length > 0 ? MobileTheme.accent : spanFlow.textColor
+                            font.pixelSize: spanFlow.size
+                            font.bold: spanFlow.bold || modelData.strong
+                            font.italic: modelData.emphasis
+                            font.underline: modelData.target.length > 0
+                            font.family: modelData.code ? MobileTheme.monoFamily
+                                                        : Qt.application.font.family
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: modelData.target.length > 0
+                            onClicked: root.offerLink(modelData.target)
+                        }
+                    }
                 }
             }
         }

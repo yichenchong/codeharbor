@@ -240,6 +240,15 @@ private slots:
     void aSaveThatSettledDuringASystemReloadSurvivesItsReply();
     void aRevertReportedDuringASystemReloadStillLetsTheReloadLand();
     void aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevision();
+    void recoveryProbeDoesNotOfferSupersededWork_data();
+    void recoveryProbeDoesNotOfferSupersededWork();
+    void recoveryProbeUsesTheRevisionOfTheBytesRead();
+    void staleSystemReloadFailureDoesNotOverrideASave_data();
+    void staleSystemReloadFailureDoesNotOverrideASave();
+    void recoveryEnvelopeBeyondTheEditableReadLimitIsOffered_data();
+    void recoveryEnvelopeBeyondTheEditableReadLimitIsOffered();
+    void inconsistentRecoveryRangesAreNotOffered_data();
+    void inconsistentRecoveryRangesAreNotOffered();
     void malformedCompletenessFlagIsRejected_data();
     void malformedCompletenessFlagIsRejected();
     void stalePermissionStatCannotChangeASamePathReopen();
@@ -3986,8 +3995,8 @@ void TstEditorController::aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevis
     respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
     servePermissionStat();
 
-    // The probe finds a snapshot left by a PREVIOUS session (a different file,
-    // so nothing is offered) and reads it...
+    // The probe finds this file's snapshot left by a PREVIOUS session and
+    // reads it...
     const QJsonObject probeStat = nextRequest();
     QCOMPARE(method(probeStat), kStat);
     QCOMPARE(reqPath(probeStat), recoveryFilePath());
@@ -4019,18 +4028,18 @@ void TstEditorController::aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevis
     QCOMPARE(snapshotContentOf(retry), QStringLiteral("unsaved work"));
     respondResult(reqId(retry), {{"path", recoveryFilePath()}, {"revision", "rec1"}});
 
-    // Only NOW does the probe's read answer, with the previous file's envelope.
+    // Only NOW does the probe answer with the superseded envelope.
     QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
     respondResult(reqId(probeRead),
                   {{"path", recoveryFilePath()},
                    {"encoding", "utf-8"},
-                   {"content", snapshotEnvelope(QStringLiteral("/foo/other.txt"),
-                                                QStringLiteral("someone else's edits"))},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                                QStringLiteral("older unsaved work"))},
                    {"revision", "rec0"},
                    {"truncated", false}});
     QTest::qWait(100);
     QVERIFY2(recoverySpy.isEmpty(),
-             "a snapshot belonging to another file was offered as this one's");
+             "a superseded snapshot was offered over newer unsaved work");
 
     // The save succeeds, so the snapshot of the bytes it wrote is obsolete and
     // must be truncated — guarded by the revision the RETRY produced, not the one
@@ -4051,6 +4060,314 @@ void TstEditorController::aSnapshotWrittenDuringTheRecoveryProbeKeepsItsOwnRevis
     QCOMPARE(reqPath(truncate), recoveryFilePath());
     QCOMPARE(reqContent(truncate), QString());
     QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("rec1"));
+}
+
+void TstEditorController::recoveryProbeDoesNotOfferSupersededWork_data()
+{
+    QTest::addColumn<QString>("operation");
+    QTest::newRow("immediate-edit") << QStringLiteral("edit");
+    QTest::newRow("save-in-flight") << QStringLiteral("saving");
+    QTest::newRow("save-completed") << QStringLiteral("saved");
+}
+
+void TstEditorController::recoveryProbeDoesNotOfferSupersededWork()
+{
+    QFETCH(QString, operation);
+    makePair();
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "orig"},
+                                {"revision", "r1"}, {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    const QJsonObject probeStat = nextRequest();
+    QCOMPARE(method(probeStat), kStat);
+    respondResult(reqId(probeStat), {{"revision", "rec0"}});
+    const QJsonObject probeRead = nextRequest();
+    QCOMPARE(method(probeRead), kReadFile);
+
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    QJsonObject save;
+    if (operation == QLatin1String("edit")) {
+        // The immediate edit observation precedes the full-text debounce.
+        m_controller->reportDirty(true, QStringLiteral("r1"));
+    } else {
+        m_controller->save(QStringLiteral("newly saved work"), QStringLiteral("r1"));
+        save = nextRequest();
+        QCOMPARE(method(save), kWriteFile);
+        QCOMPARE(reqPath(save), QStringLiteral("/foo/f.txt"));
+        if (operation == QLatin1String("saved")) {
+            respondResult(reqId(save), {{"revision", "r2"}});
+            QTRY_COMPARE(savedSpy.count(), 1);
+        }
+    }
+
+    respondResult(reqId(probeRead),
+                  {{"encoding", "utf-8"},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                                QStringLiteral("old recovery work"))},
+                   {"revision", "rec0"}, {"truncated", false}});
+    QTest::qWait(100);
+    QVERIFY2(recoverySpy.isEmpty(),
+             "late recovery must not offer work superseded by an edit or save");
+    if (operation == QLatin1String("edit")) {
+        QVERIFY(m_controller->dirty());
+        QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+        return;
+    }
+    if (operation == QLatin1String("saving")) {
+        respondResult(reqId(save), {{"revision", "r2"}});
+        QTRY_COMPARE(savedSpy.count(), 1);
+    }
+    // A save that beat the probe must still retire the discovered snapshot.
+    const QJsonObject truncate = nextRequest();
+    QCOMPARE(method(truncate), kWriteFile);
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("rec0"));
+    QVERIFY(!m_controller->dirty());
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+}
+
+void TstEditorController::recoveryProbeUsesTheRevisionOfTheBytesRead()
+{
+    makePair();
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "orig"},
+                                {"revision", "r1"}, {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    const QJsonObject probeStat = nextRequest();
+    QCOMPARE(method(probeStat), kStat);
+    respondResult(reqId(probeStat), {{"revision", "rec0"}});
+    const QJsonObject probeRead = nextRequest();
+    QCOMPARE(method(probeRead), kReadFile);
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    // The snapshot changed between stat and read. Only the latter's token
+    // guards the bytes actually discovered by the probe.
+    respondResult(reqId(probeRead),
+                  {{"encoding", "utf-8"},
+                   {"content", snapshotEnvelope(QStringLiteral("/foo/f.txt"),
+                                                QStringLiteral("recovered work"))},
+                   {"revision", "rec1"}, {"truncated", false}});
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), QStringLiteral("recovered work"));
+    QSignalSpy savedSpy(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("recovered work"), QStringLiteral("r1"));
+    const QJsonObject save = nextRequest();
+    QCOMPARE(method(save), kWriteFile);
+    respondResult(reqId(save), {{"revision", "r2"}});
+    QTRY_COMPARE(savedSpy.count(), 1);
+    const QJsonObject truncate = nextRequest();
+    QCOMPARE(method(truncate), kWriteFile);
+    QCOMPARE(reqPath(truncate), recoveryFilePath());
+    QCOMPARE(reqContent(truncate), QString());
+    QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("rec1"));
+}
+
+void TstEditorController::staleSystemReloadFailureDoesNotOverrideASave_data()
+{
+    QTest::addColumn<QString>("outcome");
+    QTest::newRow("save-in-flight") << QStringLiteral("saving");
+    QTest::newRow("save-succeeded") << QStringLiteral("clean");
+    QTest::newRow("save-conflicted") << QStringLiteral("conflict");
+}
+
+void TstEditorController::staleSystemReloadFailureDoesNotOverrideASave()
+{
+    QFETCH(QString, outcome);
+    makePair();
+    openClean(QStringLiteral("/foo/f.txt"), QStringLiteral("orig"),
+              QStringLiteral("r1"));
+    QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
+    sendNotification(kWatchEvent, {{"subscriptionId", "sub1"},
+                                   {"path", "/foo/f.txt"},
+                                   {"event", "modified"}, {"revision", "r5"}});
+    const QJsonObject reload = nextRequest();
+    QCOMPARE(method(reload), kReadFile);
+    m_controller->save(QStringLiteral("new work"), QStringLiteral("r1"));
+    const QJsonObject save = nextRequest();
+    QCOMPARE(method(save), kWriteFile);
+    if (outcome == QLatin1String("clean")) {
+        respondResult(reqId(save), {{"revision", "r2"}});
+    } else if (outcome == QLatin1String("conflict")) {
+        respondError(reqId(save), ch::rpc::kRevisionMismatch,
+                     QStringLiteral("changed on disk"),
+                     QJsonObject{{"currentRevision", "r5"}});
+    }
+    QTRY_COMPARE(m_controller->fileState(), outcome);
+
+    // This failure belongs to the read started before the save, not to the
+    // write whose outcome is now authoritative for the pane.
+    respondError(reqId(reload), -32000, QStringLiteral("old read failed"));
+    QTest::qWait(100);
+    QCOMPARE(m_controller->fileState(), outcome);
+    QCOMPARE(m_controller->revision(),
+             outcome == QLatin1String("clean") ? QStringLiteral("r2")
+                                               : QStringLiteral("r1"));
+    QCOMPARE(m_controller->dirty(), outcome != QLatin1String("clean"));
+    QVERIFY(contentSpy.isEmpty());
+}
+
+void TstEditorController::recoveryEnvelopeBeyondTheEditableReadLimitIsOffered_data()
+{
+    QTest::addColumn<QString>("kind");
+    QTest::newRow("editable-limit-ascii") << QStringLiteral("ascii");
+    QTest::newRow("escaped-envelope-over-response-limit") << QStringLiteral("escaped");
+    QTest::newRow("multibyte-codepoint-split") << QStringLiteral("multibyte");
+}
+
+void TstEditorController::recoveryEnvelopeBeyondTheEditableReadLimitIsOffered()
+{
+    QFETCH(QString, kind);
+    QString recovered;
+    if (kind == QLatin1String("ascii"))
+        recovered = QString(EditorController::kMaxEditableReadBytes, QLatin1Char('x'));
+    else if (kind == QLatin1String("escaped"))
+        recovered = QString(4 * 1024 * 1024 - 128 * 1024, QLatin1Char('"'));
+    else
+        recovered = QString(2 * 1024 * 1024 - 13, QLatin1Char('x'))
+            + QString::fromUtf8("\xF0\x9F\x98\x80") + QStringLiteral("tail");
+    const QString envelope = snapshotEnvelope(QStringLiteral("/foo/f.txt"), recovered);
+    const QByteArray raw = envelope.toUtf8();
+    const QJsonObject wholeResult{{"path", recoveryFilePath()}, {"encoding", "utf-8"},
+                                  {"content", envelope}, {"revision", "rec1"},
+                                  {"truncated", false}};
+    const qsizetype wholeResultSize =
+        QJsonDocument(wholeResult).toJson(QJsonDocument::Compact).size();
+    // The escaped case can be written under the 16 MiB request limit, yet its
+    // otherwise-identical full read cannot fit the 15 MiB result limit.
+    const QJsonObject write{{"jsonrpc", "2.0"}, {"id", 1}, {"method", kWriteFile},
+                            {"params", QJsonObject{{"path", recoveryFilePath()},
+                                                   {"content", envelope},
+                                                   {"expectedRevision", ""}}}};
+    QVERIFY(QJsonDocument(write).toJson(QJsonDocument::Compact).size() < 16 * 1024 * 1024);
+    if (kind == QLatin1String("ascii"))
+        QVERIFY(raw.size() > EditorController::kMaxEditableReadBytes);
+    if (kind == QLatin1String("escaped"))
+        QVERIFY(wholeResultSize > 15 * 1024 * 1024);
+
+    makePair();
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "orig"},
+                                {"revision", "r1"}, {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    const QJsonObject probeStat = nextRequest();
+    QCOMPARE(method(probeStat), kStat);
+    respondResult(reqId(probeStat), {{"revision", "rec1"}, {"size", raw.size()}});
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    qsizetype offset = 0;
+    int ranges = 0;
+    while (true) {
+        const QJsonObject range = nextRequest();
+        QCOMPARE(method(range), kReadFile);
+        QCOMPARE(reqPath(range), recoveryFilePath());
+        QCOMPARE(reqOffset(range), offset);
+        const qint64 length = reqLength(range);
+        QVERIFY(length > 0 && length <= 16 * 1024 * 1024);
+        const QByteArray chunk = raw.mid(offset, length);
+        const bool base64 = kind == QLatin1String("multibyte");
+        const QJsonObject result{
+            {"path", recoveryFilePath()}, {"encoding", base64 ? "base64" : "utf-8"},
+            {"content", base64 ? QString::fromLatin1(chunk.toBase64())
+                               : QString::fromUtf8(chunk)},
+            {"revision", "rec1"},
+            {"truncated", offset > 0 || offset + chunk.size() < raw.size()}};
+        QVERIFY(QJsonDocument(result).toJson(QJsonDocument::Compact).size()
+                < 15 * 1024 * 1024);
+        respondResult(reqId(range), result);
+        offset += chunk.size();
+        ++ranges;
+        if (chunk.size() < length || offset == EditorController::kMaxRecoveryReadBytes)
+            break;
+    }
+    QVERIFY(ranges > 1);
+    const QJsonObject finalStat = nextRequest();
+    QCOMPARE(method(finalStat), kStat);
+    respondResult(reqId(finalStat), {{"revision", "rec1"}, {"size", raw.size()}});
+    QTRY_COMPARE(recoverySpy.count(), 1);
+    QCOMPARE(recoverySpy.at(0).at(0).toString(), recovered);
+}
+
+void TstEditorController::inconsistentRecoveryRangesAreNotOffered_data()
+{
+    QTest::addColumn<QString>("failure");
+    QTest::newRow("changed-range-revision") << QStringLiteral("revision");
+    QTest::newRow("short-truncated-first-range") << QStringLiteral("first-short");
+    QTest::newRow("missing-final-bytes") << QStringLiteral("last-short");
+    QTest::newRow("changed-final-stat") << QStringLiteral("final-stat");
+    QTest::newRow("superseded-recovery-key") << QStringLiteral("key");
+}
+
+void TstEditorController::inconsistentRecoveryRangesAreNotOffered()
+{
+    QFETCH(QString, failure);
+    const QByteArray raw = snapshotEnvelope(
+        QStringLiteral("/foo/f.txt"),
+        QString(2 * 1024 * 1024 + 100, QLatin1Char('x'))).toUtf8();
+    makePair();
+    m_controller->ready();
+    m_controller->open(QStringLiteral("/foo/f.txt"));
+    const QJsonObject read = nextRequest();
+    respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "orig"},
+                                {"revision", "r1"}, {"truncated", false}});
+    const QJsonObject watch = nextRequest();
+    respondResult(reqId(watch), {{"subscriptionId", "sub1"}});
+    servePermissionStat();
+    const QJsonObject probeStat = nextRequest();
+    respondResult(reqId(probeStat), {{"revision", "rec1"}, {"size", raw.size()}});
+    const QJsonObject first = nextRequest();
+    QCOMPARE(method(first), kReadFile);
+    const qint64 length = reqLength(first);
+    QSignalSpy recoverySpy(m_controller, &EditorController::recoveryAvailable);
+    respondResult(reqId(first),
+                  {{"encoding", "utf-8"},
+                   {"content", QString::fromUtf8(raw.left(
+                        failure == QLatin1String("first-short") ? length - 1 : length))},
+                   {"revision", "rec1"}, {"truncated", true}});
+    if (failure != QLatin1String("first-short")) {
+        const QJsonObject last = nextRequest();
+        QCOMPARE(method(last), kReadFile);
+        QCOMPARE(reqOffset(last), length);
+        if (failure == QLatin1String("key")) {
+            m_controller->setRecoveryId(QStringLiteral("another-pane"));
+            const QJsonObject newProbe = nextRequest();
+            QCOMPARE(method(newProbe), kStat);
+            respondError(reqId(newProbe), -32000, QStringLiteral("no recovery"));
+        }
+        QByteArray tail = raw.mid(length);
+        if (failure == QLatin1String("last-short"))
+            tail.chop(1);
+        respondResult(reqId(last),
+                      {{"encoding", "utf-8"}, {"content", QString::fromUtf8(tail)},
+                       {"revision", failure == QLatin1String("revision") ? "rec2" : "rec1"},
+                       {"truncated", true}});
+        if (failure == QLatin1String("last-short")
+            || failure == QLatin1String("final-stat")) {
+            const QJsonObject finalStat = nextRequest();
+            QCOMPARE(method(finalStat), kStat);
+            respondResult(reqId(finalStat),
+                          {{"revision", failure == QLatin1String("final-stat") ? "rec2" : "rec1"},
+                           {"size", raw.size()}});
+        }
+    }
+    QTest::qWait(100);
+    QVERIFY(recoverySpy.isEmpty());
+    QCOMPARE(m_controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
 }
 
 void TstEditorController::malformedCompletenessFlagIsRejected_data()

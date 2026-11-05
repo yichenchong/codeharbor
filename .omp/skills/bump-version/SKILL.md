@@ -65,7 +65,8 @@ Create `.bumpversion.json` at the repository root:
   entry, and one entry per workspace named in the manifest's `workspaces` list
   all in step. Wildcard workspace patterns are rejected rather than guessed at.
 
-Every path must be relative to the repository root and must stay inside it.
+Every path must be relative to the repository root and must stay inside it,
+including after resolving symlinks.
 
 ### Wiring it into continuous integration
 
@@ -118,7 +119,8 @@ What it does, in order:
 9. With `--push`, runs the configured preflight commands. They run **before**
    the tag is created, so a failed build cannot consume another public version
    number.
-10. Creates the annotated tag, and with `--push` pushes the commit and the tag.
+10. Creates the annotated tag, and with `--push` atomically pushes the commit and
+    the tag. A rejected branch update cannot publish the tag on its own.
 
 It **does not push by default**; it prints the push command instead. Pushing is
 usually what actually starts a release build.
@@ -141,6 +143,9 @@ usually what actually starts a release build.
   in-progress version edits are never clobbered.
 * Stages and commits only the configured version files; unrelated working-tree
   or already-staged changes are left untouched.
+* Pushes the branch and tag with `git push --atomic`. If the remote rejects
+  either update or does not support atomic pushes, neither is published; the
+  local release commit and tag remain available for retry.
 * **Aborts before tagging if the commit being tagged does not carry the version
   being tagged.** A tag is permanent, and one whose tree says `0.1.8` under a
   release page called `v0.2.0` publishes artefacts that all announce the wrong
@@ -153,9 +158,11 @@ usually what actually starts a release build.
 * `tests/bump_version_tag.sh` exercises the release and safety paths: a
   malformed lock file proving that a failed update leaves every version file
   byte-identical, an uncommitted edit and an already-existing tag both being
-  refused before anything is rewritten, a configured path that points outside
-  the repository being rejected, a wildcard workspace pattern being refused
-  rather than guessed at, and a rewritten file keeping its mode.
+  refused before anything is rewritten, configured paths escaping the repository
+  directly or through symlinks being rejected, ordinary dotted filenames being
+  accepted, a wildcard workspace pattern being refused rather than guessed at,
+  a rewritten file keeping its mode, and a rejected branch push leaving no
+  remote release tag.
 
 ## The tool underneath
 
@@ -179,7 +186,7 @@ bash .omp/skills/bump-version/bump.sh patch --dry-run
 
 # Cut a patch release locally (commit + tag), then push manually
 bash .omp/skills/bump-version/bump.sh patch
-git push origin HEAD v0.1.1
+git push --atomic origin HEAD v0.1.1
 
 # Cut a minor release and push in one step
 bash .omp/skills/bump-version/bump.sh minor --push

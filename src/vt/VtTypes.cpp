@@ -27,6 +27,8 @@ struct Range {
 // contiguous CJK blocks merged into single spans. Ranges that are Wide only
 // under emoji presentation (the Emoji_Presentation set) are included, because
 // that is what every modern terminal and every terminal font does.
+// Emoji ranges below follow Unicode 16.0:
+// https://www.unicode.org/Public/16.0.0/ucd/EastAsianWidth.txt
 constexpr Range kWideRanges[] = {
     {0x1100, 0x115F},   // Hangul Jamo initial consonants
     {0x231A, 0x231B},   {0x2329, 0x232A},   {0x23E9, 0x23EC},   {0x23F0, 0x23F0},
@@ -58,11 +60,11 @@ constexpr Range kWideRanges[] = {
     {0x1F3F4, 0x1F3F4}, {0x1F3F8, 0x1F43E}, {0x1F440, 0x1F440}, {0x1F442, 0x1F4FC},
     {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E}, {0x1F550, 0x1F567}, {0x1F57A, 0x1F57A},
     {0x1F595, 0x1F596}, {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F}, {0x1F680, 0x1F6C5},
-    {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6D7}, {0x1F6EB, 0x1F6EC},
-    {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F90C, 0x1F93A}, {0x1F93C, 0x1F945},
-    {0x1F947, 0x1F978}, {0x1F97A, 0x1F9CB}, {0x1F9CD, 0x1F9FF}, {0x1FA70, 0x1FA74},
-    {0x1FA78, 0x1FA7A}, {0x1FA80, 0x1FA86}, {0x1FA90, 0x1FAA8}, {0x1FAB0, 0x1FAB6},
-    {0x1FAC0, 0x1FAC2}, {0x1FAD0, 0x1FAD6},
+    {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6D7}, {0x1F6DC, 0x1F6DF},
+    {0x1F6EB, 0x1F6EC}, {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F7F0, 0x1F7F0},
+    {0x1F90C, 0x1F93A}, {0x1F93C, 0x1F945}, {0x1F947, 0x1F9FF}, {0x1FA70, 0x1FA7C},
+    {0x1FA80, 0x1FA89}, {0x1FA8F, 0x1FAC6}, {0x1FACE, 0x1FADC}, {0x1FADF, 0x1FAE9},
+    {0x1FAF0, 0x1FAF8},
     {0x20000, 0x2FFFD}, // CJK extension B..F
     {0x30000, 0x3FFFD}, // CJK extension G
 };
@@ -102,6 +104,12 @@ int charWidth(char32_t codePoint)
     // hyphens silently vanish is wrong in a way the user cannot explain.
     if (codePoint == 0x00AD)
         return 1;
+
+    // Hangul medial vowels and final consonants combine with a preceding Jamo
+    // or syllable despite their Letter_Other category. Counting them as cells
+    // prevents NFC composition and shifts decomposed Korean text to the right.
+    if (codePoint >= 0x1160 && codePoint <= 0x11FF)
+        return 0;
 
     // Combining marks and format characters (ZWJ, ZWNJ, the bidi controls)
     // advance nothing: they modify the cell that precedes them. Non-spacing (Mn)

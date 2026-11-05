@@ -274,11 +274,13 @@ if [ "$DO_PUSH" -eq 1 ]; then
     # remote. Refuse instead: the tag exists locally at this point, so say so
     # and let the caller push it from a real branch.
     [ "$branch" != "HEAD" ] \
-        || die "HEAD is detached, so there is no branch to push. $tag was created locally; check out the release branch and run: git push $GIT_REMOTE HEAD $tag"
-    git push "$GIT_REMOTE" "$branch" "$tag"
+        || die "HEAD is detached, so there is no branch to push. $tag was created locally; check out the release branch and run: git push --atomic $GIT_REMOTE HEAD $tag"
+    # Never publish the release tag if the branch update is rejected: otherwise
+    # Git can accept the tag, trigger release CI, and still report push failure.
+    git push --atomic "$GIT_REMOTE" "$branch" "$tag"
     echo "Pushed $branch and $tag to $GIT_REMOTE"
 else
     echo
     echo "Next: push to trigger the release workflow:"
-    echo "  git push $GIT_REMOTE HEAD $tag"
+    echo "  git push --atomic $GIT_REMOTE HEAD $tag"
 fi

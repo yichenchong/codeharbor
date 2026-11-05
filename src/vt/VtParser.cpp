@@ -851,9 +851,10 @@ void VtParser::dispatchOsc()
 
     switch (code) {
     case 0: // set icon name and window title
-    case 1: // set icon name
     case 2: // set window title
         break;
+    case 1: // set icon name only; this engine has no icon-name consumer
+        return;
     default:
         // OSC 4 (palette), 7 (cwd), 8 (hyperlink), 52 (clipboard), 133 (prompt
         // marks) and everything else: parsed to their terminator above and

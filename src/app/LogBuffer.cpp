@@ -47,6 +47,7 @@ struct LogBuffer::HandlerLease {
 QMutex LogBuffer::s_handlerMutex;
 QVector<std::shared_ptr<LogBuffer::HandlerLease>> LogBuffer::s_handlerBuffers;
 QtMessageHandler LogBuffer::s_previousHandler = nullptr;
+bool LogBuffer::s_handlerInstalled = false;
 
 namespace {
 QString messageSource(const QMessageLogContext& context)
@@ -105,8 +106,13 @@ LogBuffer::LogBuffer(int maxEntries, int maxBytes, QObject* parent)
     // only for already-running deliveries, so the pointer cannot dangle and no
     // Qt signal is emitted while either lifetime lock is held.
     QMutexLocker locker(&s_handlerMutex);
-    if (s_handlerBuffers.isEmpty())
+    // The last buffer may already be unregistered while its destructor waits
+    // for an active delivery. Our handler is still installed during that gap;
+    // reinstalling it would replace the saved external sink with ourselves.
+    if (!s_handlerInstalled) {
         s_previousHandler = qInstallMessageHandler(&LogBuffer::messageHandler);
+        s_handlerInstalled = true;
+    }
     s_handlerBuffers.push_back(m_handlerLease);
 }
 
@@ -140,6 +146,7 @@ LogBuffer::~LogBuffer()
     if (current != &LogBuffer::messageHandler)
         qInstallMessageHandler(current);
     s_previousHandler = nullptr;
+    s_handlerInstalled = false;
 }
 
 QString LogBuffer::severityName(QtMsgType severity)

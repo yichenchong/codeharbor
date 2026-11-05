@@ -6,9 +6,9 @@
 // Strongly-typed identifier wrappers for the core data model. Using distinct
 // types prevents accidentally passing, e.g., a TerminalId where a DevSessionId
 // is expected. GroupId, DevSessionId, ViewerPaneId and TerminalId are opaque
-// UUID strings minted server-side (remote/src/workspace.ts). ServerId is the
-// exception: it names WHICH codeharbord host a row belongs to (SPEC 3.5) and is
-// chosen client-side, so it is an arbitrary opaque string rather than a UUID.
+// UUID strings minted server-side (remote/src/workspace.ts). ServerId instead
+// names WHICH codeharbord host a row belongs to (SPEC 3.5): it is the opaque
+// identity reported by that server's server.info response.
 namespace ch {
 
 struct GroupId {

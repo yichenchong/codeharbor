@@ -179,9 +179,9 @@ public:
     //
     // TERMINAL REGION: the new leaf also needs a `terminal_panes` row of its
     // own, and that is a server round trip. It is NOT waited for. The leaf is
-    // published (and persisted) immediately with no terminalPaneId so the split
-    // is instant, the row is minted in the background, and its id is written
-    // into the leaf when it lands. Until then the leaf is PENDING and the pane
+    // published immediately so the split is instant, the row is minted in the
+    // background, and persistence waits until its id is written into the leaf.
+    // Until then the leaf is PENDING and the pane
     // attaches nothing at all: it is published to QML without the
     // `terminalLegacy` marker below, which is precisely the state that means
     // "wait, your identity is coming". It deliberately does NOT fall back to
@@ -190,11 +190,12 @@ public:
     //
     // A mint that FAILS - the server refuses it, answers without an id, or
     // never answers at all within terminalMintTimeoutMs() - reports through
-    // error() and REMOVES the leaf again, so the user sees the split undone
-    // with a reason rather than a pane that can never come up; so an id-less
-    // terminal leaf, which a later load would have to read as a legacy one, is
-    // not left behind on the server; and so the region becomes writable again
-    // (persist() refuses to write a tree with a pending leaf in it).
+    // error() and REMOVES a still-pending leaf again. A leaf already bound by
+    // a newer authored tree is left alone. This undoes a failed split with a
+    // reason rather than leaving a pane that can never come up. No id-less
+    // terminal leaf is left on the server to be misread as a legacy one, and
+    // the region becomes writable again (persist() refuses to write a tree
+    // with a pending leaf in it).
     Q_INVOKABLE QString splitPane(QString region, QString paneId,
                                   QString orientation);
 

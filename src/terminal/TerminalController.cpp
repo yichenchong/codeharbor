@@ -296,10 +296,16 @@ bool TerminalController::sendInput(const QByteArray &bytes)
     // bytes on the remote side), and a single `write() == size()` compare would
     // silently throw the remainder away — half of a pasted command line, or the
     // tail of a multi-byte keystroke, typed into the user's shell.
+    const QPointer<TerminalController> self(this);
+    const QPointer<QIODevice> inputTransport = m_transport;
     qint64 sent = 0;
     while (sent < bytes.size()) {
+        // A write can emit channelError synchronously. Its handler may detach
+        // or replace the PTY; never send an old input suffix to that new shell.
+        if (!self || !inputTransport || m_transport != inputTransport)
+            return false;
         const qint64 written =
-            m_transport->write(bytes.constData() + sent, bytes.size() - sent);
+            inputTransport->write(bytes.constData() + sent, bytes.size() - sent);
         if (written <= 0)
             return false; // error, or no progress possible: report the loss
         sent += written;

@@ -166,7 +166,7 @@ export function sendControlRequest(
     } catch {
         return Promise.resolve(refusal("bad_request", "the request could not be serialized as JSON"));
     }
-    if (Buffer.byteLength(payload) > MAX_CONTROL_LINE_BYTES) {
+    if (Buffer.byteLength(payload) - 1 > MAX_CONTROL_LINE_BYTES) {
         return Promise.resolve(
             refusal("bad_request", `the request is larger than the ${MAX_CONTROL_LINE_BYTES}-byte limit`),
         );

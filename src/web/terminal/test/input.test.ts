@@ -176,6 +176,28 @@ test("a paste larger than one flow-control window drains in order", async () => 
     assert.ok(sent.length > 8, "the fixture must cross several input windows");
 });
 
+test("a queued paste yields to other tasks and new input cannot bypass that yield", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const sent: string[] = [];
+    const writer = new TerminalInputWriter({
+        sendInput(data) { sent.push(data); },
+        sendBinaryInput: noBinaryInput,
+    }, 2);
+    try {
+        writer.write("abcdefgh");
+        assert.deepEqual(sent, ["ab"], "idle input starts immediately");
+        await Promise.resolve();
+        assert.deepEqual(sent, ["ab"], "microtasks must not drain the paste");
+        writer.write("!");
+        assert.deepEqual(sent, ["ab"], "new input waits behind the scheduled drain");
+        assert.equal(writer.backlogSize, 7);
+    } finally {
+        writer.close();
+    }
+    t.mock.timers.runAll();
+    assert.deepEqual(sent, ["ab"], "closing cancels delivery from a pending drain");
+});
+
 test("invalid chunk bounds are rejected instead of disabling pacing", () => {
     assert.throws(() => chunkTerminalInput("data", 0), RangeError);
     assert.throws(

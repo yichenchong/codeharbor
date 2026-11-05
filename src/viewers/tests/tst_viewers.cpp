@@ -209,6 +209,7 @@ private slots:
     // the signal the pane binds to.
     void resolvePathCarriesTheRepositoryRootFlag();
     void resolvePathFailuresLeaveTheFlagUndetermined();
+    void resolvePathRepliesIdentifyTheirRepositoryRoot();
     void pinnedInternalUrlSurvivesEviction();
     void pinsAreCountedAndReleasable();
     void responseHeadersLetSvgStyleItself();
@@ -1443,9 +1444,10 @@ void TstViewers::resolvePathCarriesTheRepositoryRootFlag()
     // outstanding question against.
     QCOMPARE(resolved.at(0).at(0).toString(),
              QStringLiteral("/srv/repos/app/src/main.cpp"));
-    QCOMPARE(resolved.at(0).at(1).toString(),
+    QCOMPARE(resolved.at(0).at(1).toString(), QStringLiteral("/srv/repos/app"));
+    QCOMPARE(resolved.at(0).at(2).toString(),
              QStringLiteral("/srv/repos/app/src/main.cpp"));
-    QCOMPARE(resolved.at(0).at(2).toBool(), true);
+    QCOMPARE(resolved.at(0).at(3).toBool(), true);
 
     // The same call for a path in nobody's project. It is answered, not
     // refused: SPEC 9 allows it to be opened and this call never gates it.
@@ -1458,7 +1460,8 @@ void TstViewers::resolvePathCarriesTheRepositoryRootFlag()
                              {QStringLiteral("insideRepositoryRoot"), false}});
     QTRY_COMPARE(resolved.size(), 2);
     QCOMPARE(resolved.at(1).at(0).toString(), QStringLiteral("/etc/hosts"));
-    QCOMPARE(resolved.at(1).at(2).toBool(), false);
+    QCOMPARE(resolved.at(1).at(1).toString(), QStringLiteral("/srv/repos/app"));
+    QCOMPARE(resolved.at(1).at(3).toBool(), false);
 
     QCOMPARE(failures.size(), 0);
 }
@@ -1474,6 +1477,7 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
     offline.resolvePath(QStringLiteral("/etc/hosts"), QStringLiteral("/srv/app"));
     QCOMPARE(offlineFailures.size(), 1);
     QCOMPARE(offlineFailures.at(0).at(0).toString(), QStringLiteral("/etc/hosts"));
+    QCOMPARE(offlineFailures.at(0).at(1).toString(), QStringLiteral("/srv/app"));
     QCOMPARE(offlineResolved.size(), 0);
 
     RpcPair pair;
@@ -1487,7 +1491,8 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
     pair.respondError(pair.nextRequest(), -32603, QStringLiteral("EACCES"));
     QTRY_COMPARE(failures.size(), 1);
     QCOMPARE(failures.at(0).at(0).toString(), QStringLiteral("/p/a.txt"));
-    QCOMPARE(failures.at(0).at(1).toString(), QStringLiteral("EACCES"));
+    QCOMPARE(failures.at(0).at(1).toString(), QStringLiteral("/p"));
+    QCOMPARE(failures.at(0).at(2).toString(), QStringLiteral("EACCES"));
 
     // 2. A reply that simply does not carry the flag (an older daemon). An
     //    absent JSON value reads as false, so defaulting would report EVERY
@@ -1498,6 +1503,7 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
                                     QStringLiteral("/p/b.txt")}});
     QTRY_COMPARE(failures.size(), 2);
     QCOMPARE(failures.at(1).at(0).toString(), QStringLiteral("/p/b.txt"));
+    QCOMPARE(failures.at(1).at(1).toString(), QStringLiteral("/p"));
     QCOMPARE(resolved.size(), 0);
 
     // 3. Without a base the parameter is omitted rather than sent empty: an
@@ -1513,7 +1519,48 @@ void TstViewers::resolvePathFailuresLeaveTheFlagUndetermined()
         QJsonObject{{QStringLiteral("insideRepositoryRoot"), true}});
     QTRY_COMPARE(failures.size(), 3);
     QCOMPARE(failures.at(2).at(0).toString(), QStringLiteral("/p/c.txt"));
+    QCOMPARE(failures.at(2).at(1).toString(), QString());
     QCOMPARE(resolved.size(), 0);
+}
+
+void TstViewers::resolvePathRepliesIdentifyTheirRepositoryRoot()
+{
+    RpcPair pair;
+    QVERIFY(pair.listen());
+    ViewerModel viewers(pair.client());
+    QSignalSpy resolved(&viewers, &ViewerModel::pathResolved);
+    QSignalSpy failures(&viewers, &ViewerModel::pathResolveError);
+    const QString path = QStringLiteral("/srv/app/readme.md");
+    const QString firstBase = QStringLiteral("/srv/app");
+    const QString secondBase = QStringLiteral("/srv/other");
+
+    viewers.resolvePath(path, firstBase);
+    const QJsonObject first = pair.nextRequest();
+    viewers.resolvePath(path, secondBase);
+    const QJsonObject second = pair.nextRequest();
+    // Reverse completion order: the same path alone cannot identify which
+    // pane/session asked whether the file belongs to its own repository.
+    pair.respondResult(second, QJsonObject{
+        {QStringLiteral("path"), path},
+        {QStringLiteral("insideRepositoryRoot"), false},
+    });
+    pair.respondResult(first, QJsonObject{
+        {QStringLiteral("path"), path},
+        {QStringLiteral("insideRepositoryRoot"), true},
+    });
+    QTRY_COMPARE(resolved.size(), 2);
+    QCOMPARE(resolved.at(0).at(0).toString(), path);
+    QCOMPARE(resolved.at(0).at(1).toString(), secondBase);
+    QCOMPARE(resolved.at(0).at(3).toBool(), false);
+    QCOMPARE(resolved.at(1).at(0).toString(), path);
+    QCOMPARE(resolved.at(1).at(1).toString(), firstBase);
+    QCOMPARE(resolved.at(1).at(3).toBool(), true);
+
+    viewers.resolvePath(path, secondBase);
+    pair.respondError(pair.nextRequest(), -32603, QStringLiteral("EACCES"));
+    QTRY_COMPARE(failures.size(), 1);
+    QCOMPARE(failures.at(0).at(0).toString(), path);
+    QCOMPARE(failures.at(0).at(1).toString(), secondBase);
 }
 
 void TstViewers::pinnedInternalUrlSurvivesEviction()

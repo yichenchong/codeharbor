@@ -21,8 +21,8 @@
 // builds the complete new text of every file in memory before it writes a
 // single byte. A malformed lock file or a pattern that no longer matches
 // therefore leaves the whole tree untouched, instead of half-bumped.
-import { chmodSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { chmodSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const CONFIG_NAME = ".bumpversion.json";
 const SEMVER = /^\d+\.\d+\.\d+$/;
@@ -56,7 +56,7 @@ function safePath(root, value, what) {
   }
   const absolute = resolve(root, value);
   const back = relative(root, absolute);
-  if (back === "" || back.startsWith("..") || isAbsolute(back)) {
+  if (back === "" || back === ".." || back.startsWith(`..${sep}`) || isAbsolute(back)) {
     fail(`${what} points outside the repository root: '${value}'`);
   }
   return absolute;
@@ -200,6 +200,12 @@ function loadConfig(root) {
 function readText(root, path, what) {
   const absolute = safePath(root, path, what);
   try {
+    const canonicalRoot = realpathSync(root);
+    const canonical = realpathSync(absolute);
+    const back = relative(canonicalRoot, canonical);
+    if (back === "" || back === ".." || back.startsWith(`..${sep}`) || isAbsolute(back)) {
+      fail(`${path}: ${what} resolves outside the repository root through a symlink`);
+    }
     return { absolute, text: readFileSync(absolute, "utf8") };
   } catch (error) {
     if (error.code === "ENOENT") {

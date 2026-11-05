@@ -16,7 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -690,6 +690,59 @@ test("an overflow cannot dispatch a following request from the same input chunk"
         const replies = output.trim().split("\n").map((line) => JSON.parse(line));
         assert.deepEqual(replies.map((reply) => reply.id), [1]);
         assert.match(errors, /input line exceeded/);
+    } finally {
+        child.kill();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the daemon CLI runs when invoked through a symlink", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-rpc-symlink-"));
+    const script = path.join(dir, "codeharbord.ts");
+    symlinkSync(fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url)), script);
+    const child = spawn(process.execPath, [script, "rpc", "--unknown-option"], {
+        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite") },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let errors = "";
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => { errors += chunk; });
+    const exited = Promise.withResolvers<number | null>();
+    child.once("error", exited.reject);
+    child.once("close", exited.resolve);
+    try {
+        assert.equal(await exited.promise, 2, errors);
+        assert.match(errors, /unknown option '--unknown-option'/);
+    } finally {
+        child.kill();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the bridge CLI binds and shuts down when invoked through a symlink", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-bridge-symlink-"));
+    const script = path.join(dir, "bridge.ts");
+    symlinkSync(fileURLToPath(new URL("../src/bridge.ts", import.meta.url)), script);
+    const child = spawn(process.execPath, [script], {
+        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite") },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let errors = "";
+    const ready = Promise.withResolvers<void>();
+    const exited = Promise.withResolvers<number | null>();
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => {
+        errors += chunk;
+        if (errors.includes("codeharbor-bridge listening on ")) ready.resolve();
+    });
+    child.once("error", ready.reject);
+    child.once("error", exited.reject);
+    child.once("exit", () => ready.reject(new Error(`bridge exited before binding: ${errors}`)));
+    child.once("close", exited.resolve);
+    try {
+        await ready.promise;
+        assert.equal(child.kill("SIGTERM"), true);
+        assert.equal(await exited.promise, 0, errors);
     } finally {
         child.kill();
         rmSync(dir, { recursive: true, force: true });

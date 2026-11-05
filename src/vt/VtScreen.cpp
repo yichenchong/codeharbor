@@ -117,14 +117,6 @@ void VtScreen::allocateGrid()
     m_outOfRangeLine = blank;
 }
 
-void VtScreen::clearWholeGrid()
-{
-    const VtLine blank = blankLine();
-    for (int row = 0; row < m_grid.size(); ++row)
-        m_grid[row] = blank;
-    markAllDamaged();
-}
-
 void VtScreen::resetTabStops()
 {
     m_tabStops.resize(m_columns);
@@ -194,11 +186,13 @@ void VtScreen::resize(int columns, int rows)
 
     m_outOfRangeLine = blank;
 
-    // Tab stops belong to the width, so they are rebuilt rather than clamped: a
-    // stop past the new right edge is unreachable, and a new column past the old
-    // edge would otherwise have no stop at all.
-    if (m_columns != m_tabStops.size())
-        resetTabStops();
+    // Keep application-defined stops in surviving columns. Only newly exposed
+    // columns receive the hardware defaults; resizing must not undo TBC/HTS.
+    if (m_columns != oldColumns) {
+        m_tabStops.resize(m_columns);
+        for (int column = oldColumns; column < m_columns; ++column)
+            m_tabStops[column] = (column % kTabWidth == 0);
+    }
 
     // A deferred wrap computed at the old width would put the next glyph in the
     // wrong column.
@@ -214,6 +208,8 @@ void VtScreen::resize(int columns, int rows)
     m_savedCursor.y = clampInt(m_savedCursor.y, 0, m_rows - 1);
     m_savedCursorAlt.x = clampInt(m_savedCursorAlt.x, 0, m_columns - 1);
     m_savedCursorAlt.y = clampInt(m_savedCursorAlt.y, 0, m_rows - 1);
+    m_savedCursor.pendingWrap = false;
+    m_savedCursorAlt.pendingWrap = false;
 
     m_sizeDirty = true;
     m_cursorDirty = true;
@@ -513,6 +509,10 @@ void VtScreen::printCodePoint(char32_t codePoint)
         if (m_cursorX + 1 >= m_columns) {
             if (!m_autowrap)
                 return; // no room and no wrap: the glyph is dropped, not split
+            // The glyph consumes the remaining margin even though it must be
+            // drawn on the next row. Leaving old text there makes redraws retain
+            // a stale last-column character (or half a wide glyph).
+            eraseCells(m_cursorY, m_cursorX, m_columns);
             m_cursorX = 0;
             lineFeed();
         }
@@ -568,7 +568,7 @@ void VtScreen::backspace()
 void VtScreen::horizontalTab(int count)
 {
     m_pendingWrap = false;
-    for (int step = 0; step < count; ++step) {
+    for (int step = 0; step < count && m_cursorX < m_columns - 1; ++step) {
         int column = m_cursorX + 1;
         while (column < m_columns && !m_tabStops.at(column))
             ++column;
@@ -582,7 +582,7 @@ void VtScreen::horizontalTab(int count)
 void VtScreen::reverseTab(int count)
 {
     m_pendingWrap = false;
-    for (int step = 0; step < count; ++step) {
+    for (int step = 0; step < count && m_cursorX > 0; ++step) {
         int column = m_cursorX - 1;
         while (column > 0 && !m_tabStops.at(column))
             --column;
@@ -750,6 +750,8 @@ void VtScreen::eraseInDisplay(int mode)
         if (!m_history.isEmpty()) {
             m_history.clear();
             m_historyDirty = true;
+            m_historyAdvance = 0;
+            m_historyContentDirty = false;
             markAllDamaged();
         }
         break;
@@ -1242,13 +1244,8 @@ void VtScreen::setMode(int mode, bool enable, bool privateMode)
 
 void VtScreen::enterAltScreen(bool clearOnEnter)
 {
-    if (m_altActive) {
-        if (clearOnEnter) {
-            clearWholeGrid();
-            moveCursor(0, 0);
-        }
+    if (m_altActive)
         return;
-    }
     m_primaryGrid = std::move(m_grid);
     m_grid.clear();
     allocateGrid();
@@ -1291,6 +1288,7 @@ void VtScreen::saveCursor()
     slot.fg = m_fg;
     slot.bg = m_bg;
     slot.valid = true;
+    slot.pendingWrap = m_pendingWrap;
 }
 
 void VtScreen::restoreCursor()
@@ -1308,6 +1306,7 @@ void VtScreen::restoreCursor()
     m_fg = slot.fg;
     m_bg = slot.bg;
     moveCursor(slot.x, slot.y);
+    m_pendingWrap = slot.pendingWrap && m_autowrap && m_cursorX == m_columns - 1;
 }
 
 void VtScreen::alignmentTest()

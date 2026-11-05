@@ -354,13 +354,6 @@ export function mountEditor(
     let applyingHostEdit = false;
     // Whether the buffer diverges from baselineContent (unsaved user edits).
     let dirty = false;
-    // Monotonic count of USER edits to the model. Its only job is to answer
-    // whether the host may have seen an edit while the save was in flight.
-    let editSerial = 0;
-    // Value of editSerial when the bytes currently believed to be on the server
-    // were taken: set by every save this page issues and by every host-driven
-    // load.
-    let baselineEditSerial = 0;
     // Bytes handed to the host by the current save. A successful reply may
     // arrive after more edits, so it must re-baseline against these bytes rather
     // than whatever the model contains at reply time.
@@ -537,7 +530,6 @@ export function mountEditor(
         // and hand those same bytes to the save rather than reading the buffer
         // a second time.
         pendingSaveContent = bufferText(editor);
-        baselineEditSerial = editSerial;
         reporter.save(revision, pendingSaveContent);
     }
 
@@ -591,9 +583,6 @@ export function mountEditor(
         baselineContent = content;
         pendingSaveContent = undefined;
         localEditsHeld = false;
-        // The buffer now IS the file, so a save reported later must not be
-        // second-guessed by edits this load already superseded.
-        baselineEditSerial = editSerial;
         clearNotice();
         // A snapshot armed by edits this load supersedes must not be sent: it
         // would re-flag the freshly loaded buffer as dirty.
@@ -683,15 +672,12 @@ export function mountEditor(
             // external change auto-reload over it (SPEC 8.7).
             reporter.report();
         } else {
-            // If a report for edits that were later undone already reached the
-            // host, tell it that the recovery bytes now match the saved file.
+            // The host may have observed edits during the write, even when a
+            // repeated save of identical bytes joined the same write. Always
+            // reconcile against the confirmed revision; request counts cannot
+            // prove which edit observations the host has already processed.
             reporter.cancel();
-            if (editSerial !== baselineEditSerial)
-                bridge.reportContent(savedContent);
-            // The server's bytes ARE the current buffer, so this is the edit
-            // count they were taken at; without this a later reply would
-            // re-send an already-reconciled snapshot.
-            baselineEditSerial = editSerial;
+            bridge.reportDirty(false, revision);
         }
     });
 
@@ -718,10 +704,14 @@ export function mountEditor(
 
     // ---- slots: JS -> C++ ----
     // Ctrl/Cmd+S persists the buffer guarded by the loaded revision (SPEC 8.4).
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        // requestSave() is what refuses a read-only buffer, a buffer mid-load and
-        // a disconnected pane, and it is the only place that decision lives.
-        requestSave(loadedRevision);
+    // addCommand registers a global keybinding without a disposable. An editor
+    // mounted later would then steal this shortcut even after it was disposed.
+    // addAction scopes the binding to this editor and lets teardown remove it.
+    const saveAction = editor.addAction({
+        id: "codeharbor.save",
+        label: "Save File",
+        keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+        run: () => requestSave(loadedRevision),
     });
 
     // Arm the snapshot on USER edits only; host-driven setValue is excluded via
@@ -730,7 +720,6 @@ export function mountEditor(
         if (applyingHostEdit) {
             return;
         }
-        ++editSerial;
         dirty = bufferText(editor) !== baselineContent;
         renderState();
         reporter.observeEdit(dirty, loadedRevision);
@@ -743,6 +732,7 @@ export function mountEditor(
     // that a host disposing the editor directly (not through the returned host)
     // at least does not leave a timer that would fire on that dead editor.
     editor.onDidDispose(() => {
+        saveAction.dispose();
         reporter.cancel();
         if (mountedEditor === editor)
             mountedEditor = null;

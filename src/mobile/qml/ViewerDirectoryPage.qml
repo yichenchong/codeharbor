@@ -57,6 +57,7 @@ Item {
         if (root.started && root.remotePath !== root.currentPath)
             root.navigate(root.remotePath);
     }
+    onRepoRootChanged: if (root.started) root.navigate(root.currentPath)
     Component.onCompleted: {
         root.started = true;
         root.navigate(root.remotePath);
@@ -222,8 +223,8 @@ Item {
             root.loading = false;
             root.errorText = message;
         }
-        function onPathResolved(path, resolvedPath, insideRepositoryRoot) {
-            if (path !== root.repoCheckPath)
+        function onPathResolved(path, base, resolvedPath, insideRepositoryRoot) {
+            if (path !== root.repoCheckPath || base !== root.repoRoot)
                 return;
             root.repoRootState = insideRepositoryRoot ? "inside" : "outside";
         }
@@ -439,10 +440,10 @@ Item {
                     if (!content.source.toString()
                              .endsWith(content.pageFor(root.contentKind)))
                         return;
+                    content.item.repoRoot = root.repoRoot;
                     content.item.remotePath = root.currentPath;
                     content.item.paneUrl = root.service
                                          ? root.service.fileUrlFor(root.currentPath) : "";
-                    content.item.repoRoot = root.repoRoot;
                     content.item.paneId = root.paneId;
                     if (content.item.kind !== undefined)
                         content.item.kind = root.contentKind;

@@ -9,10 +9,7 @@
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
-// pathToFileURL, not string concatenation: a script path containing a space (or
-// any character a URL must percent-encode) would never compare equal to
-// import.meta.url, silently turning the CLI entry point below into a no-op.
-import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "./tools/entrypoint.ts";
 import { adapterFor } from "./adapters/index.ts";
 import { nativeString } from "./adapters/types.ts";
 import {
@@ -463,6 +460,7 @@ export function createBridgeLineFramer(
  */
 export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     const paused = new Set<net.Socket>();
+    let failed = false;
     // Sockets that already carry the cleanup listener below. A long-lived
     // producer can be paused and resumed many times, and attaching a fresh
     // 'close' listener on every pause piles them up on the same socket: Node
@@ -470,7 +468,15 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     // them is retained until the socket finally closes. Weak so a closed socket
     // is still collectable.
     const hooked = new WeakSet<net.Socket>();
+    const fail = (): void => {
+        failed = true;
+        // A throwing write need not emit an 'error' event afterward. Release
+        // every producer already waiting for a drain that can no longer arrive.
+        for (const socket of paused) socket.destroy();
+        paused.clear();
+    };
     out.on("drain", () => {
+        if (failed) return;
         const toResume = [...paused];
         // Clear before resuming. A resumed source may synchronously deliver
         // buffered input, and that write can fill the output again.
@@ -479,14 +485,12 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
             if (!socket.destroyed) socket.resume();
         }
     });
-    out.on("error", () => {
-        // There can be no useful drain after an output failure. Destroying
-        // paused producers releases the set and prevents the bridge from
-        // retaining every socket forever.
-        for (const socket of paused) socket.destroy();
-        paused.clear();
-    });
+    out.on("error", fail);
     return (event, source) => {
+        if (failed) {
+            source.destroy();
+            return;
+        }
         // The line framer normally stops before invoking us again for a paused
         // source. Keep this guard for custom callers so a full output stream
         // can never be fed another event synchronously.
@@ -524,6 +528,7 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         try {
             ok = out.write(line);
         } catch {
+            fail();
             source.destroy();
             return;
         }
@@ -661,30 +666,43 @@ export async function startBridge(
     };
     server.once("close", releaseLock);
     try {
-        let existing = false;
+        let existing: fs.Stats | undefined;
         try {
-            existing = fs.lstatSync(socketPath).isSocket();
+            existing = fs.lstatSync(socketPath);
         } catch {
             // No existing socket.
         }
-        if (existing) {
-            const alive = await new Promise<boolean>((resolve) => {
-                const probe = net.createConnection(socketPath);
-                let settled = false;
-                const finish = (isAlive: boolean): void => {
-                    if (settled) return;
-                    settled = true;
-                    probe.destroy();
-                    resolve(isAlive);
-                };
-                probe.setTimeout(1000, () => finish(false));
-                probe.on("connect", () => finish(true));
-                probe.on("error", () => finish(false));
+        if (existing?.isSocket()) {
+            const probeResult = Promise.withResolvers<boolean>();
+            const probe = net.createConnection(socketPath);
+            let settled = false;
+            const finish = (isAlive: boolean, error?: Error): void => {
+                if (settled) return;
+                settled = true;
+                probe.destroy();
+                if (error) probeResult.reject(error);
+                else probeResult.resolve(isAlive);
+            };
+            probe.setTimeout(1000, () => finish(
+                false,
+                new Error(`codeharbor-bridge: socket probe timed out; preserving ${socketPath}`),
+            ));
+            probe.on("connect", () => finish(true));
+            probe.on("error", (error: NodeJS.ErrnoException) => {
+                // Permission/resource failures say nothing about whether a
+                // listener is alive. Never unlink its endpoint on uncertainty.
+                const stale = error.code === "ECONNREFUSED" || error.code === "ENOENT";
+                finish(false, stale ? undefined : error);
             });
+            const alive = await probeResult.promise;
             if (alive) {
                 throw new Error(
                     `codeharbor-bridge: address already in use: a live bridge is listening on ${socketPath}`,
                 );
+            }
+            const current = fs.lstatSync(socketPath);
+            if (!current.isSocket() || current.dev !== existing.dev || current.ino !== existing.ino) {
+                throw new Error(`codeharbor-bridge: socket changed while probing ${socketPath}`);
             }
             fs.unlinkSync(socketPath);
         }
@@ -717,7 +735,7 @@ export async function startBridge(
     return server;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isEntrypoint(import.meta.url)) {
     const socketPath = resolveSocketPath();
     try {
         const server = await startBridge(socketPath);

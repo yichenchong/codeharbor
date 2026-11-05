@@ -14,6 +14,7 @@
 #include <QJsonValue>
 #include <QLockFile>
 #include <QPair>
+#include <QPointer>
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSignalSpy>
@@ -497,12 +498,15 @@ private slots:
     void observedHarnessLeavesAnExplicitAdapterAlone();
     void aGenericPaneFromTheTreeReachesRunningInTheSidebar();
     void refreshResultAfterControllerDestroyedIsNoop();
+    void harnessRegistrationObserverMayDestroyTheController();
+    void activeSessionRetirementObserverMayDestroyTheController();
     void agentMonitorMergesStateIntoSidebar();
     void terminalConnectionStateMergesIntoSidebar();
     void refreshDoesNotWipeAgentDerivedState();
     void markSeenClearsFinishedUnseenBadge();
     void activationRejectsUnknownOrArchivedSessions();
     void vanishedActiveSessionIsRetiredEverywhere();
+    void retiringTheActiveSessionStillNotifiesAfterAReentrantRefresh();
     void staleOrFailedRefreshNeverRetiresActiveSession();
     // The sidebar's filters hide rows; they must never narrow what the
     // controller BELIEVES exists on the server.
@@ -546,6 +550,10 @@ private slots:
     // A server at the schema floor that still names no identity is as
     // undrivable as one that is too old, and must be refused the same way.
     void serverThatReportsNoIdentityIsRefusedRatherThanLeftConnected();
+    void supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire_data();
+    void supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire();
+    void deferredServerRefusalCannotDisconnectANewerWire_data();
+    void deferredServerRefusalCannotDisconnectANewerWire();
     // The user-facing "update the server" action: it has to arm the bootstrap
     // and then actually dial, and its failure has to reach the user even though
     // the connect it rides on succeeds.
@@ -1752,6 +1760,73 @@ void TstAppController::refreshResultAfterControllerDestroyedIsNoop()
     QVERIFY(true); // reaching here without a crash is the assertion
 }
 
+void TstAppController::harnessRegistrationObserverMayDestroyTheController()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    const QString session = QStringLiteral("s1");
+    const QString pane = QStringLiteral("t1");
+    monitor.setTerminalHarness(session, pane, QStringLiteral("generic"));
+    monitor.noteTerminalAttached(session, pane);
+    QCOMPARE(monitor.stateFor(session, pane),
+             static_cast<int>(AgentState::Starting));
+    QPointer<AppController> controller = new AppController(&client);
+    controller->setAgentMonitor(&monitor);
+    client.setTransport(&transport);
+    QSignalSpy destroyed(controller.data(), &QObject::destroyed);
+    QSignalSpy transitions(&monitor, &AgentStatusMonitor::agentStateChanged);
+    connect(&monitor, &AgentStatusMonitor::agentStateChanged, &client,
+            [&controller](const QString&, const QString&, int) {
+                delete controller.data();
+            });
+
+    controller->refresh();
+    const QJsonObject request = takeRequest(transport);
+    transport.deliver(listWithTerminalFrame(
+        request.value(QStringLiteral("id")).toInt(), QStringLiteral("G"),
+        session, pane, QStringLiteral("claude-code")));
+    // Adopting the server's explicit harness clears the derived Starting
+    // state. Its synchronous observer is allowed to close this window.
+    QCOMPARE(transitions.count(), 1);
+    QCOMPARE(monitor.stateFor(session, pane),
+             static_cast<int>(AgentState::Unknown));
+    QCOMPARE(destroyed.count(), 1);
+    QVERIFY(controller.isNull());
+}
+
+void TstAppController::activeSessionRetirementObserverMayDestroyTheController()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    QPointer<AppController> controller = new AppController(&client);
+    SessionLayouts layouts(controller->workspaceDb(), controller->uiState());
+    controller->setConnection(nullptr, nullptr, nullptr, &layouts);
+    controller->setServerId(QStringLiteral("retirement-server"));
+    controller->uiState()->setActiveSession(QStringLiteral("retirement-server"),
+                                            QString());
+    client.setTransport(&transport);
+    controller->refresh();
+    transport.deliver(listWithTerminalFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G"), QStringLiteral("s1"), QStringLiteral("t1")));
+    controller->activateSession(QStringLiteral("s1"));
+    transport.takeSent(); // the two layout requests remain outstanding
+    QSignalSpy destroyed(controller.data(), &QObject::destroyed);
+    QSignalSpy refreshed(controller.data(), &AppController::refreshed);
+    connect(&layouts, &SessionLayouts::generationChanged, &client,
+            [&controller] { delete controller.data(); });
+
+    controller->refresh();
+    transport.deliver(listResultFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("G")));
+    QCOMPARE(destroyed.count(), 1);
+    QVERIFY(controller.isNull());
+    QCOMPARE(layouts.devSessionId(), QString());
+    QCOMPARE(refreshed.count(), 0);
+}
+
 // A live agent state fed to the monitor must surface in the sidebar: after a
 // refresh populates a session with a terminal pane, an agentStateChanged event
 // re-derives the row and its aggregate reflects the new AgentState. Before any
@@ -2158,6 +2233,49 @@ void TstAppController::vanishedActiveSessionIsRetiredEverywhere()
     // Idempotent: a second identical refresh is a no-op, no further signal.
     f.deliverTreeWithoutS1();
     QCOMPARE(activeSpy.count(), 1);
+}
+
+void TstAppController::retiringTheActiveSessionStillNotifiesAfterAReentrantRefresh()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    f.activateAndLoadS1();
+    f.transport.takeSent();
+    QString boundSession = f.controller.activeSessionId();
+    QCOMPARE(boundSession, QStringLiteral("s1"));
+    QSignalSpy activeChanged(&f.controller, &AppController::activeSessionChanged);
+    connect(&f.controller, &AppController::activeSessionChanged, &f.controller,
+            [&] { boundSession = f.controller.activeSessionId(); });
+    bool requestedReplacement = false;
+    QJsonObject replacement;
+    connect(&f.layouts, &SessionLayouts::generationChanged, &f.controller, [&] {
+        if (requestedReplacement)
+            return;
+        requestedReplacement = true;
+        f.controller.refresh();
+        replacement = takeRequest(f.transport);
+    });
+
+    // Clearing the deleted session's layouts synchronously supersedes this
+    // refresh, after activeSessionId was committed but before its notification.
+    f.deliverTreeWithoutS1();
+    QVERIFY(requestedReplacement);
+    QCOMPARE(replacement.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    QCOMPARE(f.controller.activeSessionId(), QString());
+    QCOMPARE(activeChanged.count(), 1);
+    QCOMPARE(boundSession, QString());
+    QCOMPARE(f.layouts.devSessionId(), QString());
+    QVERIFY(f.layouts.terminalTree().isNull());
+
+    // The replacement sees an already-retired session, so it cannot supply a
+    // missing notification for the earlier mutation. The bound consumer must
+    // already have observed the deselection, and must stay deselected.
+    f.transport.deliver(listResultFrame(
+        replacement.value(QStringLiteral("id")).toInt(), QStringLiteral("g")));
+    QCOMPARE(activeChanged.count(), 1);
+    QCOMPARE(boundSession, QString());
+    QCOMPARE(f.controller.sessionsModel()->rowCount(), 1);
 }
 
 // The retirement above must fire ONLY on an authoritative answer. A superseded
@@ -3424,6 +3542,96 @@ void TstAppController::serverThatReportsNoIdentityIsRefusedRatherThanLeftConnect
     QCOMPARE(f.controller.connectionError(), message);
 }
 
+void TstAppController::supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire_data()
+{
+    QTest::addColumn<bool>("incompatible");
+    QTest::newRow("old-compatible-identity") << false;
+    QTest::newRow("old-incompatible-server") << true;
+}
+
+void TstAppController::supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire()
+{
+    QFETCH(bool, incompatible);
+    FakeTransport transport;
+    ConnectFixture f;
+    f.client.setTransport(&transport);
+    QSignalSpy errors(&f.controller, &AppController::error);
+    f.boot.fireWired();
+    const QJsonObject oldRequest = takeRequest(transport);
+    f.boot.fireWired();
+    const QJsonObject currentRequest = takeRequest(transport);
+    transport.deliver(serverInfoFrame(
+        currentRequest.value(QStringLiteral("id")).toInt(),
+        AppController::kMinimumServerSchemaVersion,
+        QStringLiteral("current-server"), QStringLiteral("1.0.0")));
+    const QJsonObject list = takeRequest(transport);
+    QCOMPARE(list.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listResultFrame(list.value(QStringLiteral("id")).toInt(),
+                                     QStringLiteral("current-group")));
+
+    transport.deliver(serverInfoFrame(
+        oldRequest.value(QStringLiteral("id")).toInt(),
+        incompatible ? 1 : AppController::kMinimumServerSchemaVersion,
+        QStringLiteral("old-server"), QStringLiteral("0.0.1")));
+    QCoreApplication::processEvents();
+    QCOMPARE(f.controller.serverId(), QStringLiteral("current-server"));
+    QCOMPARE(f.controller.sessionsModel()->rowCount(), 1);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+}
+
+void TstAppController::deferredServerRefusalCannotDisconnectANewerWire_data()
+{
+    QTest::addColumn<bool>("duringError");
+    QTest::newRow("new-wire-from-error-observer") << true;
+    QTest::newRow("new-wire-before-deferred-disconnect") << false;
+}
+
+void TstAppController::deferredServerRefusalCannotDisconnectANewerWire()
+{
+    QFETCH(bool, duringError);
+    FakeTransport transport;
+    ConnectFixture f;
+    f.client.setTransport(&transport);
+    QSignalSpy errors(&f.controller, &AppController::error);
+    QJsonObject currentRequest;
+    const auto newWire = [&] {
+        f.boot.stateChanged(SessionBootstrap::State::Wired);
+        f.boot.fireWired();
+        currentRequest = takeRequest(transport);
+    };
+    connect(&f.controller, &AppController::error, &f.controller,
+            [&](const QString&) {
+                if (duringError)
+                    newWire();
+            });
+    f.boot.fireWired();
+    const QJsonObject oldRequest = takeRequest(transport);
+    transport.deliver(serverInfoFrame(
+        oldRequest.value(QStringLiteral("id")).toInt(), 1,
+        QStringLiteral("old-server"), QStringLiteral("0.0.1")));
+    if (!duringError)
+        newWire();
+    QCOMPARE(currentRequest.value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+    transport.deliver(serverInfoFrame(
+        currentRequest.value(QStringLiteral("id")).toInt(),
+        AppController::kMinimumServerSchemaVersion,
+        QStringLiteral("current-server"), QStringLiteral("1.0.0")));
+    const QJsonObject list = takeRequest(transport);
+    QCOMPARE(list.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    transport.deliver(listResultFrame(list.value(QStringLiteral("id")).toInt(),
+                                     QStringLiteral("current-group")));
+    QCoreApplication::processEvents();
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(f.controller.serverId(), QStringLiteral("current-server"));
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("connected"));
+    QCOMPARE(f.controller.sessionsModel()->rowCount(), 1);
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+}
+
 // "Update server" has to do two things or it does nothing: arm the bootstrap's
 // one-shot install request, and then actually dial. Arming without connecting
 // leaves the request to ambush whatever the user connects to next; connecting
@@ -3631,7 +3839,7 @@ void TstAppController::reorderingSendsTheOrderedIdsInOrderAndRefreshes()
     const QJsonObject groupAck{
         {"jsonrpc", "2.0"},
         {"id", groupReq.value(QStringLiteral("id")).toInt()},
-        {"result", true}};
+        {"result", QJsonObject{{"ok", true}}}};
     transport.deliver(QJsonDocument(groupAck).toJson(QJsonDocument::Compact) + '\n');
     QCOMPARE(takeRequest(transport).value(QStringLiteral("method")).toString(),
              QStringLiteral("workspace.list"));

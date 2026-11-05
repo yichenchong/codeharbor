@@ -172,16 +172,20 @@ struct UpdateTerminalPaneParams {
 // state: the authoritative database lives on the codeharbord host, so every
 // operation is a `workspace.*` JSON-RPC round-trip through the injected
 // CodeharbordClient, whose camelCase result JSON is mapped into the ch:: data
-// model. All methods are async; each takes a callback receiving EITHER the typed
-// result OR an RpcError (SPEC 10.3) — WorkspaceDb never throws and never touches
+// model. Each method takes a callback receiving EITHER the typed result OR an
+// RpcError (SPEC 10.3). Replies normally arrive asynchronously, but the borrowed
+// client may complete a refused call synchronously (for example, with no bound
+// transport), or a transport may answer during write(). Callers must tolerate
+// re-entry before a method returns. WorkspaceDb never throws and never touches
 // local storage. A server error is forwarded verbatim. The only errors
 // synthesized here rather than received all describe one thing: a response that
 // reports success but whose result is not the shape the method promises. That
 // is failed with the reserved code -32603, because decoding it would manufacture
 // a record with an empty id that the rest of the client cannot tell from a real
 // one. Concretely, a result that is not the expected JSON kind (an object per
-// record, an array for list()), and, for getLayout/setLayout, a SessionLayout row
-// whose `tree` is missing or fails split-tree validation. getLayout is the sole
+// record, an array for list()), an acknowledgement without boolean `ok:true`,
+// and, for getLayout/setLayout, a SessionLayout row whose `tree` is missing or
+// fails split-tree validation. getLayout is the sole
 // method for which a JSON null result is legitimate — it means "this region has
 // no persisted layout" and delivers std::nullopt with no error. An existing but
 // unreadable tree must fail instead: treating it as absent would let callers
@@ -191,9 +195,8 @@ struct UpdateTerminalPaneParams {
 // CALLER's mistake, not the server's: an addressing-mode violation in
 // resolveTerminalPane and a setLayout tree that cannot be serialized. They are
 // reported as -32602 ("invalid params"), the code the server itself would have
-// answered with, and they are delivered ASYNCHRONOUSLY like every other reply —
-// posted to the client's event loop, never invoked before the method returns —
-// so no caller is re-entered from inside its own call.
+// answered with, and they are always delivered ASYNCHRONOUSLY — posted to the
+// client's event loop, never invoked before the method returns.
 //
 // Lifetime: `client` is borrowed, not owned, must be non-null, and must outlive
 // this object. Passing a literal nullptr does not compile; a null computed at

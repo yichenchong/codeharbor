@@ -11,8 +11,8 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -470,5 +470,24 @@ test("stdin EOF waits for backpressured stdout responses to flush", { timeout: 1
         assert.equal(new Set(replies.map((reply) => reply.id)).size, count);
     } finally {
         child.kill();
+    }
+});
+
+test("a symlinked MCP server answers stdio requests (RI2)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-link-"));
+    try {
+        const link = path.join(dir, "codeharbor-mcp.ts");
+        symlinkSync(fileURLToPath(new URL("../src/mcp/server.ts", import.meta.url)), link);
+        const result = spawnSync(process.execPath, [link], {
+            env: NO_ENV,
+            input: `${request(73, "ping")}\n`,
+            encoding: "utf8",
+            timeout: 10_000,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.deepEqual(JSON.parse(result.stdout), { jsonrpc: "2.0", id: 73, result: {} });
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
     }
 });

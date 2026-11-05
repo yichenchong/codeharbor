@@ -608,6 +608,41 @@ void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
     QVERIFY2(pool.connectToHost(m_host, m_port, m_user, m_identityFile),
              qPrintable(failure));
     pool.disconnectFromHost();
+
+    // The fallback imports the key itself instead of using publickey_auto().
+    // It must therefore use libssh's expanded IdentityFile, not discard every
+    // path with a '%' as though it were an unconfigured default.
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString keyName = QStringLiteral("identity-100%");
+    QVERIFY(QFile::copy(m_identityFile, dir.filePath(keyName)));
+    const QString sshDir = dir.filePath(QStringLiteral(".ssh"));
+    QVERIFY(QDir().mkpath(sshDir));
+    QFile config(sshDir + QStringLiteral("/config"));
+    QVERIFY(config.open(QIODevice::WriteOnly | QIODevice::Text));
+    const QString identityPattern =
+        QDir::fromNativeSeparators(
+            dir.filePath(QStringLiteral("identity-100%%")));
+    const QByteArray configBytes =
+        QStringLiteral("Host *\n  IdentityFile \"%1\"\n")
+            .arg(identityPattern)
+            .toUtf8();
+    QCOMPARE(config.write(configBytes), qint64(configBytes.size()));
+    config.close();
+
+    // Qt uses USERPROFILE for QDir::homePath() on Windows. The temporary home
+    // isolates config/default-key discovery without touching the user's files.
+    const QByteArray oldProfile = qgetenv("USERPROFILE");
+    QVERIFY(qputenv("USERPROFILE", QFile::encodeName(dir.path())));
+    const auto restoreProfile = qScopeGuard([oldProfile] {
+        if (oldProfile.isEmpty())
+            qunsetenv("USERPROFILE");
+        else
+            qputenv("USERPROFILE", oldProfile);
+    });
+    failure.clear();
+    QVERIFY2(pool.connectToHost(m_host, m_port, m_user), qPrintable(failure));
+    pool.disconnectFromHost();
 }
 
 // An encrypted legacy PEM key takes OpenSSL's default console-prompt path when

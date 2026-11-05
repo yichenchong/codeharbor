@@ -183,29 +183,35 @@ void TstLiveReconnect::cleanupTestCase()
 // One real RPC round-trip over whatever transport is currently wired.
 bool TstLiveReconnect::serverInfoAnswers(QString* detail)
 {
-    bool done = false;
-    QJsonValue result;
-    std::optional<RpcError> failure;
+    // A timeout returns while the client still owns its callback. Keep the
+    // response storage alive until that callback is answered or teardown fails
+    // it; stack references would turn a slow server into a use-after-return.
+    struct Response {
+        bool done = false;
+        QJsonValue result;
+        std::optional<RpcError> failure;
+    };
+    const auto response = std::make_shared<Response>();
     m_client.call(QStringLiteral("server.info"), QJsonValue(),
-                  [&](QJsonValue value, std::optional<RpcError> error) {
-                      result = value;
-                      failure = error;
-                      done = true;
+                  [response](QJsonValue value, std::optional<RpcError> error) {
+                      response->result = value;
+                      response->failure = error;
+                      response->done = true;
                   });
 
     QDeadlineTimer deadline(kRpcTimeoutMs);
-    while (!done && !deadline.hasExpired())
+    while (!response->done && !deadline.hasExpired())
         QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
 
-    if (!done) {
+    if (!response->done) {
         *detail = QStringLiteral("server.info never answered");
         return false;
     }
-    if (failure) {
-        *detail = failure->message;
+    if (response->failure) {
+        *detail = response->failure->message;
         return false;
     }
-    *detail = result.toObject().value(QStringLiteral("name")).toString();
+    *detail = response->result.toObject().value(QStringLiteral("name")).toString();
     return *detail == QStringLiteral("codeharbord");
 }
 
@@ -279,9 +285,11 @@ void TstLiveReconnect::survivesADroppedConnection()
     // "answered, and nothing left pending" is the guarantee. The synthetic
     // "transport closed with request pending" failure itself is pinned
     // deterministically in tst_sessionbootstrap.
-    int orphanAnswers = 0;
+    const auto orphanAnswers = std::make_shared<int>(0);
     m_client.call(QStringLiteral("server.info"), QJsonValue(),
-                  [&](QJsonValue, std::optional<RpcError>) { ++orphanAnswers; });
+                  [orphanAnswers](QJsonValue, std::optional<RpcError>) {
+                      ++*orphanAnswers;
+                  });
 
     dropTheConnection();
 
@@ -299,7 +307,7 @@ void TstLiveReconnect::survivesADroppedConnection()
     QVERIFY(firstRpc.isNull());
 
     // The in-flight call was answered, not left hanging.
-    QCOMPARE(orphanAnswers, 1);
+    QCOMPARE(*orphanAnswers, 1);
     QCOMPARE(m_client.pendingCount(), 0);
 
     // ... and the session comes back on its own: new handshake, new channels,

@@ -698,9 +698,31 @@ Two rules constrain every mobile QML file, and both are security rules
   block model (`ch::MarkdownModel`) and drawing plain-text blocks; raw HTML in a
   document is shown as literal text and never interpreted.
 - A remote `file://` or internal URL is never handed to `QDesktopServices`, an
-  OS handler, or any other app, and no mobile surface performs network access on
-  behalf of remote content. Remote bytes reach the screen only through the
-  daemon's `file.readFile`.
+  OS handler, or any other app. Remote file bytes reach the screen through the
+  daemon's `file.readFile`, not through the phone's local filesystem. The optional
+  in-app web viewer loads HTTP(S) pages over the phone's network connection; it
+  is separate from remote file rendering.
+
+Automatic Markdown images require a known repository root. Their path-resolution
+replies must match both the requested image path and that original root; an old
+reply from another root cannot authorize a read. Explicitly opening a remote
+file outside the project remains supported.
+
+Mobile SVG viewing accepts self-contained, uncompressed SVG XML. Local fragment
+references for vector elements and verified embedded raster images are supported.
+External images or stylesheets, DTDs/entities, CSS resource imports or escapes,
+nested SVG image payloads (even labelled as PNG), and compressed SVG are refused
+before QtSvg parses the image.
+
+The PDF page uses native page images and selection/link models rather than a
+component that opens URI annotations through the operating system. External URI
+annotations are inactive; internal page links, multipage scrolling, text
+selection, and zoom stay inside the viewer.
+
+The optional HTTP(S) web viewer checks the initial URL and stops disallowed
+navigations when loading starts. QtWebView does not expose a pre-request
+interceptor here, so that stop hook is not a guarantee that navigation was
+prevented before starting.
 
 Two viewer backends are optional, discovered at configure time exactly as
 libssh and QtDBus are, and reported as `CH_HAVE_QTPDF` / `CH_HAVE_QTWEBVIEW`
@@ -719,6 +741,11 @@ module was never linked is a blank page at runtime. On Ubuntu/Debian the
 packages are `qt6-pdf-dev` and `qt6-webview-dev`; they are not in the apt list
 above because a desktop build never links either, so a stock workstation
 configure reports both capabilities off.
+
+The PDF selection overlay also uses `QtQuick.Shapes`. Configure imports its
+`Qt6::qmlshapesplugin` target from the matching Qt installation, so Qt's QML
+scanner can link it in static builds. The PDF capability is unavailable if that
+plugin is missing; a successful PDF library probe alone is not enough.
 
 ## Test suites
 
@@ -913,12 +940,12 @@ migration only adds columns. Upgrade the installed server (`Update server` in th
 client, or unpack a newer `codeharbor-remote.tar.gz` over it) and it opens again.
 
 Then run them. `CH_LIVE_SSH` and `CH_LIVE_HOST` / `CH_LIVE_PORT` / `CH_LIVE_USER` /
-`CH_LIVE_NODE` / `CH_LIVE_REPO` are required for the SSH-backed gates. Omit
-`CH_LIVE_SSH` and every gate QSKIPs, which reports as a green run that proved
-nothing — the exact outcome this whole section exists to avoid. Omit any of the
-other required variables and the gates fail their own precondition check instead.
-`CH_LIVE_IDENTITY` and `CH_LIVE_KNOWN_HOSTS` are optional; the gates use their
-documented fallback paths when they are unset.
+`CH_LIVE_NODE` / `CH_LIVE_REPO` are required for the SSH-backed gates. Without
+`CH_LIVE_SSH`, those cases QSKIP, while local WebEngine probes can still run.
+A green run without SSH does not prove the remote paths. Omit any of the other
+required variables and the SSH-backed gates fail their own precondition check
+instead. `CH_LIVE_IDENTITY` and `CH_LIVE_KNOWN_HOSTS` are optional; the gates use
+their documented fallback paths when they are unset.
 
 ```bash
 export CH_LIVE_SSH=1
@@ -1053,8 +1080,11 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 2. **Cut and push the tag only after the dry run.**
    `bash .omp/skills/bump-version/bump.sh --set X.Y.Z --push` syncs the version
    files, commits them, runs the local Debug build, ctest, all workspace npm
-   tests and all workspace typechecks, then creates and pushes the annotated
-   tag. If any local gate fails, no tag is created.
+   tests and all workspace typechecks, then creates the annotated tag and pushes
+   the branch and tag together with `git push --atomic`. If any local gate fails,
+   no tag is created. If the remote rejects either reference or does not support
+   atomic pushes, neither is published; the local release commit and tag remain
+   available for inspection and retry.
 3. To create a tag without pushing, omit `--push`; the script prints the
    explicit push command. That mode is for inspection only and does not run the
    release preflight.

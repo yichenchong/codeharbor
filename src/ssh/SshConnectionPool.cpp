@@ -672,24 +672,9 @@ int declineLibsshPassphrase(const char*, char*, size_t, int, int, void*)
     return -1;
 }
 
-// The identity libssh would use, read from the session while it still tells the
-// truth about WHO named it.
-//
-// libssh seeds every fresh session with its own defaults, spelled with the
-// tokens it expands at connect time ("%d/id_ed25519", %d being the .ssh
-// directory), and ssh_options_set(SSH_OPTIONS_IDENTITY) puts a profile or
-// ~/.ssh/config value at the HEAD of that same list. ssh_options_get() hands
-// back the head, so before ssh_connect() a '%' escape means "nobody named a
-// key" and anything else is the user's choice.
-//
-// The timing is the whole point: ssh_connect() runs ssh_options_apply(), which
-// expands every entry in place. Asking afterwards therefore answers
-// "<home>/.ssh/id_ed25519" even for a user who configured nothing — a path that
-// looks exactly like an explicit choice, suppresses the ~/.ssh scan in
-// identityFileCandidates(), and left the Windows named-pipe-agent fallback
-// trying one key that may not even exist while the user's real id_rsa was never
-// looked at.
-QString readConfiguredIdentity(ssh_session session)
+// Read the head of libssh's identity list. Before ssh_connect() it still holds
+// OpenSSH escapes; afterwards libssh has expanded both "~" and "%"-tokens.
+QString readIdentity(ssh_session session)
 {
     char* identity = nullptr;
     if (ssh_options_get(session, SSH_OPTIONS_IDENTITY, &identity) != SSH_OK
@@ -697,11 +682,11 @@ QString readConfiguredIdentity(ssh_session session)
         return QString();
     const QString value = QFile::decodeName(identity);
     ssh_string_free_char(identity);
-    return value.contains(QLatin1Char('%')) ? QString() : value;
+    return value;
 }
 
-// `configIdentityFile` is the head of libssh's identity list as read BEFORE
-// ssh_connect() — see readConfiguredIdentity() for why the timing matters.
+// `configIdentityFile` is the expanded head of libssh's identity list, or empty
+// when the pre-connect list still named only libssh's built-in default.
 QStringList identityFileCandidates(const QString& profileIdentityFile,
                                    const QString& configIdentityFile)
 {
@@ -714,9 +699,8 @@ QStringList identityFileCandidates(const QString& profileIdentityFile,
     add(profileIdentityFile);
     // The identity parsed from ~/.ssh/config, kept after the explicitly saved
     // profile value, which deliberately has precedence over broader OpenSSH
-    // defaults. Empty when the config named none — readConfiguredIdentity()
-    // drops libssh's own unexpanded defaults, so reaching the ~/.ssh scan below
-    // stays possible.
+    // defaults. Empty when the config named none, so the ~/.ssh scan below
+    // remains available even after libssh expands its built-in defaults.
     add(configIdentityFile);
 
     // With a profile or config identity, stop there: each rejected key spends
@@ -992,6 +976,13 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         failHandshake();
         return false;
     }
+    // Snapshot the unconfigured head before profile/config identities are added.
+    // A '%' is not evidence of a default: explicit IdentityFile entries may use
+    // %d, %r, or %% too. Only Windows' named-pipe fallback needs this distinction;
+    // every other platform lets publickey_auto() use libssh's entire list.
+    const bool needsIdentityFallback = usesUnsupportedWindowsAgent();
+    const QString defaultIdentity =
+        needsIdentityFallback ? readIdentity(m_session) : QString();
 
     // publickey_auto() passes this callback to its private-key importer. Without
     // it, encrypted PEM keys fall back to OpenSSL's controlling-terminal prompt
@@ -1080,21 +1071,25 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     if (QFileInfo(configPath).isFile()) {
         appendDiagnostic(
             QStringLiteral("Parsing SSH configuration: %1").arg(configPath));
-        if (abortRequested())
-            return false;
-        const QByteArray configUtf8 = QFile::encodeName(configPath);
-        if (ssh_options_parse_config(m_session, configUtf8.constData())
-            != SSH_OK) {
-            const QString error = QString::fromUtf8(ssh_get_error(m_session));
-            appendDiagnostic(
-                QStringLiteral("SSH configuration parsing failed: %1")
-                    .arg(error));
-            emit errorOccurred(
-                QStringLiteral("Could not parse SSH config %1: %2")
-                    .arg(configPath, error));
-            failHandshake();
-            return false;
-        }
+    }
+    // Parse even a missing file: libssh accepts it and marks config processing
+    // complete. Otherwise ssh_connect() silently parses its own default files
+    // later, after our profile overrides, and can change the actual port while
+    // host-key verification still uses the profile's m_port.
+    if (abortRequested())
+        return false;
+    const QByteArray configUtf8 = QFile::encodeName(configPath);
+    if (ssh_options_parse_config(m_session, configUtf8.constData())
+        != SSH_OK) {
+        const QString error = QString::fromUtf8(ssh_get_error(m_session));
+        appendDiagnostic(
+            QStringLiteral("SSH configuration parsing failed: %1")
+                .arg(error));
+        emit errorOccurred(
+            QStringLiteral("Could not parse SSH config %1: %2")
+                .arg(configPath, error));
+        failHandshake();
+        return false;
     }
 
     if (!setOption(SSH_OPTIONS_PORT, &portValue, QStringLiteral("SSH port"))
@@ -1143,10 +1138,10 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
             return false;
     }
 
-    // Ask BEFORE ssh_connect() expands libssh's own default identities into
-    // real paths and makes "nobody configured a key" indistinguishable from an
-    // explicit choice (see readConfiguredIdentity()).
-    const QString configuredIdentity = readConfiguredIdentity(m_session);
+    // Remember whether the user changed the head while the values are still
+    // unexpanded. Read its usable path only after ssh_connect() expands it.
+    const bool hasConfiguredIdentity =
+        needsIdentityFallback && readIdentity(m_session) != defaultIdentity;
 
     appendDiagnostic(QStringLiteral("Beginning SSH handshake."));
     if (abortRequested())
@@ -1201,6 +1196,8 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
     setState(State::Authenticating);
     if (abortRequested())
         return false;
+    const QString configuredIdentity =
+        hasConfiguredIdentity ? readIdentity(m_session) : QString();
     if (!authenticate(user, configuredIdentity)) {
         if (abortRequested())
             return false;

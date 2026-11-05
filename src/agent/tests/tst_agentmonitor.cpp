@@ -11,6 +11,7 @@
 #include <QJsonValue>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSignalSpy>
 #include <QString>
@@ -136,6 +137,10 @@ private slots:
     // AG-N6: the framing loop under a burst and under re-entrancy.
     void manyEventsInOneReadAreFramedInOrder();
     void reentrantFeedFromASlotIsFramedInOrder();
+    void reentrantEventsFinishTheirSignalsInArrivalOrder();
+    void markSeenDuringStateDeliveryDoesNotRearmBadgeSignal();
+    void signalHandlersMayDestroyTheMonitor();
+    void ageingSignalMayDestroyTheMonitor();
     // AG-N2: a pane that goes silent.
     void aSilentRunningTerminalIsDemotedToUnknown();
     void terminalOutputRefutesTheSilenceTimeout();
@@ -1429,18 +1434,7 @@ void TstAgentMonitor::manyEventsInOneReadAreFramedInOrder()
     QTRY_COMPARE(m_monitor->stateFor("dB", "tB"), asInt(AgentState::WaitingInput));
 }
 
-// AG-N6/AG-N7. The framing loop reaches slots, and a slot may drive another
-// delivery straight back into the handler. AG-N7 concluded there is no defect
-// here and did not add a guard, correctly — but it also left the invariant
-// untested. The re-entrant call appends to the END of the same buffer and the
-// loop frames from the FRONT, so the oldest complete line is always taken
-// first and no line is framed twice.
-//
-// Driven through SyncDevice rather than the socket pair on purpose. A
-// QLocalSocket suppresses a re-entrant readyRead (that is why the AG-N7 review
-// concluded the realistic re-entry path does not exist), so a socket cannot
-// exercise this at all; SyncDevice re-enters deterministically, which is what
-// the framing invariant deserves to be tested against.
+// A synchronous delivery from a state-change slot must preserve frame order.
 void TstAgentMonitor::reentrantFeedFromASlotIsFramedInOrder()
 {
     SyncDevice device;
@@ -1474,6 +1468,96 @@ void TstAgentMonitor::reentrantFeedFromASlotIsFramedInOrder()
 
     // Unbind before the stack-allocated device dies under the monitor.
     m_monitor->setTransport(nullptr);
+}
+
+void TstAgentMonitor::reentrantEventsFinishTheirSignalsInArrivalOrder()
+{
+    SyncDevice device;
+    m_monitor->setTransport(&device);
+    QStringList observed;
+    bool reentered = false;
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [&](const QString&, const QString&, int) {
+                if (reentered)
+                    return;
+                reentered = true;
+                device.push(eventLine("idle_unseen", "dOrder", "tOrder",
+                                      "claude-code", "done", "second"));
+            });
+    connect(m_monitor, &AgentStatusMonitor::harnessObserved, this,
+            [&](const QString&, const QString&, const QString& harness) {
+                observed.append(harness);
+            });
+    connect(m_monitor, &AgentStatusMonitor::notify, this,
+            [&](const QString&, const QString& body) {
+                observed.append(body);
+            });
+
+    device.push(eventLine("waiting_input", "dOrder", "tOrder",
+                          "pi", "ask", "first"));
+    QCOMPARE(observed, (QStringList{"pi", "first", "claude-code", "second"}));
+    QCOMPARE(m_monitor->stateFor("dOrder", "tOrder"), asInt(AgentState::IdleUnseen));
+    m_monitor->setTransport(nullptr);
+}
+
+void TstAgentMonitor::markSeenDuringStateDeliveryDoesNotRearmBadgeSignal()
+{
+    SyncDevice device;
+    m_monitor->setTransport(&device);
+    QSignalSpy unseen(m_monitor, &AgentStatusMonitor::unseenChanged);
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [&](const QString& dev, const QString&, int) {
+                m_monitor->markSeen(dev);
+            });
+    device.push(eventLine("idle_unseen"));
+    QVERIFY(!m_monitor->hasUnseen("d1"));
+    QCOMPARE(unseen.count(), 1);
+    QCOMPARE(unseen.first().at(1).toBool(), false);
+    m_monitor->setTransport(nullptr);
+}
+
+void TstAgentMonitor::signalHandlersMayDestroyTheMonitor()
+{
+    for (int signal = 0; signal < 3; ++signal) {
+        if (!m_monitor)
+            m_monitor = new AgentStatusMonitor;
+        QPointer<AgentStatusMonitor> alive(m_monitor);
+        SyncDevice device;
+        m_monitor->setTransport(&device);
+        const auto destroy = [this] {
+            AgentStatusMonitor* dying = m_monitor;
+            m_monitor = nullptr;
+            delete dying;
+        };
+        if (signal == 0)
+            connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this, destroy);
+        else if (signal == 1)
+            connect(m_monitor, &AgentStatusMonitor::unseenChanged, this, destroy);
+        else
+            connect(m_monitor, &AgentStatusMonitor::harnessObserved, this, destroy);
+
+        // There is another frame buffered when the callback destroys its reader.
+        device.push(eventLine("idle_unseen") + eventLine("running"));
+        QVERIFY(alive.isNull());
+    }
+}
+
+void TstAgentMonitor::ageingSignalMayDestroyTheMonitor()
+{
+    m_monitor->setFallbackIdleThresholdMs(20);
+    m_monitor->setTerminalHarness("dAge", "tAge", "generic");
+    m_monitor->noteTerminalAttached("dAge", "tAge");
+    m_monitor->noteTerminalOutput("dAge", "tAge");
+    QPointer<AgentStatusMonitor> alive(m_monitor);
+    connect(m_monitor, &AgentStatusMonitor::agentStateChanged, this,
+            [this](const QString&, const QString&, int state) {
+                if (state != asInt(AgentState::Idle))
+                    return;
+                AgentStatusMonitor* dying = m_monitor;
+                m_monitor = nullptr;
+                delete dying;
+            });
+    QTRY_VERIFY(alive.isNull());
 }
 
 // AG-N2. A harness that is killed — or whose host reboots — emits no shutdown

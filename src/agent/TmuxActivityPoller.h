@@ -88,11 +88,13 @@ private:
     // and issue an immediate poll on the transition into polling.
     void rearm();
     // Turn one `tmux.paneActivity` result into activityObserved signals.
-    void publishActivity(const QJsonObject& result);
+    void publishActivity(const QJsonObject& result, quint64 clientGeneration);
 
     // QPointer so a caller-owned client destroyed while this poller outlives it
     // auto-nulls instead of dangling.
     QPointer<CodeharbordClient> m_client;
+    // Pointer equality alone cannot reject a reply after A -> null -> A.
+    quint64 m_clientGeneration = 0;
     QSet<QString> m_devSessionIds;
     QTimer m_timer;
     int m_pollIntervalMs = kPollIntervalMs;

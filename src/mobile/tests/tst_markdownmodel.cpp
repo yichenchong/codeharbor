@@ -40,6 +40,8 @@ private slots:
     void imageDestinationsThatEscapeTheProjectAreRefused();
     void anUnterminatedFenceStaysCodeToTheEndOfTheDocument();
     void fencedAndIndentedCodeCarryTheRightLanguage();
+    void aFenceDedentPreservesTheRemainderOfATab();
+    void listMarkersInsideIndentedCodeRemainLiteral();
     void deeplyNestedListsCarryTheirNestingLevel();
     void taskMarkersHaveThreeStatesNotTwo();
     void headingsInBothSpellings();
@@ -202,6 +204,25 @@ void TstMarkdownModel::imageDestinationsThatEscapeTheProjectAreRefused()
     spaced.setMarkdown(QStringLiteral("![s](assets/my%20logo.png)"));
     QCOMPARE(blockOf(spaced, 0).value(QStringLiteral("imagePath")).toString(),
              QStringLiteral("assets/my logo.png"));
+}
+
+void TstMarkdownModel::listMarkersInsideIndentedCodeRemainLiteral()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("    - literal\n    1. still code\n"));
+    QCOMPARE(model.rowCount(), 1);
+    QCOMPARE(kindOf(model, 0), QStringLiteral("code"));
+    QCOMPARE(textOf(model, 0), QStringLiteral("- literal\n1. still code"));
+}
+
+void TstMarkdownModel::aFenceDedentPreservesTheRemainderOfATab()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("  ```\n\tindented\n  ```\n"));
+    QCOMPARE(model.rowCount(), 1);
+    QCOMPARE(kindOf(model, 0), QStringLiteral("code"));
+    // The tab occupies four columns; the two-column fence dedent must leave two.
+    QCOMPARE(textOf(model, 0), QStringLiteral("  indented"));
 }
 
 void TstMarkdownModel::anUnterminatedFenceStaysCodeToTheEndOfTheDocument()

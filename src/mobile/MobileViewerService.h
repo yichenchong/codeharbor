@@ -48,8 +48,9 @@ namespace ch {
 // ASYNCHRONY. Like ViewerModel, every operation is fire-and-forget and every
 // answer arrives as a SIGNAL carrying the path it is about, so a page can match
 // a reply against what it asked for. Nothing here is pane-scoped: one service
-// instance serves the single visible pane, and the path in each signal is what
-// disambiguates a late answer from a current one.
+// instance serves the single visible pane. File operations carry the path;
+// containment answers also carry the original repository base, so a late answer
+// about one project's boundary cannot authorize a read in another project.
 class MobileViewerService : public QObject {
     Q_OBJECT
 public:
@@ -156,8 +157,9 @@ public slots:
 
     // Ask where `path` resolves and whether it lands inside `base` (the active
     // Dev Session's repository root, SPEC 9). Answers
-    // pathResolved(path, resolvedPath, insideRepositoryRoot) or
-    // fileError(path, message).
+    // pathResolved(path, base, resolvedPath, insideRepositoryRoot) or
+    // pathResolveError(path, base, message). The original base accompanies each
+    // answer because containment is a property of BOTH inputs.
     //
     // As on the desktop the flag is a UI HINT, never a gate: SPEC 9 allows
     // paths outside the root and this client keeps them openable. It has one
@@ -279,8 +281,10 @@ signals:
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
     void stated(const QString &path, const QVariantMap &info);
-    void pathResolved(const QString &path, const QString &resolvedPath,
-                      bool insideRepositoryRoot);
+    void pathResolved(const QString &path, const QString &base,
+                      const QString &resolvedPath, bool insideRepositoryRoot);
+    void pathResolveError(const QString &path, const QString &base,
+                          const QString &message);
     // The bytes for `path` are cached and `url` may be loaded. Emitted after the
     // cache write, never before: the provider answers from the cache on a
     // worker thread and cannot wait for anything.

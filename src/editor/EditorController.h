@@ -6,6 +6,7 @@
 // QObject static_cast needs the complete CodeharbordClient (a QObject) type.
 #include "CodeharbordClient.h"
 
+#include <QByteArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
@@ -79,7 +80,7 @@ public:
     Q_INVOKABLE void setRecoveryId(const QString& id);
     QString recoveryId() const { return m_recoveryId; }
 
-    // Byte ceiling on every file.readFile this controller issues (SPEC 8.3).
+    // Byte ceiling on main-file reads (SPEC 8.3).
     //
     // A file.readFile that carries no `length` makes the server read the WHOLE
     // file into memory (the un-ranged branch of read() in remote/src/files.ts),
@@ -93,6 +94,10 @@ public:
     // unviewable (or the reverse). The value is restated here rather than shared
     // because ch_editor does not link ch_viewers and must not start to.
     static constexpr int kMaxEditableReadBytes = 8 * 1024 * 1024;
+    // A persisted recovery envelope cannot exceed the 16 MiB RPC write frame.
+    // Read it in small ranges: JSON escaping/base64 can otherwise put even a
+    // within-limit envelope over the daemon's 15 MiB encoded-response ceiling.
+    static constexpr int kMaxRecoveryReadBytes = 16 * 1024 * 1024;
 
 public slots:
     // ---- JS -> C++ bridge slots (fire-and-forget; results via signals) ----
@@ -169,7 +174,7 @@ private slots:
     // created it. An open file also enters FileState::Disconnected (SPEC 8.2):
     // nothing can be read or written until a transport is bound again, and a
     // pane that keeps advertising "clean" through an outage is lying about it.
-    void onTransportClosed();
+    void onTransportClosed(quint64 generation);
 
 private:
     void setFileState(FileState state);
@@ -224,7 +229,7 @@ private:
     // outage and the fetch had to wait for a transport.
     void refetchForReloadedPage();
     // Look for a crash-recovery snapshot for the file `generation` loaded. The
-    // generation is carried through both round trips so a snapshot belonging
+    // generation is carried through every round trip so a snapshot belonging
     // to a superseded load can never be offered against the file now open, and
     // the snapshot's own recovery-key generation is carried too so a late
     // server.info/pane-id update cannot install an old slot's revision into
@@ -232,6 +237,13 @@ private:
     // open file, so a reused per-pane slot from a previous file is never
     // offered as the current one.
     void checkRecovery(const QString& loadedContent, quint64 generation);
+    // Assemble bounded raw-byte ranges before UTF-8 decoding, preserving a
+    // codepoint split across ranges. Every range and the final stat must agree
+    // on revision; superseded probes stop before requesting another range.
+    void readRecoverySnapshot(
+        QString path, quint64 generation, quint64 recoveryGeneration,
+        QByteArray bytes, QString revision,
+        std::function<void(QString, QString)> then);
     // Forget everything known about this pane's recovery slot and retire every
     // reply still in flight for it (by bumping m_recoveryGeneration). Shared by
     // open() and by both recovery-key setters, which face the same problem: the
@@ -404,21 +416,21 @@ private:
     bool m_recoveryHasContent = false;
     // Bumped every time a reply INSTALLS a revision for this pane's slot (a
     // snapshot write, its stale-guard retry's stat, a truncate). checkRecovery()
-    // captures it before its stat/read pair and refuses to write either field
-    // above if it has moved: those two round trips describe the slot as it was
+    // captures it before probing and refuses to write either field above if it
+    // has moved: those round trips describe the slot as it was
     // before that write, so the older revision would guard the next write
     // against something the server has already replaced — and a truncate the
     // server then refuses leaves a stale snapshot standing behind a successful
     // save, which is precisely the "restore text the save superseded" offer the
     // deferral machinery below exists to prevent. Reachable because a debounced
-    // report can complete a snapshot write inside the probe's two round trips.
+    // report can complete a snapshot write while the probe is in flight.
     quint64 m_recoverySlotSerial = 0;
     // A recovery clear is itself an asynchronous write. Keep it separate from
     // m_recoveryWritesInFlight (which counts snapshot writes) so two successful
     // saves cannot issue duplicate truncates while the first one is still on
     // the wire.
     bool m_recoveryClearInFlight = false;
-    // A stat/read probe is one logical operation. This guard prevents a
+    // A recovery probe is one logical operation. This guard prevents a
     // recovery-key update from racing the permission-refresh callback into a
     // duplicate stat, while its generation capture keeps an old probe from
     // clearing the guard belonging to a newer slot.

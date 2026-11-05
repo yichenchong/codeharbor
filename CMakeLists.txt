@@ -242,10 +242,16 @@ if(CODEHARBOR_BUILD_MOBILE)
     # enough to render anything.
     find_package(Qt6 6.10 QUIET COMPONENTS Pdf PdfQuick)
     if(Qt6Pdf_FOUND AND Qt6PdfQuick_FOUND)
+        # The selection overlay uses QtQuick.Shapes. Import its plugin target
+        # here so Qt's QML scanner can link it in static mobile builds.
+        find_package(Qt6qmlshapesplugin ${Qt6_VERSION} EXACT QUIET CONFIG
+            HINTS "${Qt6Qml_DIR}/QmlPlugins")
+    endif()
+    if(Qt6Pdf_FOUND AND Qt6PdfQuick_FOUND AND TARGET Qt6::qmlshapesplugin)
         set(CH_HAVE_QTPDF 1)
         message(STATUS "Qt PDF: found; the mobile PDF viewer renders pages natively")
     else()
-        message(STATUS "Qt PDF: not found; the mobile PDF viewer is unavailable (CH_HAVE_QTPDF=0)")
+        message(STATUS "Qt PDF: Pdf/PdfQuick/Shapes not found; the mobile PDF viewer is unavailable (CH_HAVE_QTPDF=0)")
     endif()
 
     # WebViewQuick as well as WebView, for exactly the reason PdfQuick is

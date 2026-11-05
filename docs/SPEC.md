@@ -123,13 +123,14 @@ Examples:
 Supported operations:
 
 - create;
+- rename;
 - delete;
 - reorder;
 - collapse or expand;
 - move sessions into or out of the group.
 
-The current client has no group-rename control; a group can be renamed only by a
-future settings or sidebar surface.
+Rename is available from the group header's context menu or with F2 while the
+group is selected in the sidebar.
 
 ### 3.2 Dev Session
 
@@ -1183,6 +1184,11 @@ Five rules bound what an agent can do:
 - **Bounded and answered.** At most 32 commands may be in flight (further ones are told
   `busy`), an unanswered command times out after 5 s, and every command receives exactly one
   answer — an agent's turn is blocked while it waits.
+  Control requests and responses have a 64 KiB JSON-payload limit, excluding the
+  terminating newline. A producer may finish sending its complete request while
+  keeping the read side open for the asynchronous answer. Oversized results
+  produce a bounded failure that warns the operation may already have completed;
+  inspect the current viewer state before retrying.
 - **Identified.** A command carries the asking pane's `devSessionId` and `terminalId`, taken
   from the `OMP_DEV_SESSION_ID`/`OMP_TERMINAL_ID` the client exports into every terminal
   pane it creates (5.2). A process without them is refused with an explanation.
@@ -1314,6 +1320,10 @@ Initial handlers:
 rendered document, and its SOURCE is reached by "Open as -> Editor" (§4.3), which
 is also how it is changed. The renderer is a web document like the terminal and
 editor surfaces, and it follows the active theme live (§4.6).
+
+The rendered document's context menu offers Copy, Copy link address, Copy image,
+and Select all where applicable. It does not offer Save Page or View Source for
+the generated viewer page. Use "Open as -> Editor" for the remote Markdown source.
 
 Markdown from the server is UNTRUSTED input: it may contain raw HTML, script
 tags, event-handler attributes and `javascript:` or `data:` URLs. The rendered
@@ -1455,6 +1465,12 @@ Saving should be atomic:
 5. preserve mode and relevant metadata;
 6. rename the temporary file over the original;
 7. return the new revision.
+
+The returned revision belongs to the file actually written. The service keeps
+that file open across the rename and reads its metadata through the open handle,
+not through a fresh lookup of the requested path. A concurrent path replacement
+or symlink change must not supply another file's revision and allow a later save
+to overwrite content the editor never loaded.
 
 ### 8.6 Conflict Handling
 
@@ -1783,6 +1799,20 @@ this, and it is a deliberate choice over a directory beside the edited file:
   tokens as a normal save (section 8.4), so concurrent writers cannot destroy
   each other's snapshots.
 
+A recovery offer must still belong to the untouched buffer that started its
+probe. Editing or saving while the probe is in flight prevents an old snapshot
+from being offered over newer work. Clearing a discovered snapshot uses the
+revision returned with its bytes, never the earlier existence check's revision.
+
+Recovery reads use 2 MiB byte ranges and assemble at most 16 MiB, separately from
+the editor's 8 MiB main-file limit. All ranges must share a revision; a final
+size/revision check rejects a changed or incomplete multi-range snapshot.
+Decoding happens after byte assembly so a UTF-8 character split between ranges
+is preserved. This avoids the daemon's 15 MiB serialized-read-response limit
+without increasing its 16 MiB raw request limit. Snapshots whose serialized
+write request exceeds the existing transport limit still cannot be persisted;
+the read fix does not promise otherwise.
+
 Confidentiality comes from the file mode: each snapshot is written with mode
 `0600` through `writeFile`'s optional `mode` parameter, so it is readable and
 writable by its owner only, regardless of the process umask. The recovery
@@ -1846,6 +1876,9 @@ Requirements:
 >    and drops the in-memory copy. This is opt-in for the one named key: an
 >    import never saves by itself, and `keyInfo(name)` carries a `saved` bool so
 >    the UI can only ever offer it as a deliberate extra step.
+>    If deletion fails, the saved entry remains visible so the user can retry;
+>    the in-memory key and installed SSH identity are still cleared. A copy
+>    already removed outside the app is treated as deleted.
 >
 > The copy lives in `QStandardPaths::AppDataLocation` + `/keys`, a directory
 > created owner-accessible only, one file per key, written with `QSaveFile` so a

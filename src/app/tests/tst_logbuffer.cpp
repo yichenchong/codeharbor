@@ -56,6 +56,7 @@ private slots:
     void destructionRacesWithLogging();
     void qtLogNotificationMayDestroyTheBuffer();
     void qtLogBurstKeepsOnePendingNotification();
+    void overlappingBufferLifetimesPreserveThePreviousHandler();
 };
 
 void TstLogBuffer::entryAndByteCaps()
@@ -326,6 +327,39 @@ void TstLogBuffer::qtLogBurstKeepsOnePendingNotification()
     QCOMPARE(reentryEvents, 3);
     QCOMPARE(afterExplicitAppend, 4);
     QVERIFY(buffer.totalBytes() <= buffer.maxBytes());
+}
+
+void TstLogBuffer::overlappingBufferLifetimesPreserveThePreviousHandler()
+{
+    const QtMessageHandler previous = qInstallMessageHandler(&chainedHandler);
+    std::atomic<bool> start{false};
+    const auto churn = [&start] {
+        while (!start.load(std::memory_order_acquire))
+            QThread::yieldCurrentThread();
+        for (int i = 0; i < 1000; ++i) {
+            LogBuffer buffer(1, 512);
+            qWarning("overlapping log-buffer lifetime marker");
+            QThread::yieldCurrentThread();
+        }
+    };
+    QThread* first = QThread::create(churn);
+    QThread* second = QThread::create(churn);
+    first->start();
+    second->start();
+    start.store(true, std::memory_order_release);
+    const bool firstFinished = first->wait(10000);
+    const bool secondFinished = second->wait(10000);
+    // Join before releasing captured state even if a slow machine exceeded
+    // the diagnostic deadline.
+    first->wait();
+    second->wait();
+    delete first;
+    delete second;
+    const QtMessageHandler restored = qInstallMessageHandler(previous);
+
+    QVERIFY(firstFinished);
+    QVERIFY(secondFinished);
+    QVERIFY(restored == &chainedHandler);
 }
 
 } // namespace

@@ -10,6 +10,7 @@
 #include <QTimer>
 
 #include <limits>
+#include <utility>
 
 namespace ch {
 
@@ -62,6 +63,16 @@ bool isBlankLine(const QByteArray& line) noexcept
             return false;
     }
     return true;
+}
+
+void failPendingCallbacks(
+    const QHash<qint64, CodeharbordClient::ResponseCallback>& pending,
+    const RpcError& error)
+{
+    for (const CodeharbordClient::ResponseCallback& cb : pending) {
+        if (cb)
+            cb(QJsonValue(), error);
+    }
 }
 
 } // namespace
@@ -151,6 +162,10 @@ void CodeharbordClient::setTransport(QIODevice* transport)
         m_transport->disconnect(this);
 
     m_transport = transport;
+    const quint64 transportGeneration = ++m_transportGeneration;
+    m_bindingNeedsAnnouncement = bool(m_transport);
+    m_readDeferred = false;
+    m_closeDeferred = false;
     releaseReadBuffer();
     m_closed = false;
     m_streamUntrusted = false;
@@ -203,43 +218,58 @@ void CodeharbordClient::setTransport(QIODevice* transport)
     // Swept AFTER the rewire and after m_closed was cleared, so a callback that
     // immediately retries — the usual response to a transport error — writes
     // onto the NEW transport instead of being rejected as "transport closed".
-    // failAllPending() moves the map out first, so that retry's fresh pending
-    // entry survives the sweep.
-    if (!m_pending.isEmpty()) {
-        RpcError error;
-        error.code = kInternalError;
-        error.message = QStringLiteral("transport replaced with request pending");
-        error.data = QJsonValue(QJsonValue::Null);
-        failAllPending(error);
-        if (!self)
-            return;
+    // Isolate the old map BEFORE announcing the new binding, so requests issued
+    // by transportChanging handlers survive the old peer's failure sweep.
+    const QHash<qint64, ResponseCallback> pending = std::move(m_pending);
+    m_pending.clear();
+    RpcError error;
+    error.code = kInternalError;
+    error.message = QStringLiteral("transport replaced with request pending");
+    error.data = QJsonValue(QJsonValue::Null);
+    ++m_transportChangeDepth;
+    emit transportChanging(transportGeneration);
+    if (!self) {
+        // The detached callbacks still need their exactly-once failure even
+        // when the signal deleted us. This dispatch touches only locals.
+        failPendingCallbacks(pending, error);
+        return;
     }
-
-    // A callback in the sweep above may itself have rebound (a reconnect is the
-    // plausible reaction to a transport error) or detached. That nested
-    // setTransport() already drained and announced whatever it bound, so the
-    // rest of THIS call now belongs to a device we no longer hold: carrying on
-    // would drain the wrong transport and emit a SECOND transportBound() for
-    // it, making every consumer re-establish its server-side state twice.
-    if (m_transport != transport || !m_transport)
+    --m_transportChangeDepth;
+    failPendingCallbacks(pending, error);
+    if (!self)
         return;
 
-    // Drain anything already buffered on the transport before we subscribed.
-    if (m_transport->bytesAvailable() > 0) {
+    // A nested bind cannot drain while an outer invalidation broadcast is
+    // still running. The outermost completion finalizes whichever binding won,
+    // not necessarily the one this stack frame originally installed.
+    finishTransportBinding();
+}
+
+void CodeharbordClient::finishTransportBinding()
+{
+    if (m_transportChangeDepth > 0)
+        return;
+    if (m_closeDeferred) {
+        m_closeDeferred = false;
+        onTransportClosed();
+        return;
+    }
+    if (!m_bindingNeedsAnnouncement || !m_transport || m_closed)
+        return;
+
+    // Claim the announcement before draining: callbacks may re-enter this
+    // helper or install and finish an entirely new binding.
+    m_bindingNeedsAnnouncement = false;
+    const quint64 transportGeneration = m_transportGeneration;
+    QPointer<CodeharbordClient> self(this);
+    const bool readDeferred = std::exchange(m_readDeferred, false);
+    if (readDeferred || m_transport->bytesAvailable() > 0) {
         onReadyRead();
         if (!self)
             return;
-        // The drain can end the connection outright — a queued EOF frame, or an
-        // unframed line past the size cap — and a callback it dispatched can
-        // rebind just like one in the sweep. Announcing a usable transport after
-        // either would be a lie.
-        if (m_closed || m_transport != transport)
+        if (m_closed || m_transportGeneration != transportGeneration)
             return;
     }
-
-    // Announce LAST: a consumer re-establishing server-side state (a
-    // file.watch subscription, say) must find the client fully bound and
-    // drained so its very first call goes out on the new transport.
     emit transportBound();
 }
 
@@ -291,7 +321,7 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
             QStringLiteral("outgoing params is neither object nor array");
     else if (m_destroying)
         failReason = QStringLiteral("client is being destroyed");
-    else if (m_closed)
+    else if (m_closed || m_closeDeferred)
         failReason = QStringLiteral("transport closed");
     else if (!m_transport)
         failReason = QStringLiteral("no transport bound");
@@ -351,6 +381,7 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     // write would let such a response or close race past the map and orphan
     // this callback. The entry is removed again below if the write fails.
     const QPointer<QIODevice> writeTransport = m_transport;
+    const quint64 writeGeneration = m_transportGeneration;
     m_pending.insert(id, std::move(cb));
     QPointer<CodeharbordClient> self(this);
     const qint64 written = writeTransport->write(line);
@@ -374,7 +405,7 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
     // A partial frame permanently desynchronises the JSONL stream. Close only
     // the transport that was written to: a warning handler may have rebound a
     // new one while the signal was being delivered.
-    if (framingLost && m_transport == writeTransport && !m_closed)
+    if (framingLost && m_transportGeneration == writeGeneration && !m_closed)
         onTransportClosed();
     if (!self)
         return id;
@@ -396,10 +427,14 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
 
 void CodeharbordClient::onReadyRead()
 {
+    if (m_transportChangeDepth > 0) {
+        m_readDeferred = true;
+        return;
+    }
     if (!m_transport || m_closed)
         return;
 
-    const QPointer<QIODevice> sourceTransport = m_transport;
+    const quint64 transportGeneration = m_transportGeneration;
     const qsizetype bufferedBefore = m_readBuffer.size();
     // ONE bounded read per call, sized to what is actually waiting.
     // QIODevice::read(n) resizes its result to n BEFORE reading, so asking for
@@ -421,8 +456,10 @@ void CodeharbordClient::onReadyRead()
     // cannot arrive — waiting for the reply alone would tear down exactly the
     // slow, healthy, large transfer the heartbeat is supposed to protect.
     const bool readProgress = m_readBuffer.size() != bufferedBefore;
-    if (readProgress)
+    if (readProgress) {
+        ++m_readGeneration;
         m_heartbeatMisses = 0;
+    }
 
     // processLine() invokes a user callback that may delete this client. Watch
     // for that with a QPointer and stop touching members the instant it fires,
@@ -457,7 +494,7 @@ void CodeharbordClient::onReadyRead()
         if (newline == -1)
             break;
         if (newline - m_readPos > kMaxLineBytes) {
-            dropUntrustedStream(sourceTransport);
+            dropUntrustedStream(transportGeneration);
             return;
         }
         // A DEEP copy, not sliced()/left(): those share m_readBuffer's
@@ -486,12 +523,12 @@ void CodeharbordClient::onReadyRead()
         // transportClosed() announced, so the rest of this chunk belongs to a
         // connection that no longer exists: dispatching it would emit
         // notifications AFTER the close and warn about ids we just swept.
+        if (m_transportGeneration != transportGeneration)
+            return;
         if (m_closed) {
             releaseReadBuffer();
             return;
         }
-        if (m_transport != sourceTransport)
-            return;
     }
     // No '\n' past m_scanOffset: the whole buffer has now been searched, so the
     // next readyRead resumes from its end instead of from the cursor.
@@ -508,7 +545,7 @@ void CodeharbordClient::onReadyRead()
     // belongs to the caller and may still be physically healthy); what is gone
     // is our ability to trust a single byte on it, so nothing more is read.
     if (m_readBuffer.size() > kMaxLineBytes) {
-        dropUntrustedStream(sourceTransport);
+        dropUntrustedStream(transportGeneration);
         return;
     }
     // QIODevice::read() intentionally takes only one bounded chunk. A socket
@@ -526,9 +563,9 @@ void CodeharbordClient::onReadyRead()
     // makes progress a precondition for continuing, the same rule
     // onTransportClosed()'s drain loop already applies to its own iteration.
     // m_transport is checked for null in its own right: a callback above may
-    // have deleted the caller-owned device, which nulls BOTH QPointers and makes
-    // them compare equal.
-    if (readProgress && m_transport && m_transport == sourceTransport &&
+    // have deleted the caller-owned device without rebinding it.
+    if (readProgress && m_transport &&
+        m_transportGeneration == transportGeneration &&
         !m_closed && m_transport->bytesAvailable() > 0) {
         QMetaObject::invokeMethod(this, &CodeharbordClient::onReadyRead,
                                   Qt::QueuedConnection);
@@ -563,8 +600,7 @@ void CodeharbordClient::releaseReadBuffer()
     m_scanOffset = 0;
 }
 
-void CodeharbordClient::dropUntrustedStream(
-    const QPointer<QIODevice>& sourceTransport)
+void CodeharbordClient::dropUntrustedStream(quint64 transportGeneration)
 {
     // Release the garbage BEFORE announcing anything: a protocolWarning slot may
     // delete this client, and the release must not depend on surviving the emit.
@@ -583,7 +619,7 @@ void CodeharbordClient::dropUntrustedStream(
         return;
     // Only the transport those bytes came from: a warning slot is free to have
     // rebound a replacement, and this close belongs to the device we gave up on.
-    if (m_transport == sourceTransport && !m_closed)
+    if (m_transportGeneration == transportGeneration && !m_closed)
         onTransportClosed();
 }
 
@@ -786,6 +822,10 @@ void CodeharbordClient::processLine(const QByteArray& line)
 
 void CodeharbordClient::onTransportClosed()
 {
+    if (m_transportChangeDepth > 0) {
+        m_closeDeferred = true;
+        return;
+    }
     if (m_closed)
         return;
 
@@ -795,7 +835,7 @@ void CodeharbordClient::onTransportClosed()
     // unconsumed. Routing them here means a response that physically arrived is
     // DELIVERED rather than reported as "transport closed with request pending".
     QPointer<CodeharbordClient> self(this);
-    const QPointer<QIODevice> closingTransport = m_transport;
+    const quint64 transportGeneration = m_transportGeneration;
     // read() is deliberately bounded, so a close event may find more than one
     // chunk waiting. Drain every chunk that makes progress before failing
     // pending requests; otherwise a valid response just beyond the first
@@ -816,15 +856,16 @@ void CodeharbordClient::onTransportClosed()
         // Without this second check the announcement would go out twice.
         if (m_closed)
             return;
-        if (m_transport != closingTransport)
+        if (m_transportGeneration != transportGeneration)
             return;
-        // m_transport, not just the comparison above: a callback may have deleted
-        // the caller-owned device, which nulls BOTH QPointers and makes them
-        // compare equal.
+        // A callback may have deleted the caller-owned device without rebinding.
         if (!m_transport || m_transport->bytesAvailable() >= availableBefore)
             break; // protect against a broken device that reports no progress
     }
     m_closed = true;
+    m_bindingNeedsAnnouncement = false;
+    m_readDeferred = false;
+    m_closeDeferred = false;
     // Whatever is left is a half-received frame from a peer that will never
     // finish it, or bytes we have decided not to trust. Release them: keeping
     // them pins up to the 16 MiB cap for the client's whole remaining life, and
@@ -845,10 +886,10 @@ void CodeharbordClient::onTransportClosed()
     // also rebind or detach the transport, in which case this close belongs to
     // the old device and must not be announced against the new one.
     failAllPending(error);
-    if (!self || m_transport != closingTransport || !m_closed)
+    if (!self || m_transportGeneration != transportGeneration || !m_closed)
         return;
 
-    emit transportClosed();
+    emit transportClosed(transportGeneration);
 }
 
 void CodeharbordClient::onTransportDestroyed()
@@ -870,10 +911,7 @@ void CodeharbordClient::failAllPending(const RpcError& error)
     // before it is used again.
     const QHash<qint64, ResponseCallback> pending = std::move(m_pending);
     m_pending.clear();
-    for (const ResponseCallback& cb : pending) {
-        if (cb) // empty for a fire-and-forget call() with a null callback
-            cb(QJsonValue(), error);
-    }
+    failPendingCallbacks(pending, error);
 }
 
 qsizetype CodeharbordClient::pendingCount() const
@@ -954,6 +992,10 @@ void CodeharbordClient::onHeartbeatTick()
         m_heartbeatTimer->stop();
         return;
     }
+    // Reads intentionally wait until every invalidation listener has run. A
+    // nested event-loop tick must not mistake that barrier for peer silence.
+    if (m_transportChangeDepth > 0)
+        return;
 
     QPointer<CodeharbordClient> self(this);
 
@@ -980,10 +1022,13 @@ void CodeharbordClient::onHeartbeatTick()
         // as a completed interval meant the miss counter never moved. The peer
         // was probed forever, never declared dead, and SessionBootstrap's
         // reconnect ladder never ran. Count the interval as the silence it is.
+        const quint64 transportGeneration = m_transportGeneration;
+        const quint64 readGeneration = m_readGeneration;
         const bool sent = sendHeartbeatPing();
-        if (!self || m_closed || m_destroying)
+        if (!self || m_closed || m_destroying ||
+            m_transportGeneration != transportGeneration)
             return; // the failed write already tore the transport down
-        if (sent)
+        if (sent || m_readGeneration != readGeneration)
             return;
     }
 

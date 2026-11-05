@@ -362,6 +362,11 @@ private slots:
     void disablingMidLadderStopsIt();
     void disablingTheLadderClearsItsAttemptCounter();
     void userDisconnectDoesNotReconnect();
+    void reconnectStateObserverCanCancelBeforeTheTimerIsArmed_data();
+    void reconnectStateObserverCanCancelBeforeTheTimerIsArmed();
+    void disconnectFromTheFinalRetryErrorStaysDisconnected_data();
+    void disconnectFromTheFinalRetryErrorStaysDisconnected();
+    void reconnectingFromFailedDoesNotReportTheOldLadderFailure();
     void uncappedLadderKeepsRetryingAtSixty();
 
     // Which channel news is a FAILURE and which is chatter.
@@ -403,6 +408,8 @@ private slots:
     void aBlankNodePathFallsBackToABareName();
     void theInstalledReleaseIsTiedToTheClientVersion();
     void provisioningStaysInsideTheChosenDirectory();
+    void provisioningRejectsRelativeAndRootEquivalentTargets_data();
+    void provisioningRejectsRelativeAndRootEquivalentTargets();
     void theReportIsReadBackFieldForField();
     void aRequestedUpgradeReplacesAnInstallWeDidNotMake();
     void aRequestedUpgradeRefusesASourceCheckoutAndKeepsUsingIt();
@@ -419,12 +426,141 @@ private slots:
     // costing the user the service they had.
     void theProvisionScriptStagesTheArchiveAndRollsBackUnderARealShell();
     void logicalRpcCloseReconnectsTheSession();
+    void anOldRpcCloseCannotTearDownASynchronouslyRewiredSession();
     void synchronousDisconnectDuringWiringIsHonored_data();
     void synchronousDisconnectDuringWiringIsHonored();
     void synchronousChannelLossFailsWiring_data();
     void synchronousChannelLossFailsWiring();
     void synchronousChannelLossDuringRetryHonorsTheAttemptCap();
 };
+
+void TstSessionBootstrap::reconnectStateObserverCanCancelBeforeTheTimerIsArmed_data()
+{
+    QTest::addColumn<bool>("disable");
+    QTest::newRow("disconnect") << false;
+    QTest::newRow("disable-reconnect") << true;
+}
+
+void TstSessionBootstrap::reconnectStateObserverCanCancelBeforeTheTimerIsArmed()
+{
+    QFETCH(bool, disable);
+    Harness h;
+    QVERIFY(h.wire());
+    QSignalSpy scheduled(&h.boot, &SessionBootstrap::reconnectScheduled);
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+            [&h, disable](State state) {
+                if (state != State::Reconnecting)
+                    return;
+                if (disable)
+                    h.boot.setReconnectEnabled(false);
+                else
+                    h.boot.disconnectSession();
+            });
+    h.boot.rpcChannel()->dropRemote();
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
+    QCOMPARE(scheduled.count(), 0);
+    QCOMPARE(h.boot.connectCalls, 1);
+}
+
+void TstSessionBootstrap::disconnectFromTheFinalRetryErrorStaysDisconnected_data()
+{
+    QTest::addColumn<bool>("fatal");
+    QTest::newRow("attempt-cap") << false;
+    QTest::newRow("fatal-prerequisite") << true;
+}
+
+void TstSessionBootstrap::disconnectFromTheFinalRetryErrorStaysDisconnected()
+{
+    QFETCH(bool, fatal);
+    Harness h;
+    QVERIFY(h.wire());
+    h.boot.setMaxReconnectAttempts(1);
+    if (fatal)
+        h.boot.fakeScript(true, inspectionReport(QString()));
+    else
+        h.boot.connectOk = false;
+    bool cancelled = false;
+    connect(&h.boot, &SessionBootstrap::error, &h.boot,
+            [&h, fatal, &cancelled](const QString& message) {
+                if ((fatal && message.contains(QStringLiteral("not a runnable")))
+                    || (!fatal && message.contains(QStringLiteral("giving up")))) {
+                    cancelled = true;
+                    h.boot.disconnectSession();
+                }
+            });
+    h.boot.rpcChannel()->dropRemote();
+    QTRY_VERIFY(cancelled);
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
+    QCOMPARE(h.boot.reconnectAttempt(), 0);
+    QCOMPARE(h.boot.connectCalls, 2);
+}
+
+void TstSessionBootstrap::reconnectingFromFailedDoesNotReportTheOldLadderFailure()
+{
+    Harness h;
+    QVERIFY(h.wire());
+    h.boot.setMaxReconnectAttempts(1);
+    h.boot.connectOk = false;
+    bool reconnected = false;
+    bool replacementConnected = false;
+    QSignalSpy errors(&h.boot, &SessionBootstrap::error);
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+            [&h, &reconnected, &replacementConnected](State state) {
+                if (state != State::Failed)
+                    return;
+                h.boot.connectOk = true;
+                replacementConnected = h.wire();
+                reconnected = true;
+            });
+    h.boot.rpcChannel()->dropRemote();
+    QTRY_VERIFY(reconnected);
+    QVERIFY(replacementConnected);
+    QCOMPARE(h.boot.state(), State::Wired);
+    QCOMPARE(h.boot.connectCalls, 3);
+    QCOMPARE(h.boot.reconnectAttempt(), 0);
+    QVERIFY(!h.boot.reconnectPending());
+    for (const QList<QVariant>& call : errors) {
+        QVERIFY2(!call.first().toString().contains(QStringLiteral("giving up")),
+                 qPrintable(call.first().toString()));
+    }
+    h.client.call(QStringLiteral("workspace.list"), QJsonValue(),
+                  [](QJsonValue, std::optional<RpcError>) {});
+    QCOMPARE(h.client.pendingCount(), 1);
+}
+
+void TstSessionBootstrap::provisioningRejectsRelativeAndRootEquivalentTargets_data()
+{
+    QTest::addColumn<QString>("root");
+    QTest::newRow("empty") << QString();
+    QTest::newRow("relative") << QStringLiteral("codeharbor");
+    QTest::newRow("tilde") << QStringLiteral("~/codeharbor");
+    QTest::newRow("root") << QStringLiteral("/");
+    QTest::newRow("root-trailing-slashes") << QStringLiteral("///");
+    QTest::newRow("root-dot") << QStringLiteral("/./");
+    QTest::newRow("root-parent") << QStringLiteral("/srv/..");
+}
+
+void TstSessionBootstrap::provisioningRejectsRelativeAndRootEquivalentTargets()
+{
+    QFETCH(QString, root);
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport());
+    QSignalSpy errors(&h.boot, &SessionBootstrap::error);
+    QVERIFY(!h.boot.connectAndWire(h.host, h.port, QStringLiteral("user"),
+                                  QStringLiteral("/usr/bin/node"), root));
+    QCOMPARE(h.boot.state(), State::Failed);
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.first().first().toString().contains(
+        QStringLiteral("absolute directory")));
+    // Only the read-only inspection ran: none of these paths may reach the
+    // installer, create scratch files, or rename members of the target.
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+    QVERIFY(!h.boot.rpcDevice());
+    QVERIFY(!h.boot.agentDevice());
+}
 
 void TstSessionBootstrap::logicalRpcCloseReconnectsTheSession()
 {
@@ -462,6 +598,61 @@ void TstSessionBootstrap::logicalRpcCloseReconnectsTheSession()
     QCOMPARE(h.boot.connectCalls, 2);
     QVERIFY(h.boot.rpcDevice() != oldRpc);
     QVERIFY(h.boot.agentDevice() != oldAgent);
+}
+
+void TstSessionBootstrap::anOldRpcCloseCannotTearDownASynchronouslyRewiredSession()
+{
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    TestBootstrap* bootstrap = nullptr;
+    bool rewired = false;
+    bool replacementConnected = false;
+    const auto wire = [&] {
+        return bootstrap->connectAndWire(
+            QStringLiteral("example.invalid"), 2222, QStringLiteral("user"),
+            QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/codeharbor"));
+    };
+    // Connection order is intentional: this observer replaces the session
+    // before Bootstrap's later observer receives the old close notification.
+    connect(&client, &CodeharbordClient::transportClosed, &client,
+            [&](quint64) {
+                if (rewired || !bootstrap)
+                    return;
+                rewired = true;
+                replacementConnected = wire();
+            });
+    TestBootstrap boot(&pool, &client, &monitor);
+    bootstrap = &boot;
+    boot.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    boot.setTrustUnknownHostKeys(true);
+    boot.setReconnectTimeScale(kTimeScale);
+    QVERIFY(wire());
+    QPointer<SshChannelDevice> oldRpc = boot.rpcDevice();
+    QSignalSpy scheduled(&boot, &SessionBootstrap::reconnectScheduled);
+    QSignalSpy errors(&boot, &SessionBootstrap::error);
+
+    client.enableHeartbeat(1000000, 1);
+    QVERIFY(QMetaObject::invokeMethod(&client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(QMetaObject::invokeMethod(&client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(rewired);
+    QVERIFY(replacementConnected);
+    QCOMPARE(boot.state(), State::Wired);
+    QCOMPARE(boot.connectCalls, 2);
+    QVERIFY(boot.rpcDevice() != oldRpc);
+    QCOMPARE(client.transport(), static_cast<QIODevice*>(boot.rpcDevice()));
+    QCOMPARE(scheduled.count(), 0);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(!boot.reconnectPending());
+    // The replacement transport remains usable, rather than merely looking
+    // Wired after an obsolete close already detached its RPC consumer.
+    client.call(QStringLiteral("workspace.list"), QJsonValue(),
+                [](QJsonValue, std::optional<RpcError>) {});
+    QCOMPARE(client.pendingCount(), 1);
+    QVERIFY(!boot.rpcChannel()->written.isEmpty());
 }
 
 void TstSessionBootstrap::synchronousDisconnectDuringWiringIsHonored_data()

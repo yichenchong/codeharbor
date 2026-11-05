@@ -54,6 +54,16 @@ public:
         emit readyRead();
     }
 
+    void announceEof()
+    {
+        emit readChannelFinished();
+    }
+
+    void deliverOnNextWrite(const QByteArray& frame)
+    {
+        m_onNextWrite = frame;
+    }
+
     QByteArray takeSent()
     {
         const QByteArray sent = m_sent;
@@ -75,12 +85,18 @@ protected:
     qint64 writeData(const char* data, qint64 len) override
     {
         m_sent.append(data, len);
+        // Clear before readyRead: a notification handler may write reentrantly.
+        QByteArray frame;
+        frame.swap(m_onNextWrite);
+        if (!frame.isEmpty())
+            deliver(frame);
         return len;
     }
 
 private:
     QByteArray m_incoming;
     QByteArray m_sent;
+    QByteArray m_onNextWrite;
 };
 
 // One `viewer.command` notification frame, exactly as codeharbord writes it.
@@ -134,6 +150,13 @@ private slots:
     void anAnswerBecomesOneCommandResultRequest();
     void aRefusalCarriesItsCodeAndMessage();
     void aSecondAnswerForTheSameCommandIsDropped();
+    void aRepeatedNotificationDoesNotExecuteOrRefuseTheOriginal();
+    void anUnknownAnswerIsIgnored();
+    void transportReplacementRetiresCommandsBeforeDrainingTheNewPeer();
+    void transportLossRetiresCommands();
+    void aCommandReceivedDuringTransportChangingSurvivesInvalidation();
+    void supersededTransportChangeDoesNotRetireTheFinalPeersCommand();
+    void supersededTransportLossDoesNotRetireTheReplacementPeersCommand();
     void anEmptyErrorCodeStillNamesAFailure();
     void pastTheInFlightBoundACommandIsRefusedAsBusy();
     void answeringWithoutAClientIsHarmless();
@@ -358,22 +381,225 @@ void TstViewerCommands::aRefusalCarriesItsCodeAndMessage()
 
 void TstViewerCommands::aSecondAnswerForTheSameCommandIsDropped()
 {
-    // A QML handler that fell through two arms would otherwise report an outcome
-    // twice, and the second report could settle a command the daemon has since
-    // reused the socket for.
+    for (bool firstOk : {false, true}) {
+        for (bool secondOk : {false, true}) {
+            FakeTransport transport;
+            CodeharbordClient client;
+            client.setTransport(&transport);
+            ViewerCommandService service(&client);
+
+            transport.deliver(commandFrame(validParams()));
+            service.respond(QStringLiteral("vc-1"), firstOk, QString(),
+                            QString(), {});
+            QCOMPARE(takeRequests(transport).size(), 1);
+
+            service.respond(QStringLiteral("vc-1"), secondOk, QString(),
+                            QString(), {});
+            QVERIFY(takeRequests(transport).isEmpty());
+        }
+    }
+}
+
+void TstViewerCommands::aRepeatedNotificationDoesNotExecuteOrRefuseTheOriginal()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    client.setTransport(&transport);
+    ViewerCommandService service(&client);
+    QSignalSpy spy(&service, &ViewerCommandService::commandRequested);
+
+    transport.deliver(commandFrame(validParams(QStringLiteral("split"))));
+    transport.deliver(commandFrame(validParams(QStringLiteral("split"))));
+    QJsonObject malformedDuplicate = validParams();
+    malformedDuplicate.remove(QStringLiteral("devSessionId"));
+    transport.deliver(commandFrame(malformedDuplicate));
+    QCOMPARE(spy.size(), 1);
+    QCOMPARE(service.inFlightCount(), 1);
+    QVERIFY(takeRequests(transport).isEmpty());
+
+    for (int i = 1; i < ViewerCommandService::kMaxInFlight; ++i) {
+        transport.deliver(commandFrame(validParams(
+            QStringLiteral("list"), QStringLiteral("other-%1").arg(i))));
+    }
+    transport.deliver(commandFrame(validParams(QStringLiteral("split"))));
+    QCOMPARE(spy.size(), ViewerCommandService::kMaxInFlight);
+    QCOMPARE(service.inFlightCount(), ViewerCommandService::kMaxInFlight);
+    QVERIFY(takeRequests(transport).isEmpty());
+
+    service.respond(QStringLiteral("vc-1"), true, QString(), QString(), {});
+    const QVector<QJsonObject> requests = takeRequests(transport);
+    QCOMPARE(requests.size(), 1);
+    const QJsonObject params = requests.first().value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("commandId")).toString(), QStringLiteral("vc-1"));
+    QVERIFY(params.value(QStringLiteral("ok")).toBool());
+}
+
+void TstViewerCommands::anUnknownAnswerIsIgnored()
+{
     FakeTransport transport;
     CodeharbordClient client;
     client.setTransport(&transport);
     ViewerCommandService service(&client);
 
-    transport.deliver(commandFrame(validParams()));
-    transport.takeSent();
-
-    service.respond(QStringLiteral("vc-1"), true, QString(), QString(), {});
-    QCOMPARE(takeRequests(transport).size(), 1);
-
-    service.respond(QStringLiteral("vc-1"), true, QString(), QString(), {});
+    service.respond(QStringLiteral("not-announced"), false,
+                    QStringLiteral("failed"), QStringLiteral("late answer"), {});
     QVERIFY(takeRequests(transport).isEmpty());
+}
+
+void TstViewerCommands::transportReplacementRetiresCommandsBeforeDrainingTheNewPeer()
+{
+    FakeTransport original;
+    CodeharbordClient client;
+    client.setTransport(&original);
+    ViewerCommandService service(&client);
+    for (int i = 0; i < ViewerCommandService::kMaxInFlight; ++i) {
+        original.deliver(commandFrame(validParams(
+            QStringLiteral("list"), QStringLiteral("old-%1").arg(i))));
+    }
+    QCOMPARE(service.inFlightCount(), ViewerCommandService::kMaxInFlight);
+
+    // Real transports can already have bytes available when they are bound.
+    // Those commands must see free capacity, and survive post-drain lifecycle
+    // notifications so the handler can still answer them afterwards.
+    FakeTransport replacement;
+    replacement.deliver(commandFrame(
+        validParams(QStringLiteral("list"), QStringLiteral("new-command"))));
+    QSignalSpy requested(&service, &ViewerCommandService::commandRequested);
+    client.setTransport(&replacement);
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.first().first().toString(), QStringLiteral("new-command"));
+    QCOMPARE(service.inFlightCount(), 1);
+    QVERIFY(takeRequests(replacement).isEmpty());
+
+    service.respond(QStringLiteral("old-0"), false, QStringLiteral("failed"),
+                    QStringLiteral("late answer"), {});
+    QVERIFY(takeRequests(replacement).isEmpty());
+    service.respond(QStringLiteral("new-command"), true, QString(), QString(), {});
+    const QVector<QJsonObject> requests = takeRequests(replacement);
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("commandId")).toString(),
+             QStringLiteral("new-command"));
+    QCOMPARE(service.inFlightCount(), 0);
+}
+
+void TstViewerCommands::transportLossRetiresCommands()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    client.setTransport(&transport);
+    ViewerCommandService service(&client);
+    transport.deliver(commandFrame(validParams()));
+    QCOMPARE(service.inFlightCount(), 1);
+    transport.announceEof();
+    QCOMPARE(service.inFlightCount(), 0);
+}
+
+void TstViewerCommands::supersededTransportChangeDoesNotRetireTheFinalPeersCommand()
+{
+    FakeTransport original;
+    FakeTransport intermediate;
+    FakeTransport finalPeer;
+    CodeharbordClient client;
+    client.setTransport(&original);
+
+    // This slot runs before the service's invalidation slot. Without lifecycle
+    // ordering guards, its nested bind can drain the final command before the
+    // outer signal resumes its older invalidation slots.
+    QObject::connect(&client, &CodeharbordClient::transportChanging, &client,
+                     [&] {
+                         if (client.transport() == &intermediate)
+                             client.setTransport(&finalPeer);
+                     });
+    ViewerCommandService service(&client);
+    original.deliver(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("old-command"))));
+    finalPeer.deliver(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("final-command"))));
+    QSignalSpy requested(&service, &ViewerCommandService::commandRequested);
+
+    client.setTransport(&intermediate);
+    QCOMPARE(client.transport(), &finalPeer);
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.first().first().toString(), QStringLiteral("final-command"));
+    QCOMPARE(service.inFlightCount(), 1);
+    service.respond(QStringLiteral("final-command"), true, QString(), QString(), {});
+    const QVector<QJsonObject> requests = takeRequests(finalPeer);
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("commandId")).toString(),
+             QStringLiteral("final-command"));
+    QVERIFY(takeRequests(intermediate).isEmpty());
+    QCOMPARE(service.inFlightCount(), 0);
+}
+
+void TstViewerCommands::supersededTransportLossDoesNotRetireTheReplacementPeersCommand()
+{
+    FakeTransport original;
+    FakeTransport replacement;
+    CodeharbordClient client;
+    client.setTransport(&original);
+    QObject::connect(&client, &CodeharbordClient::transportClosed, &client,
+                     [&] { client.setTransport(&replacement); });
+    ViewerCommandService service(&client);
+    original.deliver(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("old-command"))));
+    replacement.deliver(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("replacement-command"))));
+    QSignalSpy requested(&service, &ViewerCommandService::commandRequested);
+
+    original.announceEof();
+    QCOMPARE(client.transport(), &replacement);
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.first().first().toString(),
+             QStringLiteral("replacement-command"));
+    QCOMPARE(service.inFlightCount(), 1);
+    service.respond(QStringLiteral("replacement-command"), true, QString(),
+                    QString(), {});
+    const QVector<QJsonObject> requests = takeRequests(replacement);
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("commandId")).toString(),
+             QStringLiteral("replacement-command"));
+    QCOMPARE(service.inFlightCount(), 0);
+}
+
+void TstViewerCommands::aCommandReceivedDuringTransportChangingSurvivesInvalidation()
+{
+    FakeTransport original;
+    FakeTransport replacement;
+    CodeharbordClient client;
+    client.setTransport(&original);
+    QObject::connect(&client, &CodeharbordClient::transportChanging, &client,
+                     [&] {
+                         if (client.transport() == &replacement)
+                             client.call(QStringLiteral("ping"), QJsonObject{}, nullptr);
+                     });
+    ViewerCommandService service(&client);
+    original.deliver(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("old-command"))));
+    replacement.deliverOnNextWrite(commandFrame(validParams(
+        QStringLiteral("list"), QStringLiteral("synchronous-command"))));
+    QSignalSpy requested(&service, &ViewerCommandService::commandRequested);
+
+    client.setTransport(&replacement);
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.first().first().toString(),
+             QStringLiteral("synchronous-command"));
+    QCOMPARE(service.inFlightCount(), 1);
+    const QVector<QJsonObject> initialRequests = takeRequests(replacement);
+    QCOMPARE(initialRequests.size(), 1);
+    QCOMPARE(initialRequests.first().value(QStringLiteral("method")).toString(),
+             QStringLiteral("ping"));
+
+    service.respond(QStringLiteral("synchronous-command"), true, QString(),
+                    QString(), {});
+    const QVector<QJsonObject> requests = takeRequests(replacement);
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("commandId")).toString(),
+             QStringLiteral("synchronous-command"));
+    QCOMPARE(service.inFlightCount(), 0);
 }
 
 void TstViewerCommands::anEmptyErrorCodeStillNamesAFailure()

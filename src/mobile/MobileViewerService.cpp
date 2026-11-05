@@ -425,7 +425,7 @@ void MobileViewerService::stat(const QString &path)
 void MobileViewerService::resolvePath(const QString &path, const QString &base)
 {
     if (!m_client) {
-        emit fileError(path, noClientMessage());
+        emit pathResolveError(path, base, noClientMessage());
         return;
     }
 
@@ -435,11 +435,11 @@ void MobileViewerService::resolvePath(const QString &path, const QString &base)
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodResolvePath), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, base](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
             if (error) {
-                emit guard->fileError(path, error->message);
+                emit guard->pathResolveError(path, base, error->message);
                 return;
             }
             const QJsonObject obj = result.toObject();
@@ -450,19 +450,19 @@ void MobileViewerService::resolvePath(const QString &path, const QString &base)
             // every path as outside the project — and in the markdown viewer
             // that would silently stop every legitimate image from loading.
             if (!inside.isBool()) {
-                emit guard->fileError(
-                    path,
+                emit guard->pathResolveError(
+                    path, base,
                     QStringLiteral("reply carried no insideRepositoryRoot "
                                    "flag"));
                 return;
             }
             const QJsonValue resolved = obj.value(QStringLiteral("path"));
             if (!resolved.isString()) {
-                emit guard->fileError(
-                    path, QStringLiteral("reply carried no resolved path"));
+                emit guard->pathResolveError(
+                    path, base, QStringLiteral("reply carried no resolved path"));
                 return;
             }
-            emit guard->pathResolved(path, resolved.toString(), inside.toBool());
+            emit guard->pathResolved(path, base, resolved.toString(), inside.toBool());
         });
 }
 

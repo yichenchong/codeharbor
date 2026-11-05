@@ -44,6 +44,22 @@ ViewerCommandService::ViewerCommandService(CodeharbordClient* client, QObject* p
     if (m_client) {
         connect(m_client, &CodeharbordClient::notificationReceived, this,
                 &ViewerCommandService::onNotification);
+        // Commands belong to the daemon on this transport. Retire them before
+        // a replacement can deliver commands, not on post-drain transportBound.
+        connect(m_client, &CodeharbordClient::transportChanging, this,
+                [this](quint64 generation) {
+                    // An earlier slot may rebind and drain a newer peer before
+                    // this older signal invocation reaches us.
+                    if (m_client
+                        && generation == m_client->transportGeneration())
+                        m_inFlight.clear();
+                });
+        connect(m_client, &CodeharbordClient::transportClosed, this,
+                [this](quint64 generation) {
+                    if (m_client
+                        && generation == m_client->transportGeneration())
+                        m_inFlight.clear();
+                });
     }
 }
 
@@ -63,11 +79,15 @@ void ViewerCommandService::onNotification(const QString& method, const QJsonValu
     QString commandId;
     if (!isUsableId(o.value(QStringLiteral("commandId")), &commandId))
         return;
+    // A repeated notification must not drive the layout twice or settle the
+    // original request with a validation/busy refusal while it is still running.
+    if (m_inFlight.contains(commandId))
+        return;
 
     QString devSessionId;
     if (!isUsableId(o.value(QStringLiteral("devSessionId")), &devSessionId)) {
-        respond(commandId, false, QStringLiteral("bad_request"),
-                QStringLiteral("the command named no Dev Session"), {});
+        sendResponse(commandId, false, QStringLiteral("bad_request"),
+                     QStringLiteral("the command named no Dev Session"), {});
         return;
     }
     // terminalId is provenance only — which pane's agent asked — but it is still
@@ -75,33 +95,32 @@ void ViewerCommandService::onNotification(const QString& method, const QJsonValu
     // than allowed to drive the layout anonymously.
     QString terminalId;
     if (!isUsableId(o.value(QStringLiteral("terminalId")), &terminalId)) {
-        respond(commandId, false, QStringLiteral("bad_request"),
-                QStringLiteral("the command named no terminal"), {});
+        sendResponse(commandId, false, QStringLiteral("bad_request"),
+                     QStringLiteral("the command named no terminal"), {});
         return;
     }
 
     const QJsonValue opValue = o.value(QStringLiteral("op"));
     if (!opValue.isString() || !isKnownOp(opValue.toString())) {
-        respond(commandId, false, QStringLiteral("bad_request"),
-                QStringLiteral("this CodeHarbor does not implement that viewer operation"),
-                {});
+        sendResponse(commandId, false, QStringLiteral("bad_request"),
+                     QStringLiteral("this CodeHarbor does not implement that viewer operation"),
+                     {});
         return;
     }
     const QJsonValue argsValue = o.value(QStringLiteral("args"));
     if (!argsValue.isUndefined() && !argsValue.isObject()) {
-        respond(commandId, false, QStringLiteral("bad_request"),
-                QStringLiteral("args was not a JSON object"), {});
+        sendResponse(commandId, false, QStringLiteral("bad_request"),
+                     QStringLiteral("args was not a JSON object"), {});
         return;
     }
 
-    // The refusals above answer WITHOUT registering the id, which is why respond()
-    // tolerates an unknown one: they are the one legitimate case of answering a
-    // command that was never announced.
+    // Boundary refusals do not announce an in-flight command. Send them
+    // directly; respond() is reserved for the handler's first answer.
     if (m_inFlight.size() >= kMaxInFlight) {
-        respond(commandId, false, QStringLiteral("busy"),
-                QStringLiteral("CodeHarbor is already working through %1 viewer commands")
-                    .arg(kMaxInFlight),
-                {});
+        sendResponse(commandId, false, QStringLiteral("busy"),
+                     QStringLiteral("CodeHarbor is already working through %1 viewer commands")
+                         .arg(kMaxInFlight),
+                     {});
         return;
     }
 
@@ -114,18 +133,16 @@ void ViewerCommandService::respond(const QString& commandId, bool ok,
                                    const QString& errorCode, const QString& message,
                                    const QVariantMap& data)
 {
-    if (commandId.trimmed().isEmpty())
+    if (!m_inFlight.remove(commandId))
         return;
-    // remove() answers whether the id was there. An id that was never announced
-    // is still answered on the wire — the validation refusals above rely on that
-    // — but a SECOND answer to an announced one is dropped, so a QML handler that
-    // falls through two arms cannot report an outcome twice.
-    if (!m_inFlight.remove(commandId) && ok) {
-        // A success for an id nobody is tracking can only be a double-report:
-        // every refusal path here is a failure. Dropping it keeps the first,
-        // truthful answer.
-        return;
-    }
+    sendResponse(commandId, ok, errorCode, message, data);
+}
+
+void ViewerCommandService::sendResponse(const QString& commandId, bool ok,
+                                        const QString& errorCode,
+                                        const QString& message,
+                                        const QVariantMap& data)
+{
     if (!m_client)
         return;
 

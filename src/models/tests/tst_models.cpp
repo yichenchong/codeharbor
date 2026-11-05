@@ -97,6 +97,7 @@ private slots:
     void workspaceValueTypesCompareEveryField();
     void identifierWrappersAreHashable();
     void updateTerminalStatesFinishesEveryRowBeforeSignalling();
+    void updateTerminalStatesStopsSignallingAfterAReentrantReset();
     void oklchRoundTripsSrgb();
     void paletteRejectsTooSmallRequest();
     void paletteOnlyAppendsToSeed();
@@ -1844,6 +1845,39 @@ void TstModels::updateTerminalStatesFinishesEveryRowBeforeSignalling()
     const int error = static_cast<int>(SessionRowState::Error);
     QCOMPARE(s1AtSignal, QVector<int>({error, error}));
     QCOMPARE(s2AtSignal, QVector<int>({error, error}));
+}
+
+void TstModels::updateTerminalStatesStopsSignallingAfterAReentrantReset()
+{
+    for (bool refilter : {false, true}) {
+        SessionsModel model;
+        GroupRow group;
+        group.group.id = GroupId{QStringLiteral("g")};
+        SessionRow first;
+        first.session.id = DevSessionId{QStringLiteral("first")};
+        first.terminals = {terminal(TerminalState::Ready, AgentState::Idle)};
+        SessionRow second = first;
+        second.session.id = DevSessionId{QStringLiteral("second")};
+        group.sessions = {first, second};
+        model.setGroups({group});
+        QSignalSpy changed(&model, &QAbstractItemModel::dataChanged);
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        QObject::connect(&model, &QAbstractItemModel::dataChanged, &model,
+                         [&model, refilter] {
+                             if (refilter)
+                                 model.setPinnedOnly(true);
+                             else
+                                 model.setGroups({});
+                         });
+
+        group.sessions[0].terminals[0].agent = AgentState::Error;
+        group.sessions[1].terminals[0].agent = AgentState::Error;
+        model.updateTerminalStates({group});
+
+        QCOMPARE(changed.count(), 1);
+        QCOMPARE(reset.count(), 1);
+        QCOMPARE(model.rowCount(), 0);
+    }
 }
 
 void TstModels::oklchRoundTripsSrgb()

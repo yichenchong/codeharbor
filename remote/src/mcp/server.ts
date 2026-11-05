@@ -22,7 +22,7 @@
 // down mid-conversation and the harness would report only that its tool provider
 // died.
 
-import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "../tools/entrypoint.ts";
 
 import { createLineFramer, RPC_SERVER_VERSION } from "../codeharbord.ts";
 import { CONTROL_OPS, type ControlOp } from "../control.ts";
@@ -434,6 +434,6 @@ export function runStdio(): void {
     });
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isEntrypoint(import.meta.url)) {
     runStdio();
 }

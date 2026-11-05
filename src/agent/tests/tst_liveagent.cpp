@@ -15,6 +15,8 @@
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QObject>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QSignalSpy>
@@ -96,7 +98,7 @@ QString stateNames(const QVector<int>& states)
 // reaching into the fixture's database, because the daemon answers
 // `tmux.paneActivity` from its OWN view of those rows: a pane written behind its
 // back would not prove the join works.
-struct RawRpc {
+struct RawRpc : QObject {
     QJsonValue result;
     std::optional<RpcError> error;
     bool done = false;
@@ -104,11 +106,16 @@ struct RawRpc {
     bool call(CodeharbordClient& client, const QString& method,
               const QJsonObject& params, int timeoutMs = kExecTimeoutMs)
     {
+        QPointer<RawRpc> self(this);
         client.call(method, params,
-                    [this](QJsonValue value, std::optional<RpcError> err) {
-                        result = value;
-                        error = err;
-                        done = true;
+                    [self](QJsonValue value, std::optional<RpcError> err) {
+                        // A timeout can return the test before the RPC client
+                        // answers or fails its pending calls during cleanup.
+                        if (!self)
+                            return;
+                        self->result = value;
+                        self->error = err;
+                        self->done = true;
                     });
         if (!QTest::qWaitFor([this] { return done; }, timeoutMs))
             return false;

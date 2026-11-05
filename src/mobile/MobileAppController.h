@@ -306,6 +306,11 @@ private:
     // selectPane), so the list and the memory of what was picked from it can
     // never name different sessions.
     QString m_shownSessionId;
+    // Session ids alone do not distinguish a reload from a re-announcement.
+    quint64 m_shownLayoutGeneration = 0;
+    // Completion/errors can precede AppController::activeSessionChanged.
+    quint64 m_lastCompletedLayoutGeneration = 0;
+    quint64 m_layoutErrorGeneration = 0;
     bool m_layoutPending = false;
     // Whether the load currently being waited for has already had a region
     // reported unreadable. SessionLayouts reports such a region through error()

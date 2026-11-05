@@ -296,7 +296,7 @@ void ViewerModel::listDirectory(const QString &path)
 void ViewerModel::resolvePath(const QString &path, const QString &base)
 {
     if (!m_client) {
-        emit pathResolveError(path,
+        emit pathResolveError(path, base,
                               QStringLiteral("no remote client is connected"));
         return;
     }
@@ -309,11 +309,11 @@ void ViewerModel::resolvePath(const QString &path, const QString &base)
     QPointer<ViewerModel> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodResolvePath), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, base](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
             if (error) {
-                emit guard->pathResolveError(path, error->message);
+                emit guard->pathResolveError(path, base, error->message);
                 return;
             }
             const QJsonObject obj = result.toObject();
@@ -324,7 +324,7 @@ void ViewerModel::resolvePath(const QString &path, const QString &base)
             // which would mark every file as outside the project.
             if (!inside.isBool()) {
                 emit guard->pathResolveError(
-                    path,
+                    path, base,
                     QStringLiteral("reply carried no insideRepositoryRoot flag"));
                 return;
             }
@@ -332,11 +332,11 @@ void ViewerModel::resolvePath(const QString &path, const QString &base)
                 obj.value(QStringLiteral("path"));
             if (!resolvedPath.isString()) {
                 emit guard->pathResolveError(
-                    path,
+                    path, base,
                     QStringLiteral("reply carried no resolved path"));
                 return;
             }
-            emit guard->pathResolved(path, resolvedPath.toString(),
+            emit guard->pathResolved(path, base, resolvedPath.toString(),
                                      inside.toBool());
         });
 }

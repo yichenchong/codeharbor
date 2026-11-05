@@ -10,9 +10,10 @@
 //     (a missing/blank session name) throws.
 //
 //  2. No shell. Every tmux invocation goes through execFile with an argv array,
-//     so a session name can contain spaces, quotes, `$`, or `;` without any
-//     interpolation risk. Names are additionally passed to `-t` with tmux's `=`
-//     exact-match prefix, which stops a leading `-` from being read as an option
+//     so names cannot interpolate shell commands. tmux ALSO parses command-list
+//     separators: killSession escapes a final `;` to keep it in the name.
+//     Names are passed to `-t` with tmux's `=` exact-match prefix, which stops a
+//     leading `-` from being read as an option
 //     and stops fnmatch/prefix matching from hitting the wrong session. `=` is
 //     NOT total, though: a LEADING `$` is tmux's session-ID form and is
 //     resolved before the exact-name lookup, so it is rejected outright rather
@@ -473,7 +474,11 @@ export async function killSession(
     runner: CommandRunner = execFileRunner,
 ): Promise<KillSessionResult> {
     const name = requireKillName(params);
-    const result = await run(runner, ["kill-session", "-t", `=${name}`]);
+    // execFile bypasses the shell, not tmux's own command-list parser: a final
+    // unescaped ';' is stripped as a command separator, so '=work;' would kill
+    // 'work'. Escape that final byte for tmux to preserve the literal name.
+    const target = `=${name.replace(/;$/, "\\;")}`;
+    const result = await run(runner, ["kill-session", "-t", target]);
     if (
         result.code === 0 ||
         isMissingTmux(result) ||

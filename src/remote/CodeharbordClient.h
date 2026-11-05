@@ -90,6 +90,9 @@ public:
     // Binding a non-null transport emits transportBound() once it is usable.
     void setTransport(QIODevice* transport);
     QIODevice* transport() const { return m_transport; }
+    // Identity of the current binding, including detach/revival of the same
+    // device. Compare lifecycle signal generations against this after re-entry.
+    quint64 transportGeneration() const { return m_transportGeneration; }
 
     // Issue an async request. Returns the monotonically increasing JSON-RPC id
     // assigned to it (also returned, unused, on the failure paths below). The
@@ -215,7 +218,23 @@ signals:
     // Detaching or replacing the transport with setTransport() does NOT emit
     // this; it fails pending callbacks without announcing a close, because the
     // caller doing the detaching already knows.
-    void transportClosed();
+    // `generation` identifies the closed binding. An earlier slot can rebind
+    // before later slots receive this emission; ignore obsolete loss events
+    // whose generation no longer equals transportGeneration().
+    void transportClosed(quint64 generation);
+    // An effective setTransport() bind, detach, or same-device revival has
+    // established a new binding, but old pending callbacks have not been failed
+    // and newly buffered notifications have not been routed yet. Clear state
+    // owned by the previous peer here; transportBound() is too late for that.
+    // Same-live-device no-op binds emit neither signal. The new transport()
+    // is already visible and calls issued here belong to it, not the old sweep.
+    // An earlier-connected slot may rebind and drain a newer peer before later
+    // slots receive this emission. Ignore it unless `generation` still equals
+    // transportGeneration(), or stale invalidation would clear new peer state.
+    // Inbound frames and transportBound are deferred until all nested Changing
+    // broadcasts finish, so even synchronous ingress from an early slot cannot
+    // precede a later slot's invalidation. Calls still target the new binding.
+    void transportChanging(quint64 generation);
     // A NEW, non-null transport is bound and ready to carry requests.
     //
     // Consumers that hold state living inside the PROCESS on the other end
@@ -229,8 +248,8 @@ signals:
     // wired and drained, so a handler may issue calls immediately. Detaching —
     // setTransport(nullptr) during teardown — deliberately emits nothing: a
     // consumer that re-established there would only write into a client with
-    // nothing bound. The matching "the old one went away" edge is
-    // transportClosed().
+    // nothing bound. Peer-owned state is invalidated by transportChanging() on
+    // explicit swaps/detaches and by transportClosed() on transport loss.
     void transportBound();
 
 private slots:
@@ -250,6 +269,9 @@ private slots:
 private:
     void processLine(const QByteArray& line);
     void failAllPending(const RpcError& error);
+    // Drain/announce only the current binding, once all nested invalidation
+    // broadcasts have finished. Old setTransport stack frames may be superseded.
+    void finishTransportBinding();
     // Issue the next probe. Returns true when a probe is genuinely in flight
     // afterwards, false when call() failed it synchronously (an unwritable
     // transport) so nothing reached the wire — which onHeartbeatTick() counts
@@ -297,13 +319,13 @@ private:
     // the size cap, so we can no longer tell where the next message begins and
     // nothing else the peer queued is a message. Release the garbage, latch the
     // stream untrusted, announce it, and take the ordinary transport-loss path
-    // against `sourceTransport` — the device the offending bytes came from, which
-    // a protocolWarning slot may already have replaced.
+    // against `transportGeneration` — the binding the offending bytes came
+    // from, which a protocolWarning slot may already have replaced.
     //
     // Touch NO member after this returns: it emits a signal and dispatches
     // pending failures, either of which may delete this client. Both call sites
     // return immediately, which is why nothing is reported back.
-    void dropUntrustedStream(const QPointer<QIODevice>& sourceTransport);
+    void dropUntrustedStream(quint64 transportGeneration);
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
     // be destroyed while still bound. A raw pointer would dangle, and the next
@@ -311,6 +333,19 @@ private:
     // use-after-free. QPointer auto-nulls instead, and Qt has already dropped
     // the connections for us.
     QPointer<QIODevice> m_transport = nullptr;
+    // A device can be detached and rebound from inside a callback. Pointer
+    // equality cannot distinguish that fresh binding from the abandoned one.
+    quint64 m_transportGeneration = 0;
+    // No inbound frame may run before every invalidation listener has seen the
+    // change, even if an early listener writes and receives bytes synchronously.
+    int m_transportChangeDepth = 0;
+    bool m_bindingNeedsAnnouncement = false;
+    bool m_readDeferred = false;
+    bool m_closeDeferred = false;
+    // Incremented for every non-empty read, including a synchronous response
+    // delivered inside write(). Heartbeat ticks use it to recognize that
+    // immediate proof of life even when no probe remains pending.
+    quint64 m_readGeneration = 0;
     QByteArray m_readBuffer;
     // m_readPos is the first byte onReadyRead() has NOT yet consumed;
     // m_scanOffset is how far past it the search for the next '\n' has already

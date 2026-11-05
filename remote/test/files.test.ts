@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
+import { promises as fs, type PathLike } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -2378,6 +2378,50 @@ test("writeFile refuses a FIFO directly or through a symlink without replacing i
             }
         }
     } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile never returns a different symlink target's revision after saving", async (t) => {
+    const dir = await tmpDir();
+    const original = path.join(dir, "original.txt");
+    const unrelated = path.join(dir, "unrelated.txt");
+    const link = path.join(dir, "current.txt");
+    const rename = fs.rename;
+    try {
+        await fs.writeFile(original, "original bytes");
+        await fs.writeFile(unrelated, "unrelated bytes");
+        await fs.symlink(original, link);
+        const loaded = await readFile({ path: link });
+        // Another process retargets the link after the save commits, before its
+        // revision is returned. The successful save still belongs to original.
+        const renameMock = t.mock.method(fs, "rename", async (from: PathLike, to: PathLike) => {
+            await rename(from, to);
+            await fs.unlink(link);
+            await fs.symlink(unrelated, link);
+        });
+        const saved = await writeFile({
+            path: link,
+            content: "saved original",
+            expectedRevision: loaded.revision,
+        });
+        renameMock.mock.restore();
+        assert.equal(saved.revision, (await stat({ path: original })).revision);
+        assert.notEqual(saved.revision, (await stat({ path: unrelated })).revision);
+        assert.equal(await fs.readFile(original, "utf-8"), "saved original");
+        // The client has not loaded unrelated. Its next edit must conflict,
+        // rather than overwrite it using a revision borrowed from that file.
+        await assert.rejects(
+            writeFile({
+                path: link,
+                content: "next edit",
+                expectedRevision: saved.revision,
+            }),
+            isRevisionMismatch,
+        );
+        assert.equal(await fs.readFile(unrelated, "utf-8"), "unrelated bytes");
+    } finally {
+        t.mock.restoreAll();
         await fs.rm(dir, { recursive: true, force: true });
     }
 });

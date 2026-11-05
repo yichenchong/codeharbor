@@ -224,7 +224,10 @@ for file in "$@"; do
             echo "$(basename "$file"): jarsigner did not report 'jar verified.'" >&2
             exit 1
         fi
-        if ! unzip -l "$file" | grep -qiE 'META-INF/.*\.(RSA|DSA|EC)$'; then
+        # Consume the entire listing. grep -q exits at the first signature
+        # entry, making unzip die on SIGPIPE for real bundles with long file
+        # lists; pipefail then rejects a correctly signed AAB.
+        if ! unzip -l "$file" | grep -iE 'META-INF/.*\.(RSA|DSA|EC)$' >/dev/null; then
             echo "$(basename "$file"): no META-INF signature block after" >&2
             echo "signing, so the bundle is not signed." >&2
             exit 1

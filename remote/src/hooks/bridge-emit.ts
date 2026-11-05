@@ -213,7 +213,12 @@ export function emitHookEvent(
         reject(new Error(`bridge socket closed before the event was written: ${socketPath}`));
     });
     socket.on("connect", () => {
-        socket.end(line, () => {
+        socket.end(line, (error?: Error | null) => {
+            if (error) {
+                socket.destroy();
+                reject(error);
+                return;
+            }
             // Disarm the watchdog: the write succeeded, and a promise that has
             // resolved must never reject afterwards.
             socket.setTimeout(0);

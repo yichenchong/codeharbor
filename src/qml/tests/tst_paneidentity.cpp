@@ -35,6 +35,7 @@
 #include <QtTest>
 
 #include <QAccessible>
+#include <QClipboard>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -2513,9 +2514,10 @@ void TstPaneIdentity::theViewerPaneMarksAPathOutsideTheRepositoryRoot()
     // it resolves to the lightweight binary view instead of spinning up a
     // Monaco page this test has no interest in.
     const QString insidePath = QStringLiteral("/srv/repos/app/notes");
+    const QString base = QStringLiteral("/srv/repos/app");
     pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/notes")));
     QTRY_COMPARE(pane->property("repoCheckPath").toString(), insidePath);
-    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    emit m_viewers.pathResolved(insidePath, base, insidePath, /*insideRepositoryRoot=*/true);
     QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("inside"));
     QVERIFY2(!marker->property("visible").toBool(),
              "a file inside the repository root is marked as outside it");
@@ -2529,7 +2531,7 @@ void TstPaneIdentity::theViewerPaneMarksAPathOutsideTheRepositoryRoot()
     QCOMPARE(pane->property("repoRootState").toString(), QString());
     QVERIFY(!marker->property("visible").toBool());
 
-    emit m_viewers.pathResolved(outsidePath, outsidePath, /*insideRepositoryRoot=*/false);
+    emit m_viewers.pathResolved(outsidePath, base, outsidePath, /*insideRepositoryRoot=*/false);
     QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
     QVERIFY2(marker->property("visible").toBool(),
              "an out-of-project file gets exactly the chrome of an in-project one");
@@ -2546,15 +2548,31 @@ void TstPaneIdentity::theViewerPaneMarksAPathOutsideTheRepositoryRoot()
 
     // ONE ViewerModel serves every pane, so a reply about a path this pane is
     // no longer showing must not relabel it.
-    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    emit m_viewers.pathResolved(insidePath, base, insidePath, /*insideRepositoryRoot=*/true);
     QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
 
     // ...and back in again.
     pane->setProperty("url", QUrl(QStringLiteral("file:///srv/repos/app/notes")));
     QTRY_COMPARE(pane->property("repoCheckPath").toString(), insidePath);
-    emit m_viewers.pathResolved(insidePath, insidePath, /*insideRepositoryRoot=*/true);
+    emit m_viewers.pathResolved(insidePath, base, insidePath, /*insideRepositoryRoot=*/true);
     QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("inside"));
     QVERIFY(!marker->property("visible").toBool());
+
+    // Keeping the same file while switching repository roots must not accept
+    // the old root's late answer, or erase the current marker on its error.
+    const QString otherBase = QStringLiteral("/srv/other");
+    m_app.setActiveSessionRepoRoot(otherBase);
+    QTRY_COMPARE(pane->property("repoCheckBase").toString(), otherBase);
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    emit m_viewers.pathResolved(insidePath, base, insidePath, true);
+    QCOMPARE(pane->property("repoRootState").toString(), QString());
+    QVERIFY(!marker->property("visible").toBool());
+    emit m_viewers.pathResolved(insidePath, otherBase, insidePath, false);
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
+    QVERIFY(marker->property("visible").toBool());
+    emit m_viewers.pathResolveError(insidePath, base, QStringLiteral("late failure"));
+    QCOMPARE(pane->property("repoRootState").toString(), QStringLiteral("outside"));
+    QVERIFY(marker->property("visible").toBool());
 
     // A web page is not "outside the repository root": nothing is asked and
     // nothing is shown.
@@ -3758,8 +3776,8 @@ void TstPaneIdentity::theMarkdownPageRendersADocumentFetchedFromTheInternalSchem
     ReadFileServer server;
     QVERIFY2(server.bind(&m_client),
              "the local RPC transport pair could not be created");
-    server.setFile(path,
-                   QStringLiteral("# Harbor Notes\n\nThe body of the document.\n"));
+    server.setFile(path, QStringLiteral("# Harbor Notes\n\nThe body of the document.\n\n"
+                                        "[Project site](https://example.com/harbor)\n"));
 
     // The REAL bundle url, unlike every other Markdown test in this file: those
     // blank it precisely so no page loads, and that is why they never saw this.
@@ -3797,6 +3815,69 @@ void TstPaneIdentity::theMarkdownPageRendersADocumentFetchedFromTheInternalSchem
     // the file while ViewerPane's banner said the read had failed would be two
     // contradictory answers on one screen.
     QCOMPARE(view->property("errorText").toString(), QString());
+
+    // Exercise the actual Chromium context-menu request, not a QML helper or
+    // a synthetic request. The menu must describe the rendered document and
+    // its useful actions must still affect the real browser selection.
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    auto *const browser = qobject_cast<QQuickItem *>(webViewIn(view));
+    QVERIFY(window && browser);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    const auto contextPoint = [this, view, browser](const QString &selector,
+                                                  bool selectText) {
+        const QString script = QStringLiteral(
+            "(function(){var e=document.querySelector(%1);"
+            "var range=document.createRange();range.selectNodeContents(e);"
+            "if(%2){window.getSelection().removeAllRanges();"
+            "window.getSelection().addRange(range);}"
+            "var r=range.getBoundingClientRect();return JSON.stringify("
+            "{x:r.left+r.width/2,y:r.top+r.height/2});})()")
+                                   .arg(QStringLiteral("\"") + selector + QStringLiteral("\""),
+                                        selectText ? QStringLiteral("true")
+                                                   : QStringLiteral("false"));
+        const QJsonObject rect = QJsonDocument::fromJson(evalJs(view, script).toUtf8()).object();
+        return browser->mapToScene(QPointF(rect.value(QStringLiteral("x")).toDouble(),
+                                          rect.value(QStringLiteral("y")).toDouble())).toPoint();
+    };
+    QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, contextPoint("h1", true));
+    QObject *const menu = childNamed(view, QStringLiteral("markdownDocumentMenu"));
+    QVERIFY(menu);
+    QTRY_VERIFY(menu->property("visible").toBool());
+    // The four supported operations are Copy, Copy link address, Copy image,
+    // and Select all: no generated-page Save Page or View Source defaults.
+    QCOMPARE(menu->property("count").toInt(), 4);
+    auto *const copy = qobject_cast<QQuickItem *>(childNamed(view, QStringLiteral("markdownCopy")));
+    auto *const copyLink = qobject_cast<QQuickItem *>(
+        childNamed(view, QStringLiteral("markdownCopyLink")));
+    auto *const selectAll = qobject_cast<QQuickItem *>(
+        childNamed(view, QStringLiteral("markdownSelectAll")));
+    QVERIFY(copy && copyLink && selectAll);
+    QVERIFY(copy->isEnabled());
+    QVERIFY(!copyLink->isVisible());
+    QGuiApplication::clipboard()->clear();
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      copy->mapToScene(QPointF(copy->width() / 2, copy->height() / 2)).toPoint());
+    QTRY_COMPARE(QGuiApplication::clipboard()->text(), QStringLiteral("Harbor Notes"));
+    QTRY_VERIFY(!menu->property("visible").toBool());
+
+    QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, contextPoint("a", false));
+    QTRY_VERIFY(menu->property("visible").toBool());
+    QVERIFY(copyLink->isVisible());
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      copyLink->mapToScene(
+                          QPointF(copyLink->width() / 2, copyLink->height() / 2)).toPoint());
+    QTRY_COMPARE(QGuiApplication::clipboard()->text(),
+                 QStringLiteral("https://example.com/harbor"));
+    QTRY_VERIFY(!menu->property("visible").toBool());
+
+    QTest::mouseClick(window, Qt::RightButton, Qt::NoModifier, contextPoint("h1", false));
+    QTRY_VERIFY(menu->property("visible").toBool());
+    QVERIFY(selectAll->isEnabled());
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      selectAll->mapToScene(
+                          QPointF(selectAll->width() / 2, selectAll->height() / 2)).toPoint());
+    QVERIFY(evalJs(view, QStringLiteral("window.getSelection().toString()"))
+                .contains(QStringLiteral("The body of the document.")));
 }
 
 // ---------------------------------------------------------------------------

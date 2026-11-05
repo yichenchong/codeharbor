@@ -457,12 +457,15 @@ private:
     // Ask the SERVER for its identity and adopt it as serverId (see
     // connectToProfile), then restore the last active session.
     void adoptServerIdentity();
+    // A reply and any deferred refusal belong to one wire only. Replacing the
+    // connection or beginning a newer identity lookup retires that work.
+    quint64 m_identityGeneration = 0;
     // Refuse a server we are wired to but cannot drive (too old, or one that
     // reports no identity): report `message`, then drop the link and land on
     // `failed`. Both callers run INSIDE a CodeharbordClient response callback
     // and the teardown drops that very client's transport, so the disconnect is
     // deferred by one event-loop turn.
-    void refuseServer(const QString& message);
+    void refuseServer(const QString& message, quint64 generation);
     void restoreActiveSession();
     // Is `devSessionId` present in the last authoritative tree we read?
     bool sessionExists(const QString& devSessionId) const;

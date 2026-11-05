@@ -387,6 +387,7 @@ void TerminalFactory::setServerId(const QString& serverId)
     for (QObject* object : controllers)
         clearAgentIdentity(static_cast<TerminalController*>(object));
     m_serverId = serverId;
+    ++m_resolutionEpoch;
     // A remembered answer names rows on a SERVER — the tmux target AND the
     // `terminal_panes` row id the pane reports its agent state under. Carrying
     // either to another server would hand a pane something belonging to a
@@ -500,6 +501,7 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
     m_resolving.insert(key, Waiters{QPointer<TerminalController>(pane.data())});
 
     const ResolvedPane cached = m_resolved.value(key);
+    const quint64 resolutionEpoch = m_resolutionEpoch;
     if (!cached.target.isEmpty()) {
         // Posted, never emitted inline: the caller (TerminalPaneView) assigns
         // its "resolving" flag from this function's RETURN value, and an answer
@@ -507,7 +509,9 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
         const QString target = cached.target;
         QMetaObject::invokeMethod(
             this,
-            [this, key, target, byRow, devSessionId, paneName]() {
+            [this, key, target, byRow, devSessionId, paneName, resolutionEpoch]() {
+                if (m_resolutionEpoch != resolutionEpoch)
+                    return;
                 finishResolution(key, target, QString());
                 // The row is re-reported from the CACHE too, not only from the
                 // live round trip below, and that is what makes the backfill
@@ -533,7 +537,8 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
                 // the whole cache while this call is queued — and a row id from
                 // the previous server must not be written into anything.
                 const ResolvedPane answer = m_resolved.value(key);
-                if (!byRow && !answer.terminalId.isEmpty())
+                if (m_resolutionEpoch == resolutionEpoch && !byRow
+                    && !answer.terminalId.isEmpty())
                     emit paneRowResolved(devSessionId, paneName, answer.terminalId);
             },
             Qt::QueuedConnection);
@@ -541,9 +546,8 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
     }
 
     QPointer<TerminalFactory> self(this);
-    const QString askedOf = m_serverId;
     m_workspace->resolveTerminalPane(
-        params, [self, key, byRow, askedOf, devSessionId,
+        params, [self, key, byRow, resolutionEpoch, devSessionId,
                  paneName](std::optional<TerminalPane> pane, std::optional<RpcError> err) {
             if (!self)
                 return;
@@ -553,7 +557,7 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
             // pane a name from a workspace it is no longer looking at — and
             // setServerId() has already answered (and forgotten) every waiter
             // this key had, so there is nobody left to deliver to either.
-            if (self->m_serverId != askedOf)
+            if (self->m_resolutionEpoch != resolutionEpoch)
                 return;
             if (err) {
                 self->finishResolution(key, QString(), err->message);
@@ -612,7 +616,8 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
             self->finishResolution(key, answer.target, QString());
             // AFTER the waiters have their target: the backfill republishes the
             // layout, and the pane should already be attaching by then.
-            if (!byRow && !answer.terminalId.isEmpty())
+            if (self && self->m_resolutionEpoch == resolutionEpoch && !byRow
+                && !answer.terminalId.isEmpty())
                 emit self->paneRowResolved(devSessionId, paneName, answer.terminalId);
         });
     return true;
@@ -626,6 +631,7 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
     // a failure does exactly that), and it must start a new flight rather than
     // append to the list being drained.
     const Waiters waiters = m_resolving.take(key);
+    const quint64 resolutionEpoch = m_resolutionEpoch;
     // The answer this key produced, which is also where the waiting panes'
     // agent-status identity comes from. Empty on a failure, and on the very
     // first delivery of a legacy lookup that the server answered without a row.
@@ -633,6 +639,13 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
     for (const QPointer<TerminalController>& waiter : waiters) {
         if (!waiter)
             continue;
+        // A previous waiter's callback can switch profiles while this local
+        // list is being delivered. Complete the old request without authorizing
+        // its old target or binding its row under the new server.
+        if (m_resolutionEpoch != resolutionEpoch) {
+            emit targetResolved(waiter, QString());
+            continue;
+        }
         // Identity is adopted HERE and nowhere else, and only for a pane whose
         // LATEST request is the one being answered. A pane retargeted while
         // this lookup was in flight is waiting on a different key by now, and
@@ -666,7 +679,7 @@ void TerminalFactory::finishResolution(const QString& key, const QString& target
         // close itself in response.
         if (!waiter)
             continue;
-        emit targetResolved(waiter, target);
+        emit targetResolved(waiter, m_resolutionEpoch == resolutionEpoch ? target : QString());
     }
 }
 
@@ -918,14 +931,17 @@ void TerminalFactory::probeForRecreatedSession(TerminalController* controller,
     QPointer<TerminalFactory> self(this);
     QPointer<TerminalController> pane(controller);
     const QString askedOf = m_serverId;
+    const quint64 resolutionEpoch = m_resolutionEpoch;
+    const QPointer<QIODevice> transport = pane ? pane->transport() : nullptr;
     // tmux.listSessions takes no parameters (remote/src/tmux.ts) and answers
     // with the whole listing; an empty one is a NORMAL host (no tmux, or no
     // server running) rather than a failure, which is the other reason nothing
     // here is ever reported as an error.
     m_rpc->call(QString::fromLatin1(rpc::kMethodListSessions), QJsonObject{},
-                [self, pane, target, askedOf](QJsonValue result,
+                [self, pane, target, askedOf, resolutionEpoch, transport](QJsonValue result,
                                               std::optional<RpcError> error) {
-                    if (!self || !pane)
+                    if (!self || !pane || !transport || pane->transport() != transport
+                        || self->m_resolutionEpoch != resolutionEpoch)
                         return;
                     if (error) {
                         // Logged rather than swallowed. This is the branch that

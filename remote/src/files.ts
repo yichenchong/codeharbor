@@ -528,13 +528,12 @@ function assertRevisionMatches(filePath: string, expectedRevision: string, curre
 // returned revision — atomic per path, without globally serializing writes to
 // unrelated files.
 //
-// RF16: because the lock spans rename+stat, the minted revision reflects
-// exactly the bytes THIS save wrote — no concurrent same-service writer can
-// rename a different version in between and have its stat leak into our token.
-// This guarantee is limited to writers going through this module: a THIRD-PARTY
-// process editing the same file in the sub-millisecond window between our rename
-// and stat remains out of scope, since Node offers no portable OS advisory file
-// lock (flock is non-portable and unavailable via fs/promises) to fence it out.
+// The returned revision is minted from the open temp-file descriptor AFTER the
+// rename, not by re-opening the requested path. A symlink may be retargeted or
+// the name replaced by another process during a save; borrowing that other
+// file's revision would authorize the client's next save to overwrite bytes it
+// never loaded. In-place edits by third-party writers still cannot be fenced
+// out without an OS-level lock.
 const writeLocks = new Map<string, Promise<void>>();
 
 // Resolve links component by component, including links in parent directories.
@@ -782,6 +781,7 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     // no explicit mode keeps the umask-masked open() mode (RF7).
     const pinMode = existing !== undefined || explicitMode !== undefined;
     let handle: FileHandle | undefined = await fsp.open(tmp, "wx", pinMode ? 0o600 : finalMode);
+    let written: Stats;
     try {
         await handle.writeFile(buf);
         // Preserve ownership. The temp file belongs to the daemon's own user, so
@@ -815,14 +815,15 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         // Flushed LAST, so the ownership and mode set above are durable together
         // with the bytes rather than being left behind in the page cache.
         await handle.sync();
-        await handle.close();
-        handle = undefined;
         // Re-verify as late as possible — right before the atomic replace — so a
         // file changed during the write + flush above is caught instead of being
         // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
         // the window; POSIX offers no atomic compare-and-rename.
         assertRevisionMatches(params.path, params.expectedRevision, await statOrUndefined(params.path));
         await fsp.rename(tmp, target);
+        written = await handle.stat();
+        await handle.close().catch(() => {});
+        handle = undefined;
     } catch (err) {
         if (handle) await handle.close().catch(() => {});
         // Cleanup must never mask the real failure: a RevisionMismatchError
@@ -845,7 +846,6 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         // Directory fsync unsupported here; the file data was already flushed.
     }
 
-    const written = await fsp.stat(params.path);
     return { path: params.path, revision: revisionFrom(written) };
 }
 

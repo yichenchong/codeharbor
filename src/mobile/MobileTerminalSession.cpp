@@ -320,7 +320,8 @@ bool MobileTerminalSession::sendMouseWheel(int notches, int column, int row)
     // One report per notch. A wheel has no "distance" field: three notches is
     // three events, which is exactly how tmux advances its copy-mode scroll.
     const bool up = notches > 0;
-    const int count = qMin(qAbs(notches), kMaxWheelNotchesPerGesture);
+    const int count = qAbs(qBound(-kMaxWheelNotchesPerGesture, notches,
+                                  kMaxWheelNotchesPerGesture));
     QByteArray payload;
     for (int sent = 0; sent < count; ++sent)
         payload += vt::encodeMouseWheel(up, column, row, encoding);

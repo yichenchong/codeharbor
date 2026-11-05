@@ -15,6 +15,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QString>
+#include <QStringList>
 #include <QtTest/QtTest>
 #include <QScopeGuard>
 
@@ -259,6 +260,16 @@ private slots:
     void aDeviceAdvertisingBytesItNeverDeliversDoesNotSpin();
     void heartbeatWarningRebindDoesNotCloseTheReplacement();
     void heartbeatWarningTrafficCancelsTheStaleVerdict();
+    void sameDeviceRebindDuringReplacementAnnouncesOnlyOnce();
+    void sameDeviceRebindDuringCloseDrainKeepsNewRequestsAlive();
+    void sameDeviceRebindAfterShortWriteKeepsNewRequestsAlive();
+    void synchronouslyAnsweredHeartbeatDoesNotCountAsSilence();
+    void transportChangingPrecedesFailuresAndBufferedNotifications();
+    void transportChangingRebindSkipsTheSupersededDrain();
+    void transportChangingDeletionStillFailsOldRequests();
+    void transportClosedGenerationIdentifiesASupersededLoss();
+    void transportChangingDefersSynchronousIngressUntilInvalidationFinishes();
+    void transportChangingDefersEofWithoutLosingItsFinalResponse();
 
 private:
     void makePair();
@@ -273,6 +284,369 @@ private:
     CodeharbordClient* m_client = nullptr;
     static int s_seq;
 };
+
+void TstRpcClient::transportChangingDefersSynchronousIngressUntilInvalidationFinishes()
+{
+    ScriptedDevice replacement;
+    bool invalidated = false;
+    bool answered = false;
+    bool notified = false;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    replacement.setWriteHook([&](const QByteArray& line) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        replacement.deliver(
+            jsonLine({{"jsonrpc", "2.0"},
+                      {"id", request.value(QStringLiteral("id"))},
+                      {"result", true}}) +
+            jsonLine({{"jsonrpc", "2.0"}, {"method", "replacement"}}));
+    });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client, [&] {
+        if (m_client->transport() != &replacement)
+            return;
+        m_client->call(QStringLiteral("ping"), QJsonValue(),
+                       [&](QJsonValue, std::optional<RpcError> error) {
+                           QVERIFY(!error.has_value());
+                           QVERIFY(invalidated);
+                           answered = true;
+                       });
+        QVERIFY(!answered);
+        QVERIFY(!notified);
+    });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client,
+            [&] { invalidated = true; });
+    connect(m_client, &CodeharbordClient::notificationReceived, m_client,
+            [&](const QString&, const QJsonValue&) {
+                QVERIFY(invalidated);
+                notified = true;
+            });
+    m_client->setTransport(&replacement);
+    QVERIFY(answered);
+    QVERIFY(notified);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::transportChangingDefersEofWithoutLosingItsFinalResponse()
+{
+    ScriptedDevice replacement;
+    bool invalidated = false;
+    bool answered = false;
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client, [&] {
+        if (m_client->transport() != &replacement)
+            return;
+        const qint64 id = m_client->call(
+            QStringLiteral("ping"), QJsonValue(),
+            [&](QJsonValue, std::optional<RpcError> error) {
+                QVERIFY(!error.has_value());
+                QVERIFY(invalidated);
+                answered = true;
+            });
+        replacement.queueSilently(jsonLine(
+            {{"jsonrpc", "2.0"}, {"id", id}, {"result", true}}));
+        replacement.announceEof();
+        QVERIFY(!answered);
+        QCOMPARE(closedSpy.count(), 0);
+    });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client,
+            [&] { invalidated = true; });
+    m_client->setTransport(&replacement);
+    QVERIFY(answered);
+    QCOMPARE(m_client->pendingCount(), 0);
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(boundSpy.count(), 0);
+}
+
+void TstRpcClient::transportClosedGenerationIdentifiesASupersededLoss()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    const quint64 closingGeneration = m_client->transportGeneration();
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    int ignoredLosses = 0;
+    int currentLosses = 0;
+    qint64 replacementId = 0;
+    bool answered = false;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    connect(m_client, &CodeharbordClient::transportClosed, m_client,
+            [&](quint64) { m_client->setTransport(&replacement); });
+    connect(m_client, &CodeharbordClient::transportClosed, m_client,
+            [&](quint64 generation) {
+                if (generation != m_client->transportGeneration()) {
+                    ++ignoredLosses;
+                    return;
+                }
+                ++currentLosses;
+            });
+    connect(m_client, &CodeharbordClient::notificationReceived, m_client,
+            [&](const QString&, const QJsonValue&) {
+                replacementId = m_client->call(
+                    QStringLiteral("replacement"), QJsonValue(),
+                    [&](QJsonValue, std::optional<RpcError> error) {
+                        QVERIFY(!error.has_value());
+                        answered = true;
+                    });
+            });
+    replacement.queueSilently(
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "replacement"}}));
+    oldDevice.announceEof();
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(closedSpy.at(0).at(0).toULongLong(), closingGeneration);
+    QCOMPARE(ignoredLosses, 1);
+    QCOMPARE(currentLosses, 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+    answerPing(replacement, replacementId);
+    QVERIFY(answered);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::transportChangingPrecedesFailuresAndBufferedNotifications()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    QStringList events;
+    qint64 newId = 0;
+    bool answered = false;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_client->call(QStringLiteral("old"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       events.append(QStringLiteral("failed"));
+                   });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client, [&] {
+        events.append(QStringLiteral("changing"));
+        if (m_client->transport() != &replacement)
+            return;
+        newId = m_client->call(
+            QStringLiteral("new"), QJsonValue(),
+            [&](QJsonValue, std::optional<RpcError> error) {
+                QVERIFY(!error.has_value());
+                answered = true;
+            });
+    });
+    connect(m_client, &CodeharbordClient::notificationReceived, m_client,
+            [&](const QString& method, const QJsonValue&) { events.append(method); });
+    connect(m_client, &CodeharbordClient::transportBound, m_client,
+            [&] { events.append(QStringLiteral("bound")); });
+    replacement.queueSilently(
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "notification"}}));
+    m_client->setTransport(&replacement);
+    QCOMPARE(events, (QStringList{QStringLiteral("changing"),
+                                  QStringLiteral("failed"),
+                                  QStringLiteral("notification"),
+                                  QStringLiteral("bound")}));
+    QCOMPARE(m_client->pendingCount(), 1);
+    answerPing(replacement, newId);
+    QVERIFY(answered);
+    const qsizetype previousEvents = events.size();
+    m_client->setTransport(&replacement);
+    QCOMPARE(events.size(), previousEvents);
+    m_client->setTransport(nullptr);
+    QCOMPARE(events.last(), QStringLiteral("changing"));
+}
+
+void TstRpcClient::transportChangingRebindSkipsTheSupersededDrain()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice intermediate;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    int failures = 0;
+    QStringList methods;
+    quint64 acceptedGeneration = 0;
+    int staleSignals = 0;
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_client->call(QStringLiteral("old"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       ++failures;
+                   });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client, [&] {
+        if (m_client->transport() == &intermediate) {
+            m_client->setTransport(&replacement);
+            QVERIFY(methods.isEmpty());
+            QCOMPARE(boundSpy.count(), 0);
+        }
+    });
+    // The nested bind emitted its own lifecycle signal, but its drain and
+    // announcement must wait until the entire outer broadcast has finished.
+    connect(m_client, &CodeharbordClient::transportChanging, m_client,
+            [&](quint64 generation) {
+                if (generation != m_client->transportGeneration()) {
+                    ++staleSignals;
+                    return;
+                }
+                acceptedGeneration = generation;
+            });
+    connect(m_client, &CodeharbordClient::notificationReceived, m_client,
+            [&](const QString& method, const QJsonValue&) { methods.append(method); });
+    intermediate.queueSilently(
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "superseded"}}));
+    replacement.queueSilently(
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "replacement"}}));
+    m_client->setTransport(&intermediate);
+    QCOMPARE(failures, 1);
+    QCOMPARE(m_client->transport(), &replacement);
+    QCOMPARE(boundSpy.count(), 1);
+    QCOMPARE(methods, QStringList{QStringLiteral("replacement")});
+    QCOMPARE(staleSignals, 1);
+    QCOMPARE(acceptedGeneration, m_client->transportGeneration());
+}
+
+void TstRpcClient::transportChangingDeletionStillFailsOldRequests()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    int failures = 0;
+    m_client->call(QStringLiteral("old"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       ++failures;
+                   });
+    connect(m_client, &CodeharbordClient::transportChanging, m_client, [&] {
+        delete m_client;
+        m_client = nullptr;
+    });
+    m_client->setTransport(&replacement);
+    QVERIFY(!m_client);
+    QCOMPARE(failures, 1);
+}
+
+void TstRpcClient::sameDeviceRebindDuringReplacementAnnouncesOnlyOnce()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    QSignalSpy boundSpy(m_client, &CodeharbordClient::transportBound);
+    int failed = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_client->call(QStringLiteral("pending"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       ++failed;
+                       m_client->setTransport(nullptr);
+                       m_client->setTransport(&replacement);
+                   });
+
+    m_client->setTransport(&replacement);
+    QCOMPARE(failed, 1);
+    QCOMPARE(m_client->transport(), &replacement);
+    QCOMPARE(boundSpy.count(), 1);
+}
+
+void TstRpcClient::sameDeviceRebindDuringCloseDrainKeepsNewRequestsAlive()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    qint64 replacementId = 0;
+    bool replacementAnswered = false;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    const qint64 originalId = m_client->call(
+        QStringLiteral("original"), QJsonValue(),
+        [&](QJsonValue, std::optional<RpcError> error) {
+            QVERIFY(!error.has_value());
+            m_client->setTransport(nullptr);
+            m_client->setTransport(&device);
+            replacementId = m_client->call(
+                QStringLiteral("replacement"), QJsonValue(),
+                [&](QJsonValue, std::optional<RpcError> replacementError) {
+                    QVERIFY(!replacementError.has_value());
+                    replacementAnswered = true;
+                });
+        });
+    device.queueSilently(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", originalId},
+                                  {"result", true}}));
+    device.announceEof();
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+    answerPing(device, replacementId);
+    QVERIFY(replacementAnswered);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::sameDeviceRebindAfterShortWriteKeepsNewRequestsAlive()
+{
+    ScriptedDevice device;
+    device.setShortWrite(true);
+    m_client->setTransport(&device);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    qint64 replacementId = 0;
+    int originalFailures = 0;
+    bool replacementAnswered = false;
+    bool rebound = false;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    connect(m_client, &CodeharbordClient::protocolWarning, m_client,
+            [&](const QString&) {
+                if (rebound)
+                    return;
+                rebound = true;
+                device.setShortWrite(false);
+                m_client->setTransport(nullptr);
+                m_client->setTransport(&device);
+                replacementId = m_client->call(
+                    QStringLiteral("replacement"), QJsonValue(),
+                    [&](QJsonValue, std::optional<RpcError> error) {
+                        QVERIFY(!error.has_value());
+                        replacementAnswered = true;
+                    });
+            });
+    m_client->call(QStringLiteral("original"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       ++originalFailures;
+                   });
+    QCOMPARE(originalFailures, 1);
+    QCOMPARE(closedSpy.count(), 0);
+    QCOMPARE(m_client->pendingCount(), 1);
+    answerPing(device, replacementId);
+    QVERIFY(replacementAnswered);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::synchronouslyAnsweredHeartbeatDoesNotCountAsSilence()
+{
+    ScriptedDevice device;
+    m_client->enableHeartbeat(1000000, 1);
+    m_client->setTransport(&device);
+    QSignalSpy closedSpy(m_client, &CodeharbordClient::transportClosed);
+    int callerFailures = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_client->call(QStringLiteral("slow"), QJsonValue(),
+                   [&](QJsonValue, std::optional<RpcError> error) {
+                       QVERIFY(error.has_value());
+                       ++callerFailures;
+                   });
+    device.setWriteHook([&](const QByteArray& line) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")).toString() ==
+            QLatin1String(ch::rpc::kMethodPing)) {
+            answerPing(device, request.value(QStringLiteral("id")).toInteger());
+        }
+    });
+    for (int i = 0; i < 3; ++i) {
+        QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                         Qt::DirectConnection));
+        QCOMPARE(closedSpy.count(), 0);
+        QCOMPARE(callerFailures, 0);
+        QCOMPARE(m_client->pendingCount(), 1);
+    }
+
+    device.setWriteHook({});
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QVERIFY(QMetaObject::invokeMethod(m_client, "onHeartbeatTick",
+                                     Qt::DirectConnection));
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(callerFailures, 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
 
 void TstRpcClient::heartbeatWarningRebindDoesNotCloseTheReplacement()
 {

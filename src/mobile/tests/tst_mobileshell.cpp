@@ -19,6 +19,7 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QGuiApplication>
@@ -34,11 +35,13 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QSignalSpy>
+#include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QVariant>
 
 #include "EditorFactory.h"
+#include "MarkdownModel.h"
 #include "MobileKeyStore.h"
 #include "MobileNavFixture.h"
 #include "MobileTerminalSession.h"
@@ -337,6 +340,44 @@ QByteArray pngBytes()
     return buffer.data();
 }
 
+#if CH_HAVE_QTPDF
+QByteArray linkedPdfBytes()
+{
+    // The left half of page one is a URI annotation; the right half links to
+    // page two. Explicit xref offsets make this a complete, decodable PDF.
+    const QByteArray textStream(
+        "1 0 0 rg 0 0 300 400 re f\n"
+        "0 0 0 rg BT /F1 20 Tf 20 320 Td (Selectable text) Tj ET\n");
+    const QList<QByteArray> objects{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] "
+        "/Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R /Annots [7 0 R 8 0 R] >>",
+        "<< /Length " + QByteArray::number(textStream.size()) + " >>\nstream\n"
+            + textStream + "endstream",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents 6 0 R >>",
+        "<< /Length 25 >>\nstream\n0 0 1 rg 0 0 300 400 re f\nendstream",
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 150 400] "
+        "/A << /S /URI /URI (ch-pdf-test://must-not-leave/) >> >>",
+        "<< /Type /Annot /Subtype /Link /Rect [150 0 300 400] /Dest [5 0 R /Fit] >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    };
+    QByteArray pdf("%PDF-1.4\n");
+    QList<qsizetype> offsets{0};
+    for (qsizetype i = 0; i < objects.size(); ++i) {
+        offsets.append(pdf.size());
+        pdf += QByteArray::number(i + 1) + " 0 obj\n" + objects.at(i) + "\nendobj\n";
+    }
+    const qsizetype xref = pdf.size();
+    pdf += "xref\n0 " + QByteArray::number(offsets.size()) + "\n0000000000 65535 f \n";
+    for (qsizetype i = 1; i < offsets.size(); ++i)
+        pdf += QByteArray::number(offsets.at(i)).rightJustified(10, '0') + " 00000 n \n";
+    pdf += "trailer\n<< /Size " + QByteArray::number(offsets.size())
+           + " /Root 1 0 R >>\nstartxref\n" + QByteArray::number(xref) + "\n%%EOF\n";
+    return pdf;
+}
+#endif
+
 // The first descendant QObject (not only Items — an ch::EditorController is
 // parented to the page but is not one) whose C++ class is `className`.
 QObject *findObjectOfClass(QObject *root, const QString &className)
@@ -384,6 +425,14 @@ QObject *openEditor(QQuickItem *page, const QString &content,
 
 }  // namespace
 
+class PdfUrlRecorder : public QObject {
+    Q_OBJECT
+public:
+    QList<QUrl> urls;
+public slots:
+    void record(const QUrl &url) { urls.append(url); }
+};
+
 class TstMobileShell : public QObject {
     Q_OBJECT
 private slots:
@@ -414,6 +463,7 @@ private slots:
 
     // ---- one viewer page at a time (requested by the viewer-page slice) ----
     void tappingASecondFileRetargetsTheLoadedViewer();
+    void openingMarkdownFromTheDirectoryUsesOneCurrentRootRead();
     void theSessionRootListsEvenWithoutATrailingSlash();
     void tappingADirectoryListsItExactlyOnceAndRenamesTheHeader();
     void anEmptyDirectorySaysSoOnlyOnceItHasAnswered();
@@ -423,14 +473,19 @@ private slots:
     void theFirstKeystrokeIsReportedWithoutWaitingForTheDebounce();
     void aCrlfFileIsSplitWithoutCarriageReturns();
     void anOrderedListItemIsNotDrawnAsABullet();
+    void markdownTextPreservesLinesAndWrapsLongTokens();
     void markdownImageAliasesShareCompletion_data();
     void markdownImageAliasesShareCompletion();
+    void markdownImagesRequireAKnownProjectRoot();
+    void markdownImageContainmentAnswersMatchTheProjectRoot_data();
+    void markdownImageContainmentAnswersMatchTheProjectRoot();
     void retargetingTheImagePaneHandsBackTheBytes();
     // Declared unconditionally and SKIPPED inside when the optional Qt module is
     // absent, rather than compiled out: a slot behind a preprocessor conditional
     // has to be seen the same way by moc and by the compiler, and a build where
     // those two disagree fails at link time with nothing pointing at the cause.
     void thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies();
+    void pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork();
     void aNavigationToANonHttpAddressIsRefusedAndSaidSo();
 
 private:
@@ -1727,6 +1782,38 @@ void TstMobileShell::tappingASecondFileRetargetsTheLoadedViewer()
     QCOMPARE(requestPath(reads.at(0)), QStringLiteral("/repo/b.txt"));
 }
 
+void TstMobileShell::openingMarkdownFromTheDirectoryUsesOneCurrentRootRead()
+{
+    PageHost host(QStringLiteral("ViewerDirectoryPage"),
+                  QStringLiteral("remotePath: \"/repo/\"\n"
+                                 "        repoRoot: \"/repo\"\n"
+                                 "        onOpenRequested: function(path) { remotePath = path }"));
+    QVERIFY(showPage(host));
+    QQuickItem *page = host.page();
+    const auto listings = requestsFor(host.requests(), rpc::kMethodListDirectory);
+    QCOMPARE(listings.size(), 1);
+    host.deliver(listingFrame(requestId(listings.first()), {}, {QStringLiteral("note.md")}));
+
+    QVERIFY(callQmlFunction(page, "activate",
+                           QVariantMap{{QStringLiteral("name"), QStringLiteral("note.md")},
+                                       {QStringLiteral("kind"), QStringLiteral("file")}}));
+    QQuickItem *markdown = findByQmlTypeIn(page, QStringLiteral("ViewerMarkdownPage"));
+    QVERIFY(markdown);
+    QCOMPARE(markdown->property("repoRoot").toString(), QStringLiteral("/repo"));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    QCOMPARE(requestPath(reads.first()), QStringLiteral("/repo/note.md"));
+    host.deliver(textReadFrame(requestId(reads.first()), QStringLiteral("# Current note"),
+                               QStringLiteral("current-revision")));
+    QTRY_VERIFY(!markdown->property("loading").toBool());
+    QCOMPARE(markdown->property("errorText").toString(), QString());
+    auto *blocks = qobject_cast<MarkdownModel *>(markdown->property("blocks").value<QObject *>());
+    QVERIFY(blocks);
+    QCOMPARE(blocks->rowCount(), 1);
+    QCOMPARE(blocks->data(blocks->index(0), MarkdownModel::TextRole).toString(),
+             QStringLiteral("Current note"));
+}
+
 // The default viewer pane. A viewer leaf with NO url is "the session root, i.e.
 // a directory listing" (ch::PaneListModel), and PaneHostPage resolves that to
 // the repository root — which has no trailing slash. The trailing slash is the
@@ -2065,6 +2152,99 @@ void TstMobileShell::markdownImageAliasesShareCompletion()
         QCOMPARE(QUrl(first), host.viewers.imageUrl(QStringLiteral("/repo/a.png")));
 }
 
+void TstMobileShell::markdownTextPreservesLinesAndWrapsLongTokens()
+{
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    const QString token(200, QLatin1Char('Q'));
+    host.deliver(textReadFrame(requestId(reads.at(0)),
+                               QStringLiteral("alpha\nbeta\n\n**") + token
+                                   + QStringLiteral("**\n"), QStringLiteral("r1")));
+    QQuickItem *alpha = nullptr;
+    QQuickItem *beta = nullptr;
+    QQuickItem *longWord = nullptr;
+    QTRY_VERIFY((alpha = findItemShowing(host.page(), QStringLiteral("alpha"))));
+    QTRY_VERIFY((beta = findItemShowing(host.page(), QStringLiteral("beta"))));
+    QTRY_VERIFY((longWord = findItemShowing(host.page(), token)));
+    const qreal firstY = alpha->mapToScene(QPointF()).y();
+    const qreal secondY = beta->mapToScene(QPointF()).y();
+    QVERIFY(secondY >= firstY + alpha->height());
+    QVERIFY(secondY <= firstY + alpha->height() + 2);
+    QVERIFY(longWord->width() <= host.page()->width());
+    QVERIFY(longWord->height() > alpha->height() * 2);
+}
+
+void TstMobileShell::markdownImagesRequireAKnownProjectRoot()
+{
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.at(0)),
+                               QStringLiteral("![secret](symlink.png)\n"),
+                               QStringLiteral("r1")));
+    QTRY_VERIFY(host.page()->property("imageRefused").value<QJSValue>()
+                    .property(QStringLiteral("symlink.png")).isString());
+    const auto requests = host.requests();
+    QVERIFY(requestsFor(requests, rpc::kMethodResolvePath).isEmpty());
+    QVERIFY(requestsFor(requests, rpc::kMethodReadFile).isEmpty());
+}
+
+void TstMobileShell::markdownImageContainmentAnswersMatchTheProjectRoot_data()
+{
+    QTest::addColumn<bool>("fail");
+    QTest::newRow("stale-success") << false;
+    QTest::newRow("stale-error") << true;
+}
+
+void TstMobileShell::markdownImageContainmentAnswersMatchTheProjectRoot()
+{
+    QFETCH(bool, fail);
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\"\n"
+                                 "        repoRoot: \"/repo\""));
+    QVERIFY(showPage(host));
+    auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    const QString markdown = QStringLiteral("![badge](a.png)\n");
+    host.deliver(textReadFrame(requestId(reads.at(0)), markdown, QStringLiteral("r1")));
+    // QTRY_VERIFY evaluates its predicate more than once. Wait on stable page
+    // state, then drain the transport exactly once outside that predicate.
+    QTRY_VERIFY(host.page()->property("imagePending").value<QJSValue>()
+                    .property(QStringLiteral("a.png")).isString());
+    const auto oldResolves = requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(oldResolves.size(), 1);
+
+    host.page()->setProperty("repoRoot", QStringLiteral("/other"));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.at(0)), markdown, QStringLiteral("r1")));
+    QTRY_VERIFY(host.page()->property("imagePending").value<QJSValue>()
+                    .property(QStringLiteral("a.png")).isString());
+    const auto currentResolves = requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(currentResolves.size(), 1);
+
+    if (fail)
+        host.deliver(errorFrame(requestId(oldResolves.at(0)), QStringLiteral("stale failure")));
+    else
+        host.deliver(resolveFrame(requestId(oldResolves.at(0)), QStringLiteral("/repo/a.png"), true));
+    // Neither a stale permission nor a stale failure may consume the current
+    // resolve: one leaks a read, the other strands the current reply.
+    QVERIFY(host.requests().isEmpty());
+    QCOMPARE(host.page()->property("imagePending").value<QJSValue>()
+                 .property(QStringLiteral("a.png")).toString(), QStringLiteral("/repo/a.png"));
+    QVERIFY(host.page()->property("imageRefused").value<QJSValue>()
+                .property(QStringLiteral("a.png")).isUndefined());
+    host.deliver(resolveFrame(requestId(currentResolves.at(0)), QStringLiteral("/repo/a.png"), false));
+    QTRY_VERIFY(host.page()->property("imageRefused").value<QJSValue>()
+                    .property(QStringLiteral("a.png")).isString());
+    QVERIFY(requestsFor(host.requests(), rpc::kMethodReadFile).isEmpty());
+}
+
 // An image pane hands its bytes back when it moves on. The cache is LRU-bounded
 // so this is not a leak, but an image may be 8 MiB and a phone has better uses
 // for that than a picture nobody is looking at.
@@ -2168,6 +2348,68 @@ void TstMobileShell::thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies()
     host.root.reset();
     QVERIFY2(!QFile::exists(spoolFor(QStringLiteral("/repo/b.pdf"))),
              "the document outlived the pane that was showing it");
+#endif
+}
+
+void TstMobileShell::pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    PdfUrlRecorder recorder;
+    QDesktopServices::setUrlHandler(QStringLiteral("ch-pdf-test"), &recorder, "record");
+    const auto unregister = qScopeGuard([] {
+        QDesktopServices::unsetUrlHandler(QStringLiteral("ch-pdf-test"));
+    });
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/links.pdf\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.at(0)), linkedPdfBytes()));
+    QQuickItem *view = host.page()->findChild<QQuickItem *>(QStringLiteral("pdfView"));
+    QVERIFY(view);
+    QTRY_COMPARE(view->property("count").toInt(), 2);
+    QQuickItem *first = nullptr;
+    QTRY_VERIFY((first = findItem(host.page(), [](QQuickItem *item) {
+        return item->objectName() == QLatin1String("pdfPageImage")
+               && item->property("currentFrame").toInt() == 0
+               && item->property("status").toInt() == 1; // Image.Ready
+    })));
+    QQuickItem *selection = findItem(host.page(), [](QQuickItem *item) {
+        return item->objectName() == QLatin1String("pdfTextSelection")
+               && item->property("page").toInt() == 0;
+    });
+    QVERIFY(selection);
+    const qreal pageScale = first->width() / 300.0;
+    const QRect textArea = first->mapRectToScene(
+        QRectF(15 * pageScale, 55 * pageScale, 170 * pageScale, 40 * pageScale))
+                               .toAlignedRect();
+    const QImage unselected = host.window()->grabWindow().copy(textArea);
+    QVERIFY(!unselected.isNull());
+    QVERIFY(QMetaObject::invokeMethod(selection, "selectAll"));
+    QTRY_VERIFY(selection->property("text").toString().contains(QStringLiteral("Selectable text")));
+    // PdfSelection supplies geometry, not paint. Its consumer must draw the
+    // selected area, not merely change an invisible backend text property.
+    QTRY_VERIFY(host.window()->grabWindow().copy(textArea) != unselected);
+    QVERIFY(QMetaObject::invokeMethod(selection, "clear"));
+    QTRY_COMPARE(host.window()->grabWindow().copy(textArea), unselected);
+
+    const QPoint external = first->mapToScene(QPointF(first->width() / 4, 50)).toPoint();
+    QTest::mouseClick(host.window(), Qt::LeftButton, Qt::NoModifier, external);
+    QCoreApplication::processEvents();
+    QVERIFY(recorder.urls.isEmpty());
+    QCOMPARE(view->property("currentPage").toInt(), 0);
+
+    const qreal originalWidth = first->width();
+    view->setProperty("zoom", 2);
+    QTRY_COMPARE(first->width(), originalWidth * 2);
+    view->setProperty("zoom", 1);
+    QTRY_COMPARE(first->width(), originalWidth);
+    const QPoint internal = first->mapToScene(QPointF(first->width() * 3 / 4, 50)).toPoint();
+    QTest::mouseClick(host.window(), Qt::LeftButton, Qt::NoModifier, internal);
+    QTRY_COMPARE(view->property("currentPage").toInt(), 1);
+    QVERIFY(recorder.urls.isEmpty());
 #endif
 }
 

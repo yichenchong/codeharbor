@@ -29,57 +29,6 @@ renderer.code = ({ text, lang }: Tokens.Code): string => {
         : "";
     return `<pre${languageLabel}><code${languageClass}>${escaped}</code></pre>`;
 };
-// The accessible name for the checkbox that is about to be rendered. marked
-// hands the checkbox renderer nothing but `checked`; the words that say WHAT
-// the task is belong to the list item around it. The item is rendered first
-// and its checkbox token is always the first thing inside it (a nested task
-// list is rendered after, and sets this again for its own item), so passing
-// the name down through one variable is enough.
-let pendingTaskLabel = "";
-
-renderer.listitem = function (this: Renderer, item: Tokens.ListItem): string {
-    pendingTaskLabel = "";
-    if (item.task) {
-        // The item's own inline content, rendered through marked's text-only
-        // renderer so the name is words rather than markup: a task written as
-        // "buy **milk**" must be announced as "buy milk". Raw HTML the document
-        // wrote inline survives that renderer verbatim, so the tags are dropped
-        // here too — an announcement of "less than b greater than" helps nobody
-        // — and the remaining whitespace is collapsed because a name is read as
-        // one phrase. Nested block content (a sub-list, a code block) is
-        // deliberately left out: it is read as itself, after the checkbox, and
-        // repeating it in the name would make the announcement several
-        // sentences long.
-        const body = item.tokens.find(
-            (token) => token.type === "text" || token.type === "paragraph",
-        );
-        if (body && "tokens" in body && body.tokens) {
-            pendingTaskLabel = this.parser
-                .parseInline(body.tokens, this.parser.textRenderer)
-                // A <script> or <style> the document wrote inline is dropped by
-                // the sanitiser CONTENT AND ALL, so its text is not part of the
-                // item a sighted user sees; taking it into the name would make
-                // the two disagree.
-                .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-                .replace(/<[^>]*>/g, "")
-                .replace(/\s+/g, " ")
-                .trim();
-        }
-    }
-    return Renderer.prototype.listitem.call(this, item);
-};
-renderer.checkbox = ({ checked }: Tokens.Checkbox): string => {
-    const state = checked ? " checked" : "";
-    // Without a name a screen reader announces "checkbox, checked" and nothing
-    // else, so a task list reads as a row of anonymous boxes. aria-label rather
-    // than a wrapping <label> because the box stays DISABLED — there is nothing
-    // to click, only something to read — and a label element around the item's
-    // whole content would drag any nested list into the name.
-    const label = pendingTaskLabel.length > 0
-        ? ` aria-label="${escapeHtml(pendingTaskLabel)}"`
-        : "";
-    return `<input type="checkbox"${state} disabled${label}>`;
-};
 
 // The URL policy for every attribute DOMPurify treats as a URI. It REPLACES
 // DOMPurify's default expression, and is narrower than it: besides the
@@ -351,6 +300,29 @@ export function rewriteRelativeUrls(
     // A Markdown document has no legitimate <input src>.
     for (const input of template.content.querySelectorAll("input[src]")) {
         input.removeAttribute("src");
+    }
+
+    // Name task checkboxes from the sanitized DOM, not marked's text renderer:
+    // that renderer mixes raw code text with encoded HTML entities, so escaping
+    // its output again made "&amp;" visible to assistive technology verbatim.
+    // DOM textContent agrees with what the reader sees, including inline code.
+    for (const checkbox of template.content.querySelectorAll('li input[type="checkbox"][disabled]')) {
+        const item = checkbox.closest("li");
+        if (!item) {
+            continue;
+        }
+        const content = (checkbox.closest("p") ?? item).cloneNode(true) as Element;
+        // Nested tasks and block content are announced separately.
+        for (const nested of content.querySelectorAll("input, ul, ol, pre, blockquote, table")) {
+            nested.remove();
+        }
+        for (const image of content.querySelectorAll("img")) {
+            image.replaceWith(image.ownerDocument.createTextNode(image.getAttribute("alt") ?? ""));
+        }
+        const label = content.textContent?.replace(/\s+/g, " ").trim() ?? "";
+        if (label.length > 0) {
+            checkbox.setAttribute("aria-label", label);
+        }
     }
 
     for (const link of template.content.querySelectorAll("a[href]")) {

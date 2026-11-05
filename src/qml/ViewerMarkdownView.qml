@@ -302,6 +302,20 @@ Item {
         settings.javascriptCanOpenWindows: false
         webChannel: markdownChannel
 
+        // Browser defaults act on the generated qrc renderer, not the remote
+        // Markdown file. Save Page has no download destination/handler here,
+        // and View Source would open the app's HTML shell in a refused window.
+        // Offer only operations that work on the rendered document instead.
+        onContextMenuRequested: function(request) {
+            request.accepted = true
+            documentMenu.canCopy = (request.editFlags & ContextMenuRequest.CanCopy) !== 0
+            documentMenu.canSelectAll = (request.editFlags & ContextMenuRequest.CanSelectAll) !== 0
+            documentMenu.hasLink = request.linkUrl.toString().length > 0
+            documentMenu.hasImage = request.mediaType === ContextMenuRequest.MediaTypeImage
+                && (request.mediaFlags & ContextMenuRequest.MediaInError) === 0
+            documentMenu.popup(request.position.x, request.position.y)
+        }
+
         onLoadingChanged: function(request) {
             root.loading = request.status === WebEngineView.LoadStartedStatus
             if (request.status === WebEngineView.LoadSucceededStatus) {
@@ -339,6 +353,42 @@ Item {
         onNewWindowRequested: function(request) {
             console.warn("ViewerMarkdownView: refused a new window for",
                          request.requestedUrl)
+        }
+    }
+
+    Menu {
+        id: documentMenu
+        objectName: "markdownDocumentMenu"
+        property bool canCopy: false
+        property bool canSelectAll: false
+        property bool hasLink: false
+        property bool hasImage: false
+
+        MenuItem {
+            objectName: "markdownCopy"
+            text: qsTr("Copy")
+            enabled: documentMenu.canCopy
+            onTriggered: webView.triggerWebAction(WebEngineView.Copy)
+        }
+        MenuItem {
+            objectName: "markdownCopyLink"
+            text: qsTr("Copy link address")
+            visible: documentMenu.hasLink
+            height: visible ? implicitHeight : 0
+            onTriggered: webView.triggerWebAction(WebEngineView.CopyLinkToClipboard)
+        }
+        MenuItem {
+            objectName: "markdownCopyImage"
+            text: qsTr("Copy image")
+            visible: documentMenu.hasImage
+            height: visible ? implicitHeight : 0
+            onTriggered: webView.triggerWebAction(WebEngineView.CopyImageToClipboard)
+        }
+        MenuItem {
+            objectName: "markdownSelectAll"
+            text: qsTr("Select all")
+            enabled: documentMenu.canSelectAll
+            onTriggered: webView.triggerWebAction(WebEngineView.SelectAll)
         }
     }
 

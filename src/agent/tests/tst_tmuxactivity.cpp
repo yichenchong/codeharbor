@@ -59,6 +59,9 @@ private slots:
     void aNullLastActivityEmitsNothing();
     // A slow or wedged daemon must not accumulate identical requests.
     void anOverlappingTickIssuesNoSecondRequest();
+    void rebindingTheSameClientRejectsItsOldReply();
+    void removedDevSessionsAreNotPublished();
+    void rebindingFromAnActivitySlotStopsTheOldListing();
 
 private:
     // Every JSON-RPC request the poller has written since the last call, oldest
@@ -290,6 +293,81 @@ void TstTmuxActivity::anOverlappingTickIssuesNoSecondRequest()
     // not QTimer.
     QTest::qWait(200);
     QVERIFY(!takeRequests().isEmpty());
+}
+
+void TstTmuxActivity::rebindingTheSameClientRejectsItsOldReply()
+{
+    QSignalSpy spy(m_poller, &TmuxActivityPoller::activityObserved);
+    m_poller->setDevSessionIds({QStringLiteral("d1")});
+    const QList<QJsonObject> old = takeRequests();
+    QCOMPARE(old.size(), 1);
+
+    m_poller->setRpcClient(nullptr);
+    m_poller->setRpcClient(m_client);
+    const QList<QJsonObject> current = takeRequests();
+    QCOMPARE(current.size(), 1);
+    respond(old.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 5000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "old", 1000)}}});
+    QTest::qWait(100);
+    QCOMPARE(spy.count(), 0);
+
+    // The old callback must not release the current request's overlap guard.
+    m_poller->pollNow();
+    QCOMPARE(takeRequests(100).size(), 0);
+    respond(current.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 5000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "current", 4500)}}});
+    QTRY_COMPARE(spy.count(), 1);
+    QCOMPARE(spy.first().at(1).toString(), QStringLiteral("current"));
+    QCOMPARE(spy.first().at(2).toLongLong(), 500LL);
+}
+
+void TstTmuxActivity::removedDevSessionsAreNotPublished()
+{
+    QSignalSpy spy(m_poller, &TmuxActivityPoller::activityObserved);
+    m_poller->setDevSessionIds({QStringLiteral("d1")});
+    const QList<QJsonObject> old = takeRequests();
+    QCOMPARE(old.size(), 1);
+    m_poller->setDevSessionIds({});
+    respond(old.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 5000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "old", 1000)}}});
+    QTest::qWait(100);
+    QCOMPARE(spy.count(), 0);
+
+    m_poller->setDevSessionIds({QStringLiteral("d2")});
+    const QList<QJsonObject> current = takeRequests();
+    QCOMPARE(current.size(), 1);
+    respond(current.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 5000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "old", 1000),
+                                    paneEntry("d2", "current", 4000)}}});
+    QTRY_COMPARE(spy.count(), 1);
+    QCOMPARE(spy.first().at(0).toString(), QStringLiteral("d2"));
+}
+
+void TstTmuxActivity::rebindingFromAnActivitySlotStopsTheOldListing()
+{
+    QSignalSpy spy(m_poller, &TmuxActivityPoller::activityObserved);
+    connect(m_poller, &TmuxActivityPoller::activityObserved, this,
+            [this] { m_poller->setRpcClient(nullptr); });
+    m_poller->setDevSessionIds({QStringLiteral("d1")});
+    const QList<QJsonObject> requests = takeRequests();
+    QCOMPARE(requests.size(), 1);
+    respond(requests.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 5000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "first", 4000),
+                                    paneEntry("d1", "second", 3000)}}});
+    QTRY_COMPARE(spy.count(), 1);
+    QCOMPARE(spy.first().at(1).toString(), QStringLiteral("first"));
+    QTest::qWait(100);
+    QCOMPARE(spy.count(), 1);
 }
 
 QTEST_MAIN(TstTmuxActivity)

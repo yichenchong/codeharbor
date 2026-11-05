@@ -92,15 +92,21 @@ private slots:
     void decodesUtf8SplitAcrossWrites();
     void reportsInvalidUtf8WithoutDesynchronising();
     void placesWideCharacterInTwoCells();
+    void wideCharacterWrapClearsAbandonedCell();
     void foldsCombiningMarkIntoPrecedingCell();
+    void composesDecomposedHangul();
+    void modernEmojiOccupyTwoCells();
     void deferredWrapDoesNotScrollPrematurely();
+    void savedCursorRestoresDeferredWrap();
     void autowrapOffOverwritesLastColumn();
     void honoursScrollRegionForLineFeedAndEditing();
     void scrollsUpAndDownWithinRegion();
     void scrollingPrimaryScreenFeedsHistory();
     void eraseDisplayThreeClearsHistory();
+    void eraseHistoryDiscardsPendingAdvance();
     void historyCapKeepsAbsoluteAddressingConsistent();
     void altScreenLeavesPrimaryAndHistoryIntact();
+    void repeatedAltScreenActivationPreservesContent();
     void appliesIndexedAndTruecolourSgr();
     void appliesColonSeparatedSgr();
     void trailingOmittedSgrParameterResetsRendition();
@@ -110,6 +116,8 @@ private slots:
     void bellDoesNotTerminateNonOscStrings();
     void textRangeSpansWrappedWideCharacters();
     void tabStopsAndBackspaceMoveCursor();
+    void largeTabCountsStopAtScreenEdges();
+    void resizePreservesApplicationTabStops();
     void insertsAndDeletesCharacters();
     void editingCharactersNeverOrphansWideHalves();
     void softHyphenOccupiesOneCell();
@@ -330,6 +338,29 @@ void TstVt::placesWideCharacterInTwoCells()
     QCOMPARE(cellAt(other, 0, 1).text, char32_t('z'));
 }
 
+void TstVt::wideCharacterWrapClearsAbandonedCell()
+{
+    for (const QByteArray &text : {QByteArrayLiteral("abcde"),
+                                   QByteArrayLiteral("abc\xe4\xb8\xad")}) {
+        VtScreen screen;
+        screen.resize(5, 3);
+        screen.write(text);
+        QSignalSpy damageSpy(&screen, &VtScreen::linesChanged);
+        feedByte(screen, csi("1;5H") + QByteArrayLiteral("\xe6\x96\x87"));
+        QCOMPARE(lineText(screen, 0),
+                 text == QByteArrayLiteral("abcde") ? QStringLiteral("abcd")
+                                                   : QStringLiteral("abc"));
+        QCOMPARE(cellAt(screen, 0, 3).width, quint8(1));
+        QCOMPARE(cellAt(screen, 0, 4).width, quint8(1));
+        QCOMPARE(lineText(screen, 1), QStringLiteral("\u6587"));
+        QCOMPARE(screen.cursorRow(), 1);
+        QCOMPARE(screen.cursorColumn(), 2);
+        QCOMPARE(damageSpy.count(), 1);
+        QCOMPARE(damageSpy.at(0).at(0).toInt(), 0);
+        QCOMPARE(damageSpy.at(0).at(1).toInt(), 1);
+    }
+}
+
 void TstVt::foldsCombiningMarkIntoPrecedingCell()
 {
     VtScreen screen;
@@ -354,6 +385,47 @@ void TstVt::foldsCombiningMarkIntoPrecedingCell()
     bare.write(QByteArrayLiteral("\xcc\x81"));
     QCOMPARE(bare.cursorColumn(), 0);
     QCOMPARE(cellAt(bare, 0, 0).text, char32_t(' '));
+}
+
+void TstVt::composesDecomposedHangul()
+{
+    for (bool split : {false, true}) {
+        VtScreen screen;
+        screen.resize(5, 2);
+        // U+1100 + U+1161 + U+11A8 canonically compose to U+AC01 (각).
+        const QByteArray stream = QByteArrayLiteral("\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8X");
+        if (split)
+            feedByte(screen, stream);
+        else
+            screen.write(stream);
+        QCOMPARE(lineText(screen, 0), QStringLiteral("\uac01X"));
+        QCOMPARE(cellAt(screen, 0, 0).text, char32_t(0xAC01));
+        QCOMPARE(cellAt(screen, 0, 0).width, quint8(2));
+        QCOMPARE(cellAt(screen, 0, 1).width, quint8(0));
+        QCOMPARE(cellAt(screen, 0, 2).text, char32_t('X'));
+        QCOMPARE(screen.cursorColumn(), 3);
+    }
+}
+
+void TstVt::modernEmojiOccupyTwoCells()
+{
+    // Representative additions from Unicode 14, 15 and 16, across the emoji
+    // blocks whose missing entries used to advance only one column.
+    const char32_t emoji[] = {0x1F979, 0x1F6DC, 0x1F7F0, 0x1FA75, 0x1FA89,
+                             0x1FA8F, 0x1FAC6, 0x1FADC, 0x1FAE0, 0x1FAF8};
+    for (char32_t codePoint : emoji) {
+        VtScreen screen;
+        screen.resize(5, 2);
+        const QString glyph = QString::fromUcs4(&codePoint, 1);
+        feedByte(screen, QByteArrayLiteral("abc") + glyph.toUtf8() + QByteArrayLiteral("X"));
+        QCOMPARE(lineText(screen, 0), QStringLiteral("abc") + glyph);
+        QCOMPARE(cellAt(screen, 0, 3).text, codePoint);
+        QCOMPARE(cellAt(screen, 0, 3).width, quint8(2));
+        QCOMPARE(cellAt(screen, 0, 4).width, quint8(0));
+        QCOMPARE(lineText(screen, 1), QStringLiteral("X"));
+        QCOMPARE(screen.cursorRow(), 1);
+        QCOMPARE(screen.cursorColumn(), 1);
+    }
 }
 
 // --- wrapping ---------------------------------------------------------------
@@ -381,6 +453,44 @@ void TstVt::deferredWrapDoesNotScrollPrematurely()
     QCOMPARE(screen.historyLines(), 1);
     QCOMPARE(lineText(screen, screen.totalLines() - 1), QStringLiteral("A"));
     QCOMPARE(screen.cursorColumn(), 1);
+}
+
+void TstVt::savedCursorRestoresDeferredWrap()
+{
+    for (const QByteArray &text : {QByteArrayLiteral("abcde"),
+                                   QByteArrayLiteral("abc\xe4\xb8\xad")}) {
+        for (bool split : {false, true}) {
+            VtScreen screen;
+            screen.resize(5, 3);
+            const QByteArray stream = text + QByteArrayLiteral("\x1b""7")
+                + csi("2;1H") + QByteArrayLiteral("x\x1b""8Y");
+            if (split)
+                feedByte(screen, stream);
+            else
+                screen.write(stream);
+            QCOMPARE(lineText(screen, 0), QString::fromUtf8(text));
+            QCOMPARE(lineText(screen, 1), QStringLiteral("Y"));
+            QCOMPARE(screen.cursorRow(), 1);
+            QCOMPARE(screen.cursorColumn(), 1);
+        }
+    }
+
+    // 1049 uses the same saved cursor while a full-screen program runs.
+    VtScreen alternate;
+    alternate.resize(5, 3);
+    alternate.write(QByteArrayLiteral("abcde") + csi("?1049h")
+                    + QByteArrayLiteral("alt") + csi("?1049l") + QByteArrayLiteral("Z"));
+    QCOMPARE(lineText(alternate, 0), QStringLiteral("abcde"));
+    QCOMPARE(lineText(alternate, 1), QStringLiteral("Z"));
+
+    // A wrap saved at the old width must not survive a geometry change.
+    VtScreen resized;
+    resized.resize(5, 3);
+    resized.write(QByteArrayLiteral("abcde\x1b""7"));
+    resized.resize(4, 3);
+    resized.write(QByteArrayLiteral("\x1b""8Y"));
+    QCOMPARE(lineText(resized, 0), QStringLiteral("abcY"));
+    QCOMPARE(resized.cursorRow(), 0);
 }
 
 void TstVt::autowrapOffOverwritesLastColumn()
@@ -518,6 +628,29 @@ void TstVt::eraseDisplayThreeClearsHistory()
     QCOMPARE(lineText(screen, screen.firstScreenRow()), QString());
 }
 
+void TstVt::eraseHistoryDiscardsPendingAdvance()
+{
+    VtScreen screen;
+    screen.resize(10, 3);
+    QSignalSpy scrollSpy(&screen, &VtScreen::screenScrolled);
+    QSignalSpy damageSpy(&screen, &VtScreen::linesChanged);
+
+    screen.write(QByteArrayLiteral("a\r\nb\r\nc\r\nd") + csi("3J"));
+    QCOMPARE(screen.historyLines(), 0);
+    QCOMPARE(scrollSpy.count(), 0);
+    QCOMPARE(lineText(screen, 0), QStringLiteral("b"));
+    QCOMPARE(damageSpy.count(), 1);
+    QCOMPARE(damageSpy.at(0).at(0).toInt(), 0);
+    QCOMPARE(damageSpy.at(0).at(1).toInt(), 2);
+
+    // Only history accumulated AFTER the erase can move a consumer's anchor.
+    screen.write(QByteArrayLiteral("\r\ne\r\nf") + csi("3J") + QByteArrayLiteral("\r\ng"));
+    QCOMPARE(screen.historyLines(), 1);
+    QCOMPARE(scrollSpy.count(), 1);
+    QCOMPARE(scrollSpy.at(0).at(0).toInt(), 1);
+    QCOMPARE(lineText(screen, 0), QStringLiteral("d"));
+}
+
 void TstVt::historyCapKeepsAbsoluteAddressingConsistent()
 {
     VtScreen screen;
@@ -578,6 +711,27 @@ void TstVt::altScreenLeavesPrimaryAndHistoryIntact()
     QCOMPARE(lineText(screen, screen.firstScreenRow() + 0), QStringLiteral("b"));
     QCOMPARE(lineText(screen, screen.firstScreenRow() + 1), QStringLiteral("c"));
     QCOMPARE(lineText(screen, screen.firstScreenRow() + 2), QStringLiteral("d"));
+    QCOMPARE(screen.cursorRow(), 1);
+    QCOMPARE(screen.cursorColumn(), 2);
+}
+
+void TstVt::repeatedAltScreenActivationPreservesContent()
+{
+    VtScreen screen;
+    screen.resize(10, 3);
+    screen.write(QByteArrayLiteral("primary") + csi("2;3H") + csi("?1049h")
+                 + QByteArrayLiteral("alternate"));
+    QSignalSpy damageSpy(&screen, &VtScreen::linesChanged);
+
+    screen.write(csi("?1049h"));
+    QVERIFY(screen.altScreenActive());
+    QCOMPARE(lineText(screen, 0), QStringLiteral("alternate"));
+    QCOMPARE(screen.cursorRow(), 0);
+    QCOMPARE(screen.cursorColumn(), 9);
+    QCOMPARE(damageSpy.count(), 0);
+
+    screen.write(csi("?1049l"));
+    QCOMPARE(lineText(screen, 0), QStringLiteral("primary"));
     QCOMPARE(screen.cursorRow(), 1);
     QCOMPARE(screen.cursorColumn(), 2);
 }
@@ -726,9 +880,11 @@ void TstVt::setsWindowTitleFromOsc()
     screen.write(QByteArrayLiteral("\x1b]2;second\x1b\\"));
     QCOMPARE(screen.windowTitle(), QStringLiteral("second"));
 
-    // OSC 1 (icon name) is accepted as a title too.
-    screen.write(QByteArrayLiteral("\x1b]1;third\x07"));
-    QCOMPARE(screen.windowTitle(), QStringLiteral("third"));
+    // OSC 1 changes only an icon name, not the title shown in the mobile chrome.
+    const int titleChanges = titleSpy.count();
+    feedByte(screen, QByteArrayLiteral("\x1b]1;icon only\x07"));
+    QCOMPARE(screen.windowTitle(), QStringLiteral("second"));
+    QCOMPARE(titleSpy.count(), titleChanges);
 
     // Split across writes, including between the ESC and the ']'.
     feedByte(screen, QByteArrayLiteral("\x1b]2;split title\x07"));
@@ -877,6 +1033,50 @@ void TstVt::tabStopsAndBackspaceMoveCursor()
     screen.write(csi("2;1H") + QByteArrayLiteral("\x08\x08X"));
     QCOMPARE(screen.cursorRow(), 1);
     QCOMPARE(cellAt(screen, 1, 0).text, char32_t('X'));
+}
+
+void TstVt::largeTabCountsStopAtScreenEdges()
+{
+    VtScreen screen;
+    screen.resize(20, 2);
+    screen.write(csi("999999999999I"));
+    QCOMPARE(screen.cursorColumn(), 19);
+    QCOMPARE(screen.cursorRow(), 0);
+    screen.write(csi("999999999999Z"));
+    QCOMPARE(screen.cursorColumn(), 0);
+    QCOMPARE(screen.cursorRow(), 0);
+
+    // The same bounds apply with no tab stops at all and a one-column grid.
+    screen.write(csi("3g") + csi("999999999999I") + QByteArrayLiteral("X")
+                 + csi("999999999999Z") + QByteArrayLiteral("Y"));
+    QCOMPARE(cellAt(screen, 0, 19).text, char32_t('X'));
+    QCOMPARE(cellAt(screen, 0, 0).text, char32_t('Y'));
+    screen.resize(1, 1);
+    screen.write(csi("999999999999I") + csi("999999999999Z"));
+    QCOMPARE(screen.cursorColumn(), 0);
+    QCOMPARE(screen.cursorRow(), 0);
+}
+
+void TstVt::resizePreservesApplicationTabStops()
+{
+    VtScreen screen;
+    screen.resize(10, 2);
+    screen.write(csi("3g") + csi("3G") + QByteArrayLiteral("\x1bH"));
+    screen.resize(20, 2);
+    screen.write(csi("1G") + QByteArrayLiteral("\tA\tB"));
+    QCOMPARE(cellAt(screen, 0, 2).text, char32_t('A'));
+    QCOMPARE(cellAt(screen, 0, 16).text, char32_t('B'));
+
+    // Shrinking keeps the custom stop and does not resurrect cleared defaults.
+    screen.resize(9, 2);
+    screen.write(csi("1G") + QByteArrayLiteral("\t"));
+    QCOMPARE(screen.cursorColumn(), 2);
+    screen.write(csi("8G") + csi("Z"));
+    QCOMPARE(screen.cursorColumn(), 2);
+
+    // RIS still restores the hardware defaults.
+    screen.write(QByteArrayLiteral("\x1b""c\t"));
+    QCOMPARE(screen.cursorColumn(), 8);
 }
 
 void TstVt::insertsAndDeletesCharacters()

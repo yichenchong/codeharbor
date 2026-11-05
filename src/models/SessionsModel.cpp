@@ -87,6 +87,7 @@ void SessionsModel::setGroups(QVector<GroupRow> groups)
 {
     const bool hadSessions = hasSessions();
     const bool hadUnarchivedSessions = hasUnarchivedSessions();
+    ++resetSerial_;
     beginResetModel();
     allGroups_ = std::move(groups);
     groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
@@ -100,6 +101,7 @@ void SessionsModel::applyFilters()
     // Presence deliberately not re-checked: both filters read pinned/archived
     // out of the UNFILTERED tree, which this does not touch, so hasSessions()
     // and hasUnarchivedSessions() cannot move here.
+    ++resetSerial_;
     beginResetModel();
     groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
     endResetModel();
@@ -227,8 +229,12 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
                 changedRows.append(index(static_cast<int>(si), 0, groupIndex));
         }
     }
-    for (const QModelIndex &row : std::as_const(changedRows))
+    const quint64 serial = resetSerial_;
+    for (const QModelIndex &row : std::as_const(changedRows)) {
+        if (serial != resetSerial_)
+            break;
         emit dataChanged(row, row, {RowStateRole});
+    }
 }
 
 SessionRowState SessionsModel::aggregateSessionState(const QVector<TerminalStatus> &terminals)

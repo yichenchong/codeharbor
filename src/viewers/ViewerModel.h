@@ -115,8 +115,8 @@ public:
 
     // Asynchronously ask where `path` resolves and whether it lands inside
     // `base`, the Dev Session's repository root (SPEC 9). On success emits
-    // pathResolved(path, resolvedPath, insideRepositoryRoot); on failure or
-    // without a client, pathResolveError.
+    // pathResolved(path, base, resolvedPath, insideRepositoryRoot); on failure or
+    // without a client, pathResolveError(path, base, message).
     //
     // SPEC 9 allows paths outside the root and this call does NOT change that:
     // the flag is a UI hint the pane shows as a marker, never a gate. The
@@ -132,12 +132,13 @@ signals:
     void viewKindsRevisionChanged();
     void directoryListed(const QString &path, const QVariantList &entries);
     void directoryError(const QString &path, const QString &message);
-    // `path` echoes what was ASKED for (not the resolved spelling), so a pane
-    // can tell an answer about the file it is showing from an answer about the
-    // file it has since navigated away from.
-    void pathResolved(const QString &path, const QString &resolvedPath,
-                      bool insideRepositoryRoot);
-    void pathResolveError(const QString &path, const QString &message);
+    // `path` and `base` echo what was ASKED for (not the resolved spelling), so
+    // a pane can distinguish both a different file and the same file checked
+    // against another Dev Session's repository root.
+    void pathResolved(const QString &path, const QString &base,
+                      const QString &resolvedPath, bool insideRepositoryRoot);
+    void pathResolveError(const QString &path, const QString &base,
+                          const QString &message);
     // A request the embedded browser made for an internal URL was refused, with
     // the reason the WebEngine job interface could not carry: fail() takes only
     // Chromium's coarse error enum, so without this an oversized image or PDF

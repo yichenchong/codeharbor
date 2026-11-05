@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Writable } from "node:stream";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { startControlListener } from "../src/control.ts";
 import { main } from "../src/tools/viewctl.ts";
@@ -67,6 +69,25 @@ test("valid CLI commands retain applied and refused exit statuses", async () => 
         assert.match(refusedErr.text(), /No such pane/);
     } finally {
         listener.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a symlinked viewer CLI still runs and reports refusals (RI2)", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-viewctl-link-"));
+    try {
+        const link = path.join(dir, "codeharbor-view.ts");
+        symlinkSync(fileURLToPath(new URL("../src/tools/viewctl.ts", import.meta.url)), link);
+        const result = spawnSync(process.execPath, [link, "list"], {
+            env: {},
+            encoding: "utf8",
+            timeout: 10_000,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(JSON.parse(result.stdout).code, "bad_request");
+        assert.match(result.stderr, /OMP_DEV_SESSION_ID/);
+    } finally {
         rmSync(dir, { recursive: true, force: true });
     }
 });

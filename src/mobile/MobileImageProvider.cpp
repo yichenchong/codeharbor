@@ -5,11 +5,164 @@
 #include <QImageIOHandler>
 #include <QImageReader>
 #include <QMutexLocker>
+#include <QRegularExpression>
+#include <QStringView>
 #include <QUrl>
+#include <QXmlStreamReader>
 
 #include <utility>
 
 namespace ch {
+
+namespace {
+
+bool hasOnlyLocalCssUrls(QStringView css)
+{
+    // QtSvg resolves paint-server URLs locally, but do not let stylesheet
+    // imports or escaped spellings introduce a second resource grammar here.
+    if (css.contains(QLatin1Char('\\'))
+        || css.contains(QLatin1String("@import"), Qt::CaseInsensitive))
+        return false;
+    static const QRegularExpression url(
+        QStringLiteral("url\\s*\\(([^)]*)\\)"),
+        QRegularExpression::CaseInsensitiveOption);
+    auto matches = url.globalMatchView(css);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        QStringView target = match.capturedView(1).trimmed();
+        if (target.size() >= 2
+            && ((target.front() == QLatin1Char('"') && target.back() == QLatin1Char('"'))
+                || (target.front() == QLatin1Char('\'') && target.back() == QLatin1Char('\''))))
+            target = target.mid(1, target.size() - 2).trimmed();
+        if (!target.startsWith(QLatin1Char('#')))
+            return false;
+    }
+    return true;
+}
+
+struct SvgRasterBudget {
+    // At most 16 Mi pixels (64 MiB at 32 bpp) and 128 image decodes per document.
+    // Charge every reference, including invisible/zero-geometry image elements.
+    qint64 pixels = 16 * qint64(1024 * 1024);
+    int images = 128;
+};
+
+bool isEmbeddedRaster(QStringView reference, SvgRasterBudget *budget)
+{
+    // QtSvg tests the original spelling case-sensitively before decoding a
+    // data URL. QUrl alone would normalize DATA: and authorize a filename read.
+    if (!reference.startsWith(QLatin1String("data:")) || --budget->images < 0)
+        return false;
+    const QUrl url(reference.toString());
+    if (url.scheme() != QLatin1String("data") || !url.host().isEmpty())
+        return false;
+    // Match Qt's data-URL decoding order: locate the comma before percent
+    // decoding, then inspect the decoded media-type suffix for base64.
+    const QByteArray encoded = url.toEncoded(QUrl::RemoveScheme);
+    const qsizetype comma = encoded.indexOf(',');
+    if (comma < 0)
+        return false;
+    const QByteArray type = QByteArray::fromPercentEncoding(encoded.first(comma)).trimmed();
+    QByteArray bytes = QByteArray::fromPercentEncoding(encoded.mid(comma + 1));
+    if (QLatin1StringView(type).endsWith(QLatin1String(";base64"), Qt::CaseInsensitive)) {
+        const auto decoded = QByteArray::fromBase64Encoding(
+            bytes, QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded)
+            return false;
+        bytes = *decoded;
+    }
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::ReadOnly))
+        return false;
+    QImageReader reader(&buffer);
+    const QByteArray format = reader.format();
+    // MIME types are not evidence: an image/png data URL can contain another
+    // SVG, which would otherwise start an unrestricted recursive resource load.
+    if (format != "png" && format != "jpeg" && format != "gif"
+        && format != "webp" && format != "bmp" && format != "ico"
+        && format != "tiff")
+        return false;
+    const QSize dimensions = reader.size();
+    if (!dimensions.isValid() || dimensions.isEmpty())
+        return false;
+    const qint64 pixels = qint64(dimensions.width()) * dimensions.height();
+    if (pixels > budget->pixels)
+        return false;
+    budget->pixels -= pixels;
+    // QtSvg falls back to opening the href as a filename if data decoding
+    // fails. Verify the raster is decodable, not only that its header sniffed.
+    return !reader.read().isNull();
+}
+
+bool isSelfContainedSvg(const QByteArray &bytes)
+{
+    QXmlStreamReader xml(bytes);
+    bool foundRoot = false;
+    SvgRasterBudget rasterBudget;
+    int depth = 0;
+    int styleDepth = 0;
+    QString styleText;
+    while (!xml.atEnd()) {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
+            return false;
+        if (token == QXmlStreamReader::ProcessingInstruction
+            && xml.processingInstructionTarget().compare(
+                   QLatin1String("xml-stylesheet"), Qt::CaseInsensitive) == 0)
+            return false; // QtSvg reads external CSS files from this instruction.
+        if (token == QXmlStreamReader::Characters && styleDepth > 0) {
+            styleText.append(xml.text());
+            continue;
+        }
+        if (token == QXmlStreamReader::EndElement) {
+            if (depth == styleDepth) {
+                if (!hasOnlyLocalCssUrls(styleText))
+                    return false;
+                styleDepth = 0;
+                styleText.clear();
+            }
+            --depth;
+            continue;
+        }
+        if (token != QXmlStreamReader::StartElement)
+            continue;
+        ++depth;
+        if (styleDepth > 0)
+            return false; // nested markup in a style element is unsupported
+        if (xml.name() == QLatin1String("style"))
+            styleDepth = depth;
+        if (!foundRoot) {
+            if (xml.name() != QLatin1String("svg"))
+                return false;
+            foundRoot = true;
+        }
+        for (const auto &attribute : xml.attributes()) {
+            const QStringView value = attribute.value();
+            if (attribute.name() == QLatin1String("href")) {
+                const QStringView reference = value.trimmed();
+                if (reference.isEmpty())
+                    continue;
+                // A fragment is local for <use>/gradients, but QtSvg's <image>
+                // treats even "#id" as a filename rather than an SVG reference.
+                if (xml.name() != QLatin1String("image")
+                    && reference.startsWith(QLatin1Char('#')))
+                    continue;
+                if (xml.name() != QLatin1String("image")
+                    || !isEmbeddedRaster(value, &rasterBudget))
+                    return false;
+            } else if (!hasOnlyLocalCssUrls(value)) {
+                return false;
+            }
+        }
+        // Do not use readElementText() here: it skips processing instructions
+        // that QtSvg would still process (and can use to read a local CSS file).
+    }
+    // Compressed SVG is deliberately not passed on unchecked: the XML gate
+    // cannot inspect it, so it is outside this self-contained SVG subset.
+    return foundRoot && !xml.hasError();
+}
+
+} // namespace
 
 void MobileImageCache::insert(const QString &remotePath, const QByteArray &bytes)
 {
@@ -153,6 +306,10 @@ QImage MobileImageProvider::requestImage(const QString &id, QSize *size,
     // server-controlled name must not be able to steer the decoder.
     reader.setDecideFormatFromContent(true);
     reader.setAutoTransform(true);
+    // size() already makes QtSvg parse the document and follow image/CSS
+    // resources, so the resource boundary must be checked BEFORE that accessor.
+    if (reader.format().startsWith("svg") && !isSelfContainedSvg(bytes))
+        return {};
     // The dimensions the CALLER will see, which are not necessarily the ones
     // the file stores. setAutoTransform(true) makes read() apply the file's
     // EXIF orientation after the handler has decoded, but

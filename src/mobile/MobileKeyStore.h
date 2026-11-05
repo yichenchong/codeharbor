@@ -192,6 +192,8 @@ public:
     // tolerated: without a pool there is nothing to authenticate, and
     // applyIdentityForConnect() says so through lastError() instead of
     // dereferencing nothing.
+    // Rebinding first clears the old pool's installed identity; installation on
+    // the replacement still requires an explicit applyIdentityForConnect().
     Q_INVOKABLE void setConnectionPool(ch::SshConnectionPool* pool);
 
     // Names of keys held IN MEMORY right now, sorted. A saved key appears here
@@ -497,10 +499,9 @@ private:
     // permissions that came back are wider than owner-only — which is a refusal
     // to write a key into a directory anyone else can list.
     bool ensureSavedKeyDirectory();
-    // Delete the saved file for `name` and drop it from m_savedNames. Returns
-    // false when there was no saved file to delete or the unlink failed; the
-    // name is dropped either way, because a name whose file is gone is not a
-    // saved key whatever the reason. Shared by removeKey() and forgetSavedKey().
+    // Delete the saved file for `name` and drop it from m_savedNames only once
+    // the file is gone. A failed unlink keeps the name available for a retry.
+    // A file already removed externally counts as success.
     bool deleteSavedKeyFile(const QString& name);
 
     QString m_knownHostsPath;

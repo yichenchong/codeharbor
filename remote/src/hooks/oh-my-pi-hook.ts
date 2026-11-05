@@ -48,10 +48,7 @@
 // SPEC 6.4: a broken producer must never take down the agent. Any failure to
 // connect or write is swallowed (logged to stderr) and the process exits 0.
 
-// pathToFileURL, not string concatenation: a script path containing a space (or
-// any character a URL must percent-encode) would never compare equal to
-// import.meta.url, silently turning the CLI entry point below into a no-op.
-import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "../tools/entrypoint.ts";
 import { resolveSocketPath } from "../events.ts";
 import {
     emitHookEvent,
@@ -209,7 +206,7 @@ export async function main(
     }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isEntrypoint(import.meta.url)) {
     // main() already swallows every failure, but its own stderr write can fail
     // (EPIPE) and an unhandled rejection exits non-zero, which a harness may
     // read as a failed hook and surface to the user (SPEC 6.4).

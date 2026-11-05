@@ -130,6 +130,13 @@ public:
     // Decode the cached bytes for the requested remote path. Returns a null
     // QImage — never a fetch, never a block — when the path is not cached or
     // its bytes are not an image format this build can decode.
+    // SVG is limited to self-contained, uncompressed XML: local fragment
+    // references and verified embedded PNG/JPEG/GIF/WebP/BMP/ICO/TIFF rasters.
+    // Embedded rasters are charged before decoding against cumulative ceilings
+    // of 16 Mi pixels and 128 image references per SVG document.
+    // External resources, nested SVG images, DTDs, stylesheet instructions,
+    // CSS imports/escaped resource spellings and compressed SVG are refused
+    // before QImageReader::size(), which itself can load external SVG resources.
     QImage requestImage(const QString &id, QSize *size,
                         const QSize &requestedSize) override;
 

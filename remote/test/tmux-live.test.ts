@@ -214,3 +214,32 @@ test(
         }
     },
 );
+
+test(
+    "killing a semicolon-suffixed session never kills its shorter namesake",
+    { skip: SKIP },
+    async (t) => {
+        t.after(async () => {
+            await runner(["kill-server"]);
+        });
+        const base = `${SESSION}_semicolon`;
+        const created = await runner(["new-session", "-d", "-s", base]);
+        assert.equal(created.code, 0, created.stderr);
+
+        // The suffixed session does not exist. tmux's argv parser used to strip
+        // the final semicolon and kill the live shorter name instead.
+        await killSession({ name: `${base};` }, runner);
+        assert.deepEqual((await listSessions(runner)).map((session) => session.name), [base]);
+
+        // A backslash quotes the final semicolon for tmux's command-list parser;
+        // the actual session name stored by the server contains no backslash.
+        const literal = await runner(["new-session", "-d", "-s", `${base}\\;`]);
+        assert.equal(literal.code, 0, literal.stderr);
+        assert.deepEqual(
+            (await listSessions(runner)).map((session) => session.name).sort(),
+            [base, `${base};`].sort(),
+        );
+        await killSession({ name: `${base};` }, runner);
+        assert.deepEqual((await listSessions(runner)).map((session) => session.name), [base]);
+    },
+);

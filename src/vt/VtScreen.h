@@ -207,6 +207,7 @@ private:
         QRgb fg = VtDefaultForeground;
         QRgb bg = VtDefaultBackground;
         bool valid = false;
+        bool pendingWrap = false;
     };
 
     // --- parser-facing operations -------------------------------------------
@@ -278,7 +279,6 @@ private:
     void applySimpleSgr(int code);
     // Fold a zero-width mark into the cell that precedes the cursor.
     void attachCombiningMark(char32_t codePoint);
-    void clearWholeGrid();
     void resizeLine(VtLine &line) const;
     void emitPending();
     // Reduce the cell at (row, column) to a blank if it is one half of a

@@ -25,6 +25,7 @@
 
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 using ch::CodeharbordClient;
 using ch::CreateGroupParams;
@@ -98,6 +99,9 @@ private slots:
     void pinnedStateCrossesTheWireInBothDirections();
     void updateGroupSerializesPartialWithFalse();
     void viewerPaneMethodsSerializeParamsAndForwardOutcomes();
+    void acknowledgementResultsRequireOkTrue_data();
+    void acknowledgementResultsRequireOkTrue();
+    void acknowledgementMethodsForwardServerErrors();
     void liveCreateAndListOverProcess();
 
 private:
@@ -1870,6 +1874,112 @@ void TstWorkspaceDb::viewerPaneMethodsSerializeParamsAndForwardOutcomes()
     QVERIFY(deleteErr.has_value());
     QCOMPARE(deleteErr->code, -32602);
     QCOMPARE(deleteErr->message, QStringLiteral("no such pane"));
+}
+
+void TstWorkspaceDb::acknowledgementResultsRequireOkTrue_data()
+{
+    QTest::addColumn<int>("operation");
+    QTest::addColumn<QJsonValue>("result");
+    QTest::addColumn<bool>("success");
+    const QJsonArray results{
+        QJsonValue(QJsonValue::Null),
+        false,
+        true,
+        QJsonArray{true},
+        QJsonObject{},
+        QJsonObject{{"ok", false}},
+        QJsonObject{{"ok", 1}},
+        QJsonObject{{"ok", "true"}},
+        QJsonObject{{"ok", QJsonValue(QJsonValue::Null)}},
+        QJsonObject{{"ok", true}},
+    };
+    for (int operation = 0; operation < 3; ++operation) {
+        for (qsizetype i = 0; i < results.size(); ++i) {
+            const QByteArray name = QByteArray::number(operation) + '-' +
+                                    QByteArray::number(qint64(i));
+            QTest::newRow(name.constData())
+                << operation << results.at(i) << (i == results.size() - 1);
+        }
+    }
+}
+
+void TstWorkspaceDb::acknowledgementResultsRequireOkTrue()
+{
+    QFETCH(int, operation);
+    QFETCH(QJsonValue, result);
+    QFETCH(bool, success);
+    makePair();
+    int calls = 0;
+    std::optional<RpcError> receivedError;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    const auto callback = [&](std::optional<RpcError> error) {
+        ++calls;
+        receivedError = std::move(error);
+    };
+    switch (operation) {
+    case 0:
+        m_db->reorderGroups(ServerId{QStringLiteral("srv")}, {}, callback);
+        break;
+    case 1:
+        m_db->reorderSessions(ch::GroupId{QStringLiteral("group")}, {}, callback);
+        break;
+    case 2:
+        m_db->deleteViewerPane(ch::ViewerPaneId{QStringLiteral("pane")}, callback);
+        break;
+    }
+    const QJsonObject request = readRequest();
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", request.value(QStringLiteral("id"))},
+                                  {"result", result}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(calls, 1);
+    QCOMPARE(receivedError.has_value(), !success);
+    if (!success) {
+        QCOMPARE(receivedError->code, ch::rpc::kInternalError);
+        QVERIFY(receivedError->message.contains(
+            request.value(QStringLiteral("method")).toString()));
+    }
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstWorkspaceDb::acknowledgementMethodsForwardServerErrors()
+{
+    makePair();
+    for (int operation = 0; operation < 3; ++operation) {
+        int calls = 0;
+        std::optional<RpcError> receivedError;
+        const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+        m_client->setTransport(m_clientSide);
+        const auto callback = [&](std::optional<RpcError> error) {
+            ++calls;
+            receivedError = std::move(error);
+        };
+        switch (operation) {
+        case 0:
+            m_db->reorderGroups(ServerId{QStringLiteral("srv")}, {}, callback);
+            break;
+        case 1:
+            m_db->reorderSessions(ch::GroupId{QStringLiteral("group")}, {}, callback);
+            break;
+        case 2:
+            m_db->deleteViewerPane(ch::ViewerPaneId{QStringLiteral("pane")}, callback);
+            break;
+        }
+        const QJsonObject request = readRequest();
+        const QJsonObject data{{"retryable", true}};
+        m_serverSide->write(jsonLine(
+            {{"jsonrpc", "2.0"},
+             {"id", request.value(QStringLiteral("id"))},
+             {"error", QJsonObject{{"code", ch::rpc::kDatabaseBusy},
+                                    {"message", "database is busy"},
+                                    {"data", data}}}}));
+        m_serverSide->flush();
+        QTRY_COMPARE(calls, 1);
+        QVERIFY(receivedError.has_value());
+        QCOMPARE(receivedError->code, ch::rpc::kDatabaseBusy);
+        QCOMPARE(receivedError->message, QStringLiteral("database is busy"));
+        QCOMPARE(receivedError->data, QJsonValue(data));
+    }
 }
 
 QTEST_GUILESS_MAIN(TstWorkspaceDb)

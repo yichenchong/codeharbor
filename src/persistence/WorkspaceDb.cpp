@@ -509,13 +509,10 @@ RpcError invalidParams(const char* method, const char* problem)
     return error;
 }
 
-// Deliver a locally-detected failure on the SAME terms as a server one: later,
-// from the event loop, never inside the method the caller is still in. Every
-// method here is documented async and its callers are written for that — one
-// that took its callback synchronously would re-enter them halfway through
-// their own call to this class, a shape no other method has. The delivery is
-// posted to the borrowed client, which is the object the real reply would have
-// come from and outlives this repository by contract.
+// Local parameter failures are deliberately queued, as documented by the two
+// validation methods, rather than re-entering the caller inside validation.
+// Transport failures still follow CodeharbordClient's synchronous failure
+// contract. Post to the borrowed client, which outlives this repository.
 template <typename Callback>
 void failAsync(QObject* context, Callback cb, RpcError error)
 {
@@ -525,6 +522,22 @@ void failAsync(QObject* context, Callback cb, RpcError error)
             cb(std::nullopt, std::move(error));
         },
         Qt::QueuedConnection);
+}
+
+// Mutations without a record still have a result contract: only {ok:true}
+// acknowledges success. A JSON-RPC result alone does not prove the operation
+// was applied.
+auto okHandler(const char* method, WorkspaceDb::OkCallback cb)
+{
+    return [method, cb = std::move(cb)](
+               QJsonValue result, std::optional<RpcError> error) {
+        if (!error) {
+            const QJsonValue ok = result.toObject().value(QStringLiteral("ok"));
+            if (!result.isObject() || !ok.isBool() || !ok.toBool())
+                error = malformedResult(method, "an object with ok:true");
+        }
+        cb(std::move(error));
+    };
 }
 
 // Response handler for every workspace.* method whose result is a single record
@@ -633,9 +646,7 @@ void WorkspaceDb::reorderGroups(const ServerId& serverId,
     };
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceReorderGroups), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
-        });
+        okHandler(rpc::kMethodWorkspaceReorderGroups, std::move(cb)));
 }
 
 void WorkspaceDb::createSession(const CreateSessionParams& params,
@@ -686,9 +697,7 @@ void WorkspaceDb::reorderSessions(const GroupId& groupId,
     };
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceReorderSessions), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
-        });
+        okHandler(rpc::kMethodWorkspaceReorderSessions, std::move(cb)));
 }
 
 void WorkspaceDb::moveSessionToGroup(const MoveSessionParams& params,
@@ -733,9 +742,7 @@ void WorkspaceDb::deleteViewerPane(const ViewerPaneId& id, OkCallback cb)
     const QJsonObject params{{QStringLiteral("id"), id.value}};
     m_client->call(
         QString::fromLatin1(rpc::kMethodWorkspaceDeleteViewerPane), params,
-        [cb = std::move(cb)](QJsonValue, std::optional<RpcError> error) {
-            cb(std::move(error));
-        });
+        okHandler(rpc::kMethodWorkspaceDeleteViewerPane, std::move(cb)));
 }
 
 void WorkspaceDb::createTerminalPane(const CreateTerminalPaneParams& params,

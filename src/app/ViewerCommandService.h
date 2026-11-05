@@ -79,6 +79,9 @@ signals:
 
 private:
     void onNotification(const QString& method, const QJsonValue& params);
+    void sendResponse(const QString& commandId, bool ok,
+                      const QString& errorCode, const QString& message,
+                      const QVariantMap& data);
 
     QPointer<CodeharbordClient> m_client;
     QSet<QString> m_inFlight;

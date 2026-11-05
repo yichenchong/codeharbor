@@ -37,9 +37,11 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include <QFileInfo>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QtEndian>
 
 using ch::MobileKeyStore;
 using ch::SshConnectionPool;
@@ -228,6 +230,8 @@ private slots:
     void diagnosesAPublicKeyByName();
     void rejectsTextThatIsNotAKey();
     void rejectsUnusableNames();
+    void refusesATruncatedOpenSshPrivateSection();
+    void importsAuthenticatedCipherKeys();
     void refusesAnOversizeKey();
 
     // Path 1: in-memory import.
@@ -248,6 +252,7 @@ private slots:
     void installsAReferencedIdentityOnThePool();
     void anEmptyNameClearsThePoolIdentity();
     void removingTheInstalledKeyDisarmsThePool();
+    void changingPoolsDisarmsThePreviousIdentity();
     void forgetSessionDropsEveryStoredSecret();
     void aReferenceIsNeverTreatedAsAnIdentityFilePath();
 
@@ -289,6 +294,9 @@ private slots:
     void forgetSessionKeepsASavedKeyAndWipesTheSessionOne();
     void forgetSavedKeyDeletesTheFileFromDisk();
     void removeKeyDeletesTheSavedFileToo();
+    void aFailedSavedKeyDeletionCanBeRetried();
+    void forgettingAnAlreadyRemovedSavedKeySucceeds();
+    void anUnsearchableSavedKeyDirectoryDoesNotImplyDeletion();
     void savingAKeyPutsNothingInQSettings();
 
 private:
@@ -413,6 +421,98 @@ void TestMobileKeyStore::refusesAnOversizeKey()
                                      QStringLiteral("fat")));
     QVERIFY(!store.lastError().isEmpty());
     QVERIFY(store.keyNames().isEmpty());
+}
+
+void TestMobileKeyStore::refusesATruncatedOpenSshPrivateSection()
+{
+    QByteArray encoded;
+    for (const QByteArray &line : QByteArray(kPlainKey).split('\n')) {
+        if (!line.startsWith("-----"))
+            encoded += line.trimmed();
+    }
+    const QByteArray container = QByteArray::fromBase64(encoded);
+    qsizetype offset = QByteArrayLiteral("openssh-key-v1").size() + 1;
+    for (int field = 0; field < 3; ++field)
+        offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    offset += 4; // key count
+    offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+
+    const QList<QByteArray> damaged{
+        container.first(offset), // public half only, no private length
+        container.chopped(1), // private bytes shorter than their declared length
+        container.first(offset) + QByteArray(4, '\0'), // empty private half
+        container + QByteArrayLiteral("trailing bytes"),
+    };
+    MobileKeyStore store(root());
+    for (const QByteArray &blob : damaged) {
+        const QString text = QStringLiteral("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+            + QString::fromLatin1(blob.toBase64())
+            + QStringLiteral("\n-----END OPENSSH PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("damaged"), text));
+        QVERIFY(!store.lastError().isEmpty());
+        QVERIFY(store.keyNames().isEmpty());
+    }
+}
+
+void TestMobileKeyStore::importsAuthenticatedCipherKeys()
+{
+    // Real ssh-keygen -t ed25519 -N mc-regression -Z <cipher> keys. OpenSSH
+    // successfully decrypted each fixture; these are throwaway test identities.
+    const char *keys[] = {
+        R"(-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAAFmFlczI1Ni1nY21Ab3BlbnNzaC5jb20AAAAGYmNyeXB0AA
+AAGAAAABAgQGJZpu/Ig1BKOcwUfX7rAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAA
+ICkUg4ayjm5iaaR7moNjdJYjjp6atDZSps61y7Xhi/MAAAAAkLzVqriHuK0zedC+rDbKEr
+JZrCyTIYlJOsInFp7rfjgOyt3p8zpGY7iYKM9DUpSTU+rOGpsWLaLDIF5wpUl+zYDQ0vX4
+eJrrmFh+30DtL2P9+KaJCaR5sVv3lSnZgc3cdXNnXfjvvM5em9YZsUEeY/z0jUfHlWYdy4
+LiLm44/w7KdfUVSQKpfufd0VTNXsTDqqYgWzCw76ImDdXk3pLBvhY=
+-----END OPENSSH PRIVATE KEY-----
+)",
+        R"(-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAAFmFlczEyOC1nY21Ab3BlbnNzaC5jb20AAAAGYmNyeXB0AA
+AAGAAAABDor/u+hOaBAB+e0vcj+QHtAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAA
+IIyJmlk7BgC3H96lYLFDQ+pE/HHlhLeoaJWuYgCzEnmRAAAAkOq/sknzhZiX7rJEoDET4L
+NMeefjX2z8ajDlMQ6gPJpBlLUh0lQdputm3oDulWgadlGJyjdhrlLZhUs6TZOq3agd2LyY
+zif9OQ8k0gwPR/niwp7CB/iNyI2Mvcm1QTT6KgQamRt3dO+okjBhzvaVabaFjzOq3ljvWq
+rDVh/QU2nPMi9lFqVucD9vGBow/WamCpY99k+MkxGO1hsq+p0xV00=
+-----END OPENSSH PRIVATE KEY-----
+)",
+        R"(-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAAHWNoYWNoYTIwLXBvbHkxMzA1QG9wZW5zc2guY29tAAAABm
+JjcnlwdAAAABgAAAAQ+7kDnht8ZeDRa8m4sZgbLwAAABgAAAABAAAAMwAAAAtzc2gtZWQy
+NTUxOQAAACDC0oSRYEffsgjPSEKhdiBHiS8CVzdgz0iLWlwDnmVx+QAAAJDkf7LF24ISPF
+ukJ1dlCpQNeuO3SLg0+mmueSqBj2/D1BPCQJla3FmBRZeFtL3MUY85lgEdT13C3B7PNlLC
+67a8usBw4XGuVq6cZ9TeNc8MumnJQUxEDbsx6pz7k1ZnTnZRwIn+20rFNauQdHyMoPNpSv
+B110slVf6dCaidJpml/hFbfOs9vz3h2h3h5NrPXO0hD9EEwbpEgUR1RPURqYHc
+-----END OPENSSH PRIVATE KEY-----
+)",
+    };
+    MobileKeyStore store(root());
+    int index = 0;
+    for (const char *key : keys) {
+        const QString name = QStringLiteral("aead-%1").arg(++index);
+        QVERIFY2(store.importKeyFromText(name, QString::fromLatin1(key)),
+                 qPrintable(store.lastError()));
+        const QVariantMap info = store.keyInfo(name);
+        QVERIFY(info.value(QStringLiteral("encrypted")).toBool());
+        QVERIFY(info.value(QStringLiteral("fingerprintAvailable")).toBool());
+
+        QByteArray encoded;
+        for (const QByteArray &line : QByteArray(key).split('\n')) {
+            if (!line.startsWith("-----"))
+                encoded += line.trimmed();
+        }
+        const QByteArray container = QByteArray::fromBase64(encoded);
+        for (const QByteArray &damaged :
+             {container.chopped(1), container.chopped(16),
+              container + QByteArrayLiteral("trailing bytes")}) {
+            const QString text = QStringLiteral("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+                + QString::fromLatin1(damaged.toBase64())
+                + QStringLiteral("\n-----END OPENSSH PRIVATE KEY-----\n");
+            QVERIFY(!store.importKeyFromText(QStringLiteral("damaged"), text));
+            QVERIFY(!store.keyNames().contains(QStringLiteral("damaged")));
+        }
+    }
 }
 
 void TestMobileKeyStore::importsAKeyWithoutTouchingDisk()
@@ -578,6 +678,28 @@ void TestMobileKeyStore::installsAnInMemoryIdentityOnThePool()
     QVERIFY(!pool.hasInMemoryIdentity());
     QVERIFY(store.applyIdentityForConnect(QStringLiteral("pasted")));
     QVERIFY(pool.hasInMemoryIdentity());
+}
+
+void TestMobileKeyStore::changingPoolsDisarmsThePreviousIdentity()
+{
+    SshConnectionPool first;
+    SshConnectionPool second;
+    MobileKeyStore store(root());
+    store.setConnectionPool(&first);
+    QVERIFY(store.importKeyFromText(QStringLiteral("work"),
+                                   QString::fromLatin1(kPlainKey)));
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("work")));
+    QVERIFY(first.hasInMemoryIdentity());
+    store.setConnectionPool(&first);
+    QVERIFY(first.hasInMemoryIdentity());
+
+    store.setConnectionPool(&second);
+    QVERIFY(!first.hasInMemoryIdentity());
+    QVERIFY(!second.hasInMemoryIdentity());
+    QVERIFY(store.applyIdentityForConnect(QStringLiteral("work")));
+    QVERIFY(second.hasInMemoryIdentity());
+    store.setConnectionPool(nullptr);
+    QVERIFY(!second.hasInMemoryIdentity());
 }
 
 void TestMobileKeyStore::installsAReferencedIdentityOnThePool()
@@ -1456,6 +1578,93 @@ void TestMobileKeyStore::savingAKeyPutsNothingInQSettings()
     QFile saved(savedKeyPath(appData.path(), QStringLiteral("kept")));
     QVERIFY(saved.open(QIODevice::ReadOnly));
     QVERIFY(saved.readAll().contains(keyNeedle()));
+}
+
+void TestMobileKeyStore::aFailedSavedKeyDeletionCanBeRetried()
+{
+    for (bool remove : {false, true}) {
+        QTemporaryDir data;
+        QVERIFY(data.isValid());
+        MobileKeyStore store(data.path());
+        const QString name = QStringLiteral("work");
+        QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
+        QVERIFY(store.saveKeyOnDevice(name));
+        QSignalSpy removed(&store, &MobileKeyStore::keyRemoved);
+        const QString path = savedKeyPath(data.path(), name);
+        // A directory at the file's path makes QFile::remove fail even for an
+        // elevated test process; no platform-specific permission assumption.
+        QVERIFY(QFile::remove(path));
+        QVERIFY(QDir().mkdir(path));
+        QVERIFY(!(remove ? store.removeKey(name) : store.forgetSavedKey(name)));
+        QVERIFY(store.isSavedOnDevice(name));
+        QVERIFY(store.allKeyNames().contains(name));
+        QVERIFY(!store.lastError().isEmpty());
+        QVERIFY(store.keyNames().isEmpty());
+        QCOMPARE(removed.count(), 0);
+
+        QVERIFY(QDir().rmdir(path));
+        QFile restored(path);
+        QVERIFY(restored.open(QIODevice::WriteOnly));
+        QCOMPARE(restored.write(QByteArray(kPlainKey)), qint64(qstrlen(kPlainKey)));
+        restored.close();
+        QVERIFY(remove ? store.removeKey(name) : store.forgetSavedKey(name));
+        QVERIFY(!store.isSavedOnDevice(name));
+        QVERIFY(!QFileInfo::exists(path));
+        QCOMPARE(removed.count(), 1);
+    }
+}
+
+void TestMobileKeyStore::forgettingAnAlreadyRemovedSavedKeySucceeds()
+{
+    QTemporaryDir data;
+    QVERIFY(data.isValid());
+    MobileKeyStore store(data.path());
+    const QString name = QStringLiteral("work");
+    QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
+    QVERIFY(store.saveKeyOnDevice(name));
+    QVERIFY(QFile::remove(savedKeyPath(data.path(), name)));
+    QVERIFY(store.forgetSavedKey(name));
+    QVERIFY(!store.isSavedOnDevice(name));
+    QVERIFY(!store.hasKeys());
+}
+
+void TestMobileKeyStore::anUnsearchableSavedKeyDirectoryDoesNotImplyDeletion()
+{
+#ifndef Q_OS_UNIX
+    QSKIP("POSIX directory search permissions are required.");
+#else
+    QTemporaryDir data;
+    QVERIFY(data.isValid());
+    MobileKeyStore store(data.path());
+    const QString name = QStringLiteral("work");
+    QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
+    QVERIFY(store.saveKeyOnDevice(name));
+    const QString directory = savedKeysDirectory(data.path());
+    const QString path = savedKeyPath(data.path(), name);
+    const auto permissions = QFile::permissions(directory);
+    QVERIFY(QFile::setPermissions(directory,
+                                 QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    QFile probe(path);
+    if (probe.open(QIODevice::ReadOnly)) {
+        probe.close();
+        QVERIFY(QFile::setPermissions(directory, permissions));
+        QSKIP("This process can bypass directory search permissions.");
+    }
+    QSignalSpy removed(&store, &MobileKeyStore::keyRemoved);
+    const bool deleted = store.forgetSavedKey(name);
+    const bool stillListed = store.isSavedOnDevice(name);
+    const bool reportedError = !store.lastError().isEmpty();
+    const int removalSignals = removed.count();
+    // Restore before assertions so even a failing regression can clean up.
+    QVERIFY(QFile::setPermissions(directory, permissions));
+    QVERIFY(!deleted);
+    QVERIFY(stillListed);
+    QVERIFY(reportedError);
+    QCOMPARE(removalSignals, 0);
+    QVERIFY(QFileInfo::exists(path));
+    QVERIFY(store.forgetSavedKey(name));
+    QVERIFY(!QFileInfo::exists(path));
+#endif
 }
 
 // Guiless: nothing here draws, and a credential test must not depend on a

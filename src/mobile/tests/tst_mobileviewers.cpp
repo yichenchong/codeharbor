@@ -10,12 +10,14 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QImage>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QtTest/QtTest>
 
@@ -146,11 +148,13 @@ private slots:
     void aStatReplyIsForwardedAsAMapAndCheckedFirst();
     void resolvePathReportsOutsideTheRepositoryRoot();
     void aResolveReplyMissingTheFlagIsAFailureNotAFalse();
+    void resolveAnswersKeepTheirOriginalRepositoryRoot();
     void theImageHandshakeCachesBytesBeforeAnnouncingTheUrl();
     void aSecondRequestForACachedImageCostsNoRoundTrip();
     void anOverCapImageReadIsRefusedAndNothingIsCached();
     void theProviderReportsTheSizeTheCallerWillActuallyGet();
     void theImageProviderAnswersOnlyFromTheCache();
+    void svgImagesNeverReadLocalResourcesOrNestedSvgPayloads();
     void theImageCacheEvictsTheLeastRecentlyUsed();
     void imageUrlsAreOpaqueAndRoundTrip();
     void viewKindsSpeakTheDesktopVocabulary();
@@ -480,7 +484,9 @@ void TstMobileViewers::resolvePathReportsOutsideTheRepositoryRoot()
     // The ASKED-for path is echoed, so a page can tell an answer about the file
     // it shows from one about the file it has navigated away from.
     QCOMPARE(resolved.at(0).at(0).toString(), QStringLiteral("/etc/hosts"));
-    QCOMPARE(resolved.at(0).at(2).toBool(), false);
+    QCOMPARE(resolved.at(0).at(1).toString(), QStringLiteral("/srv/repo"));
+    QCOMPARE(resolved.at(0).at(2).toString(), QStringLiteral("/etc/hosts"));
+    QCOMPARE(resolved.at(0).at(3).toBool(), false);
 
     // An empty base is OMITTED: the server would resolve it against its own
     // working directory, and everything is inside the filesystem root.
@@ -494,7 +500,7 @@ void TstMobileViewers::resolvePathReportsOutsideTheRepositoryRoot()
 void TstMobileViewers::aResolveReplyMissingTheFlagIsAFailureNotAFalse()
 {
     QSignalSpy resolved(m_service, &MobileViewerService::pathResolved);
-    QSignalSpy errors(m_service, &MobileViewerService::fileError);
+    QSignalSpy errors(m_service, &MobileViewerService::pathResolveError);
 
     m_service->resolvePath(QStringLiteral("/repo/a"), QStringLiteral("/repo"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
@@ -510,6 +516,27 @@ void TstMobileViewers::aResolveReplyMissingTheFlagIsAFailureNotAFalse()
                   {{"insideRepositoryRoot", true}});
     QCOMPARE(resolved.size(), 0);
     QCOMPARE(errors.size(), 2);
+}
+
+void TstMobileViewers::resolveAnswersKeepTheirOriginalRepositoryRoot()
+{
+    QSignalSpy resolved(m_service, &MobileViewerService::pathResolved);
+    QSignalSpy errors(m_service, &MobileViewerService::pathResolveError);
+    const QString path = QStringLiteral("/repo/a.png");
+    m_service->resolvePath(path, QStringLiteral("/repo"));
+    const qint64 first = takeRequest().value(QStringLiteral("id")).toInteger();
+    m_service->resolvePath(path, QStringLiteral("/other"));
+    const qint64 second = takeRequest().value(QStringLiteral("id")).toInteger();
+
+    // Opposite delivery order must not make either answer claim the other root.
+    respondError(second, -32603, QStringLiteral("cannot resolve"));
+    respondResult(first, {{"path", path}, {"insideRepositoryRoot", true}});
+    QCOMPARE(resolved.size(), 1);
+    QCOMPARE(resolved.at(0).at(0).toString(), path);
+    QCOMPARE(resolved.at(0).at(1).toString(), QStringLiteral("/repo"));
+    QCOMPARE(errors.size(), 1);
+    QCOMPARE(errors.at(0).at(0).toString(), path);
+    QCOMPARE(errors.at(0).at(1).toString(), QStringLiteral("/other"));
 }
 
 // The handshake documented in MobileImageProvider.h. Getting the ORDER wrong is
@@ -731,6 +758,7 @@ void TstMobileViewers::everyOperationDegradesWithoutATransport()
     QSignalSpy dirErrors(&orphan, &MobileViewerService::directoryError);
     QSignalSpy imageErrors(&orphan, &MobileViewerService::imageError);
     QSignalSpy pdfErrors(&orphan, &MobileViewerService::pdfError);
+    QSignalSpy resolveErrors(&orphan, &MobileViewerService::pathResolveError);
 
     orphan.readFile(QStringLiteral("/a"));
     orphan.writeFile(QStringLiteral("/a"), QStringLiteral("b"), QString());
@@ -740,7 +768,8 @@ void TstMobileViewers::everyOperationDegradesWithoutATransport()
     orphan.requestImage(QStringLiteral("/a.png"));
     orphan.requestPdf(QStringLiteral("/a.pdf"));
 
-    QCOMPARE(fileErrors.size(), 4);
+    QCOMPARE(fileErrors.size(), 3);
+    QCOMPARE(resolveErrors.size(), 1);
     QCOMPARE(dirErrors.size(), 1);
     QCOMPARE(imageErrors.size(), 1);
     QCOMPARE(pdfErrors.size(), 1);
@@ -1035,6 +1064,106 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
     QCOMPARE(imageReady.size(), 1);
     QCOMPARE(m_service->cachedImageBytes(png), pngBytes());
+}
+
+void TstMobileViewers::svgImagesNeverReadLocalResourcesOrNestedSvgPayloads()
+{
+    if (!QImageReader::supportedImageFormats().contains("svg"))
+        QSKIP("this build has no SVG image decoder");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString markerPath = directory.filePath(QStringLiteral("private-marker.png"));
+    QImage marker(4, 4, QImage::Format_RGB32);
+    marker.fill(Qt::red);
+    QVERIFY(marker.save(markerPath));
+    const auto imageSvg = [](const QString &href) {
+        return QStringLiteral(
+            "<svg xmlns='http://www.w3.org/2000/svg' "
+            "xmlns:xlink='http://www.w3.org/1999/xlink' width='4' height='4'>"
+            "<image width='4' height='4' xlink:href='%1'/></svg>")
+            .arg(href.toHtmlEscaped()).toUtf8();
+    };
+    const QByteArray external = imageSvg(markerPath);
+    auto cache = std::make_shared<MobileImageCache>();
+    MobileImageProvider provider(cache);
+    const QString remote = QStringLiteral("/remote/untrusted.svg");
+    const auto decode = [&](const QByteArray &svg) {
+        cache->insert(remote, svg);
+        return provider.requestImage(QString::fromLatin1(QUrl::toPercentEncoding(remote)),
+                                     nullptr, QSize());
+    };
+    QVERIFY(decode(external).isNull());
+    QVERIFY(decode(imageSvg(QStringLiteral("data:image/svg+xml;base64,")
+                            + QString::fromLatin1(external.toBase64()))).isNull());
+    // A declared raster MIME type must not disguise a nested SVG decoder.
+    QVERIFY(decode(imageSvg(QStringLiteral("data:image/png;base64,")
+                            + QString::fromLatin1(external.toBase64()))).isNull());
+    QVERIFY(decode(imageSvg(QStringLiteral("data:image/png,")
+                            + QString::fromLatin1(QUrl::toPercentEncoding(
+                                QString::fromUtf8(external))))).isNull());
+    QVERIFY(decode(QByteArray("<?xml-stylesheet type=\"text/css\" href=\"")
+                   + markerPath.toUtf8()
+                   + "\"?><svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>").isNull());
+    QVERIFY(decode(QByteArray("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>"
+                              "<style><?xml-stylesheet type=\"text/css\" href=\"")
+                   + markerPath.toUtf8() + "\"?></style></svg>").isNull());
+    QVERIFY(decode(QByteArray("<!DOCTYPE svg [<!ENTITY local '")
+                   + markerPath.toUtf8() + "'>]>"
+                   + imageSvg(QStringLiteral("&local;"))).isNull());
+    QVERIFY(decode(QByteArray("<!DOCTYPE svg SYSTEM '")
+                   + QUrl::fromLocalFile(markerPath).toEncoded()
+                   + "'><svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>").isNull());
+    QVERIFY(decode(QByteArray("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>"
+                              "<style>@import url('/private/style.css');</style></svg>")).isNull());
+    QVERIFY(decode(QByteArray("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>"
+                              "<rect width='4' height='4' fill='url(/private/paint.svg)'/></svg>")).isNull());
+
+    // Ordinary self-contained vectors, fragment references and real embedded
+    // raster data remain viewable, rather than disabling SVG support wholesale.
+    const QImage fragment = decode(QByteArray(
+        "<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' "
+        "width='4' height='4'><defs><rect id='box' width='4' height='4' fill='red'/>"
+        "</defs><use xlink:href='#box'/></svg>"));
+    QVERIFY(!fragment.isNull());
+    QCOMPARE(fragment.pixelColor(1, 1), QColor(Qt::red));
+    const QByteArray png = pngBytes();
+    const QImage embedded = decode(imageSvg(QStringLiteral("data:image/png;base64,")
+                                            + QString::fromLatin1(png.toBase64())));
+    QVERIFY(!embedded.isNull());
+    QCOMPARE(embedded.pixelColor(1, 1), QColor(Qt::red));
+    for (const QString &scheme : {QStringLiteral("DATA:"), QStringLiteral("Data:"),
+                                 QStringLiteral(" data:")})
+        QVERIFY(decode(imageSvg(scheme + QStringLiteral("image/png;base64,")
+                                + QString::fromLatin1(png.toBase64()))).isNull());
+
+    const auto monoPng = [](int width, int height) {
+        // A one-bit solid raster provides genuine large decoded dimensions
+        // without allocating a huge test fixture or relying on corrupt headers.
+        QImage raster(width, height, QImage::Format_Mono);
+        raster.setColorTable({qRgb(0, 0, 0), qRgb(255, 255, 255)});
+        raster.fill(0);
+        QBuffer buffer;
+        buffer.open(QIODevice::WriteOnly);
+        if (!raster.save(&buffer, "PNG"))
+            return QByteArray();
+        return buffer.data();
+    };
+    const QByteArray oversized = monoPng(4097, 4096);
+    QVERIFY(!oversized.isEmpty());
+    QVERIFY(decode(imageSvg(QStringLiteral("data:image/png;base64,")
+                            + QString::fromLatin1(oversized.toBase64()))).isNull());
+
+    const auto repeatedSvg = [](const QByteArray &raster, int count) {
+        const QByteArray image = "<image width='0' height='0' href='data:image/png;base64,"
+                                 + raster.toBase64() + "'/>";
+        return QByteArray("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'>")
+               + image.repeated(count) + "</svg>";
+    };
+    const QByteArray megapixel = monoPng(1024, 1024);
+    QVERIFY(!megapixel.isEmpty());
+    // Charge each reference, even when QtSvg later ignores zero-size elements.
+    QVERIFY(decode(repeatedSvg(megapixel, 17)).isNull());
+    QVERIFY(decode(repeatedSvg(png, 129)).isNull());
 }
 
 // QGuiApplication, not QCoreApplication: MobileImageProvider decodes into a

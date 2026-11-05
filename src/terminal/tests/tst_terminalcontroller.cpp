@@ -7,6 +7,7 @@
 #include <QStringDecoder>
 
 #include <cstring>
+#include <functional>
 
 #include "SessionState.h"
 #include "TerminalController.h"
@@ -64,6 +65,7 @@ public:
     // How many write() calls the transport has seen, so a test can tell one
     // whole-buffer write from a resumed sequence of short ones.
     int writeCalls() const { return m_writeCalls; }
+    std::function<void()> afterWrite;
 
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override
@@ -92,6 +94,8 @@ protected:
         if (m_failureAfter >= 0)
             accepted = qMin(accepted, m_failureAfter - m_written.size());
         m_written.append(data, accepted);
+        if (afterWrite)
+            afterWrite();
         return accepted;
     }
 
@@ -148,6 +152,8 @@ private slots:
     void sendInputResumesAShortWrite();
     void sendInputReportsAnUnsentSuffix_data();
     void sendInputReportsAnUnsentSuffix();
+    void sendInputNeverContinuesOnAReplacedTransport_data();
+    void sendInputNeverContinuesOnAReplacedTransport();
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
     void flushBoundariesNeverSplitAMultiByteCharacter();
@@ -1218,6 +1224,37 @@ void TstTerminalController::sendInputReportsAnUnsentSuffix()
     QVERIFY(replacement.written().isEmpty());
     QVERIFY(controller.sendInput(QByteArrayLiteral("fresh")));
     QCOMPARE(replacement.written(), QByteArrayLiteral("fresh"));
+}
+
+void TstTerminalController::sendInputNeverContinuesOnAReplacedTransport_data()
+{
+    QTest::addColumn<bool>("replace");
+    QTest::newRow("detach-during-short-write") << false;
+    QTest::newRow("replace-during-short-write") << true;
+}
+
+void TstTerminalController::sendInputNeverContinuesOnAReplacedTransport()
+{
+    QFETCH(bool, replace);
+    TerminalController controller;
+    FakeChannel channel;
+    FakeChannel replacement;
+    channel.setWriteLimit(3);
+    // SshChannelDevice can emit channelError after accepting a prefix. The
+    // receiver may synchronously detach or reconnect before write() returns.
+    channel.afterWrite = [&]() {
+        controller.setTransport(replace ? &replacement : nullptr);
+    };
+    controller.setTransport(&channel);
+    QVERIFY(!controller.sendInput(QByteArrayLiteral("echo command\n")));
+    QCOMPARE(channel.written(), QByteArrayLiteral("ech"));
+    QCOMPARE(channel.writeCalls(), 1);
+    QVERIFY(replacement.written().isEmpty());
+    QCOMPARE(controller.transport(), replace ? &replacement : nullptr);
+    if (replace) {
+        QVERIFY(controller.sendInput(QByteArrayLiteral("fresh")));
+        QCOMPARE(replacement.written(), QByteArrayLiteral("fresh"));
+    }
 }
 
 // A renderer that has not been laid out yet reports 0 rows and columns. Taking

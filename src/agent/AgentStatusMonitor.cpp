@@ -118,6 +118,10 @@ void AgentStatusMonitor::onReadyRead()
         return;
 
     m_readBuffer.append(m_transport->readAll());
+    if (m_processingRead)
+        return;
+    m_processingRead = true;
+    QPointer<AgentStatusMonitor> self(this);
 
     // Consume every complete line; a trailing partial line stays buffered until
     // the rest arrives on a later readyRead (a line split across reads).
@@ -158,10 +162,9 @@ void AgentStatusMonitor::onReadyRead()
     // oversize guard below makes that unreachable in practice, but the guard
     // runs AFTER this loop, so the loop must be correct on its own.
     //
-    // Re-entrancy: processLine() reaches slots that may drive another delivery
-    // straight back into this handler. The re-entrant call appends to the END
-    // of the same buffer and frames from the FRONT, so the oldest complete line
-    // is always consumed first and no line is framed twice.
+    // Re-entrant deliveries append only. The outer drain finishes all of the
+    // current event's signals before applying the next frame, preserving arrival
+    // order for harness observations and notifications as well as raw states.
     qsizetype newline;
     while ((newline = m_readBuffer.indexOf('\n')) != -1) {
         if (m_discardingLine) {
@@ -191,6 +194,8 @@ void AgentStatusMonitor::onReadyRead()
         const QByteArray line = m_readBuffer.left(newline);
         m_readBuffer.remove(0, newline + 1);
         processLine(line);
+        if (!self)
+            return;
     }
 
     // Guard against an unterminated line growing the buffer without bound. The
@@ -201,6 +206,7 @@ void AgentStatusMonitor::onReadyRead()
         m_readBuffer.clear();
         m_discardingLine = true;
     }
+    m_processingRead = false;
 }
 
 void AgentStatusMonitor::processLine(const QByteArray& line)
@@ -272,16 +278,23 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
     // layer has already re-derived the sidebar row by the time the desktop
     // bubble is raised; notify() is a side effect, not a source of truth, and
     // must never be the thing that tells the UI something changed.
+    QPointer<AgentStatusMonitor> self(this);
     if (changed)
         emit agentStateChanged(dev, term, static_cast<int>(next));
-    if (armedUnseen)
+    if (!self)
+        return;
+    if (armedUnseen && m_unseen.contains(dev))
         emit unseenChanged(dev, true);
+    if (!self)
+        return;
     // After the state signals: a consumer of this one may write to the server
     // and refresh the workspace tree, which calls back into setTerminalHarness()
     // here, and the sidebar should already be showing the state this event
     // carried by then.
     if (harnessMoved)
         emit harnessObserved(dev, term, ev.harness);
+    if (!self)
+        return;
 
     // Desktop-notification hook: a genuine transition into an attention-worthy
     // state, or a completion that re-arms a badge the user had already cleared.
@@ -707,6 +720,7 @@ void AgentStatusMonitor::onAgeTick()
         }
     }
 
+    QPointer<AgentStatusMonitor> self(this);
     for (const Pending& p : pending) {
         // A signal handler may evict or replace this pane while an earlier
         // pending transition is being emitted. Do not report a transition for
@@ -715,6 +729,8 @@ void AgentStatusMonitor::onAgeTick()
         if (!st || st->state != p.state)
             continue;
         emit agentStateChanged(p.dev, p.term, static_cast<int>(p.state));
+        if (!self)
+            return;
     }
 
     rearmAgeTimer();

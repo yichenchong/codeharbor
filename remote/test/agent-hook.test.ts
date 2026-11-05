@@ -4,7 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
@@ -551,6 +551,57 @@ test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async ()
     }
 });
 
+test("bridge socket probes preserve live endpoints on permission and resource errors", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-probe-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const server = net.createServer((socket) => socket.end("still alive"));
+    const listening = Promise.withResolvers<void>();
+    server.listen(socketPath, listening.resolve);
+    await listening.promise;
+    const original = fs.lstatSync(socketPath);
+    let replacement: net.Server | undefined;
+    try {
+        for (const code of ["EACCES", "EMFILE", "EAGAIN"]) {
+            const probeError = Object.assign(new Error(`probe failed: ${code}`), { code });
+            const create = t.mock.method(net, "createConnection", () => {
+                const probe = new net.Socket();
+                queueMicrotask(() => probe.emit("error", probeError));
+                return probe;
+            });
+            try {
+                await assert.rejects(startBridge(socketPath, () => {}).then((result) => {
+                    replacement = result;
+                    return result;
+                }), { code });
+            } finally {
+                create.mock.restore();
+            }
+            assert.equal(fs.lstatSync(socketPath).ino, original.ino);
+            assert.equal(fs.existsSync(`${socketPath}.lock`), false, "a failed startup releases its lock");
+        }
+        const reply = Promise.withResolvers<string>();
+        const producer = net.createConnection(socketPath);
+        producer.setEncoding("utf8");
+        producer.once("data", reply.resolve);
+        producer.once("error", reply.reject);
+        try {
+            assert.equal(await reply.promise, "still alive");
+        } finally {
+            producer.destroy();
+        }
+    } finally {
+        if (replacement) {
+            const stopped = Promise.withResolvers<void>();
+            replacement.close(() => stopped.resolve());
+            await stopped.promise;
+        }
+        const stopped = Promise.withResolvers<void>();
+        server.close(() => stopped.resolve());
+        await stopped.promise;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 // A stand-in for a producer socket that records the three things the sink does
 // to one: pause it, resume it, and subscribe to its 'close' so a producer that
 // disconnects mid-stall can be forgotten.
@@ -775,6 +826,52 @@ test("makeStreamSink subscribes to a source's close only once across stalls", as
         1,
         "the sink must not stack a 'close' listener per stall cycle",
     );
+});
+
+test("a bridge output error disconnects both stalled and future producers", () => {
+    let writes = 0;
+    const out = Object.assign(new EventEmitter(), {
+        write(): boolean {
+            writes += 1;
+            return false;
+        },
+    });
+    const sink = makeStreamSink(out as unknown as NodeJS.WritableStream);
+    const stalled = fakeSource();
+    sink(RELAY_EVENT, stalled.socket);
+    assert.equal(stalled.paused, true);
+
+    out.emit("error", new Error("SSH channel closed"));
+    assert.equal(stalled.destroyed, true);
+    const newcomer = fakeSource();
+    sink(RELAY_EVENT, newcomer.socket);
+    assert.equal(newcomer.destroyed, true);
+    assert.equal(writes, 1, "a failed output must never receive another write");
+    out.emit("drain");
+    assert.equal(stalled.resumes, 0);
+    assert.equal(newcomer.resumes, 0);
+});
+
+test("a throwing bridge output releases producers already awaiting drain", () => {
+    let writes = 0;
+    const out = Object.assign(new EventEmitter(), {
+        write(): boolean {
+            writes += 1;
+            if (writes > 1) throw new Error("output destroyed");
+            return false;
+        },
+    });
+    const sink = makeStreamSink(out as unknown as NodeJS.WritableStream);
+    const stalled = fakeSource();
+    const current = fakeSource();
+    sink(RELAY_EVENT, stalled.socket);
+    sink(RELAY_EVENT, current.socket);
+    assert.equal(stalled.destroyed, true);
+    assert.equal(current.destroyed, true);
+    const newcomer = fakeSource();
+    sink(RELAY_EVENT, newcomer.socket);
+    assert.equal(newcomer.destroyed, true);
+    assert.equal(writes, 2);
 });
 
 // readline has no maximum line length, so a producer that streams bytes and
@@ -1065,6 +1162,27 @@ test("emitHookEvent settles when the bridge hangs up without reading (AG5)", asy
     }
 });
 
+test("a failed hook write rejects instead of reporting delivery (RI1)", async (t) => {
+    const socket = new net.Socket();
+    const failure = new Error("write EPIPE");
+    t.mock.method(net, "createConnection", () => {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+    });
+    // Writable callbacks run before the corresponding error event. The
+    // callback alone must not resolve a write that the transport refused.
+    t.mock.method(socket, "end", (_line: string, callback: (error?: Error) => void) => {
+        callback(failure);
+        queueMicrotask(() => socket.emit("error", failure));
+        return socket;
+    });
+    await assert.rejects(
+        emitHookEvent({ event: "agent_start", devSessionId: "s", terminalId: "t" }, "unused"),
+        failure,
+    );
+    assert.equal(socket.destroyed, true);
+});
+
 // RA2. emitHookEvent documents that it REPORTS failures by rejecting. An
 // argument net.createConnection refuses outright (an empty path) is validated
 // synchronously, so without a guard the throw escapes past the returned
@@ -1085,11 +1203,8 @@ test("emitHookEvent rejects instead of throwing on an unusable socket path (RA2)
 // a harness actually runs is the SCRIPT, and that path has its own contract
 // that nothing covered:
 //
-//   * The CLI entry point has to recognise itself. It compares import.meta.url
-//     against pathToFileURL(process.argv[1]); if that comparison ever stops
-//     matching, the installed hook becomes a silent no-op — it loads, defines
-//     everything, emits nothing, and exits 0, so the harness sees a perfectly
-//     healthy hook and the sidebar simply never updates.
+//   * The CLI entry point has to run when invoked as a script; an imported-only
+//     no-op exits 0 but never updates the sidebar.
 //   * The hook runs INSIDE someone else's process tree, and its stdout may be
 //     a pipe the harness parses. A single stray byte there corrupts the host.
 //     Its payload goes to the socket; stdout must stay empty, always.
@@ -1637,9 +1752,8 @@ test("makeStreamSink destroys stalled producers when the output fails", () => {
 
 // The relay's own CLI entry point, which nothing in the portable suite ran. Two
 // things have to hold and neither is visible from the exported functions: the
-// entry point must recognise itself (it compares import.meta.url against
-// pathToFileURL(process.argv[1]), and a mismatch makes the whole relay a silent
-// no-op), and a signalled stop must leave nothing behind on disk.
+// entry point must recognise itself, and a signalled stop must leave nothing
+// behind on disk.
 test("the bridge CLI announces itself and cleans up on SIGTERM", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-cli-"));
     const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
@@ -1737,4 +1851,23 @@ test("an over-long metadata bag is given up before the readable summary", async 
     assert.equal(logged.length, 1);
     assert.match(logged[0], /OMP_METADATA was dropped/);
     assert.doesNotMatch(logged[0], /OMP_SUMMARY/);
+});
+
+test("a symlinked hook CLI still runs its configuration checks (RI2)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-link-"));
+    try {
+        const link = path.join(dir, "oh-my-pi-hook.ts");
+        fs.symlinkSync(fileURLToPath(new URL("../src/hooks/oh-my-pi-hook.ts", import.meta.url)), link);
+        const result = spawnSync(process.execPath, [link, "agent_start"], {
+            env: {},
+            encoding: "utf8",
+            timeout: 10_000,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, /OMP_DEV_SESSION_ID and OMP_TERMINAL_ID/);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });

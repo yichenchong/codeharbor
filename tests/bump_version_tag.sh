@@ -395,6 +395,85 @@ if grep -qE "TypeError|Cannot destructure" "$work/out19"; then
     fail "an unhandled JavaScript error escaped instead of a readable message"
 fi
 
+# --- 18a. symlinks must not redirect a bump outside the repository ------------
+make_repo 0.1.8
+mkdir -p "$work/external-versions"
+printf '{ "version": "0.1.8" }\n' >"$work/external-versions/version.json"
+ln -s "$work/external-versions" external-versions
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.sources.push({ path: "external-versions/version.json", kind: "json" });
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+before="$(snapshot)"
+outside_before="$(cksum <"$work/external-versions/version.json")"
+if node "$bumpctl" apply 0.2.0 --root "$work/repo" >"$work/out-symlink" 2>&1; then
+    fail "apply followed a directory symlink outside the repository"
+fi
+grep -q "outside the repository root" "$work/out-symlink" \
+    || { cat "$work/out-symlink" >&2; fail "no explanation of the symlink escape"; }
+[ "$(snapshot)" = "$before" ] || fail "a symlink escape left version files half-bumped"
+[ "$(cksum <"$work/external-versions/version.json")" = "$outside_before" ] \
+    || fail "a symlink escape modified the external file"
+rm external-versions
+ln -s "$work/external-versions/version.json" external-versions
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.sources.at(-1).path = "external-versions";
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+if node "$bumpctl" apply 0.2.0 --root "$work/repo" >"$work/out-symlink-file" 2>&1; then
+    fail "apply accepted a source symlink outside the repository"
+fi
+[ -L external-versions ] || fail "apply replaced an external source symlink"
+[ "$(snapshot)" = "$before" ] || fail "an external source symlink left version files half-bumped"
+
+# --- 18b. two leading dots in a filename are not a parent directory ----------
+make_repo 0.1.8
+printf '{ "version": "0.1.8" }\n' >..version.json
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.sources.push({ path: "..version.json", kind: "json" });
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+node "$bumpctl" apply 0.2.0 --root "$work/repo" >"$work/out-dot-name" 2>&1 \
+    || { cat "$work/out-dot-name" >&2; fail "apply refused an in-repository dotted filename"; }
+node -e '
+  const fs = require("node:fs");
+  if (JSON.parse(fs.readFileSync("..version.json", "utf8")).version !== "0.2.0") process.exit(1);
+' || fail "apply did not update the in-repository dotted filename"
+
+# --- 18c. a rejected branch push must not publish the release tag -------------
+make_repo 0.1.8
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.preflight = [];
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+git commit -q -am "local release fixture without external preflight commands"
+git init -q --bare "$work/push-remote.git"
+git remote add origin "$work/push-remote.git"
+branch="$(git symbolic-ref --short HEAD)"
+git push -q origin "$branch"
+cat >"$work/push-remote.git/hooks/update" <<'SH'
+#!/bin/sh
+case "$1" in refs/heads/*) exit 1 ;; esac
+SH
+chmod +x "$work/push-remote.git/hooks/update"
+if bash "$bump" --set 0.2.0 --push >"$work/out-atomic-push" 2>&1; then
+    fail "a branch-rejecting remote accepted the release push"
+fi
+if git --git-dir="$work/push-remote.git" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    cat "$work/out-atomic-push" >&2
+    fail "the failed branch push still published the release tag"
+fi
+git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null \
+    || fail "a rejected push lost the local release tag"
+
 # --- 19. the continuous-integration wrapper runs and agrees ------------------
 # .github/scripts/check-versions.mjs resolves the repository root from its OWN
 # location, so it can only ever check this checkout. That is exactly why it is

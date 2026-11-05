@@ -1269,10 +1269,10 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
             self->m_pendingTerminalMints.remove(paneId);
 
             SplitNode* leaf = self->findTerminalLeaf(paneId);
-            // Closing a pane while its row is being minted cancels the UI
-            // operation. A later server error for that already-closed pane is
-            // stale and must not produce an error banner.
-            if (!leaf)
+            // A close or an authored replacement can supersede this mint.
+            // Once a leaf has an identity, neither an old failure nor its
+            // deadline may remove that now-usable pane.
+            if (!leaf || !leaf->terminalPaneId.isEmpty())
                 return;
             if (err || !pane || pane->id.value.isEmpty()) {
                 // Take the half-made pane back out rather than leave one that
@@ -1284,10 +1284,6 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                         : QStringLiteral("the server created this terminal without an id"));
                 return;
             }
-            // Already bound, which is what makes a mint's answer idempotent:
-            // nothing to write and nothing to publish.
-            if (!leaf->terminalPaneId.isEmpty())
-                return; // already bound; nothing to publish
             leaf->terminalPaneId = pane->id.value;
             // Republished, not quiet: the pane is waiting for exactly this
             // field before it may resolve anything, and it reads it off the
@@ -1327,7 +1323,8 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                            // out, and a deadline for a pane the user has
                            // already closed is not news. Same verdict the
                            // FAILED answer above reaches for the same case.
-                           if (!self->findTerminalLeaf(paneId))
+                           const SplitNode* leaf = self->findTerminalLeaf(paneId);
+                           if (!leaf || !leaf->terminalPaneId.isEmpty())
                                return;
                            self->abandonTerminalMint(
                                paneId,

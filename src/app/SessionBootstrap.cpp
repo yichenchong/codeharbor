@@ -143,6 +143,8 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
         // abandon it mid-flight; a connectAndWire() may not. See there.
         m_attemptIsRetry = true;
         if (!attemptWire()) {
+            if (m_cancelRequested)
+                return;
             // A prerequisite on the SERVER that the user has to change — no
             // Node.js on the far side, a Node too old to run the service, a
             // repository root nothing may be installed into, an artifact that
@@ -162,13 +164,17 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
         // The RPC client can lose the logical stream without a device EOF:
         // heartbeat expiry, a partial write, or an oversized frame all close
         // its protocol state while the SSH channel itself remains open.
-        connect(m_client, &CodeharbordClient::transportClosed, this, [this] {
-            if (m_rpcDevice && m_client
-                && m_client->transport() == m_rpcDevice) {
-                handleConnectionLost(
-                    QStringLiteral("codeharbord RPC transport closed"));
-            }
-        });
+        connect(m_client, &CodeharbordClient::transportClosed, this,
+                [this](quint64 generation) {
+                    // An earlier close observer may already have rebound this
+                    // client and wired a replacement session synchronously.
+                    if (m_rpcDevice && m_client
+                        && generation == m_client->transportGeneration()
+                        && m_client->transport() == m_rpcDevice) {
+                        handleConnectionLost(
+                            QStringLiteral("codeharbord RPC transport closed"));
+                    }
+                });
     }
 
     if (m_pool) {
@@ -961,10 +967,15 @@ void SessionBootstrap::scheduleReconnect()
     }
     if (m_maxAttempts > 0 && m_attempt >= m_maxAttempts) {
         cancelReconnect();
+        const int attempts = m_attempt;
+        QPointer<SessionBootstrap> self(this);
+        setState(State::Failed);
+        if (!self || m_state != State::Failed || m_attempt != attempts
+            || m_cancelRequested)
+            return;
         emit error(QStringLiteral("giving up on the session after %1 reconnect "
                                   "attempts")
-                       .arg(m_attempt));
-        setState(State::Failed);
+                       .arg(attempts));
         return;
     }
 
@@ -974,6 +985,11 @@ void SessionBootstrap::scheduleReconnect()
     const int delayMs = qMax<int>(
         1, static_cast<int>(std::llround(delaySeconds * 1000.0 * m_timeScale)));
     setState(State::Reconnecting);
+    // State observers can synchronously disconnect, disable the ladder, or
+    // start a different session. That newer decision owns the timer.
+    if (m_state != State::Reconnecting || !m_reconnectEnabled
+        || m_cancelRequested)
+        return;
     m_reconnectTimer->start(delayMs);
     emit reconnectScheduled(m_attempt + 1, delaySeconds);
 }
@@ -1589,13 +1605,12 @@ bool SessionBootstrap::ensureRemoteService()
                 .arg(kMinimumRemoteNodeMinor)
                 .arg(m_repoRoot));
     }
-    if (m_repoRoot.isEmpty() || m_repoRoot == QLatin1String("/")
-        || m_repoRoot.startsWith(QLatin1Char('~'))) {
-        // "~" is refused rather than expanded: every path this client sends is
-        // shell-quoted (it must be — repoRoot is user input), so an unexpanded
-        // tilde would create a directory literally named "~" and install into
-        // it. Reading such a path merely fails; WRITING to it makes a mess in
-        // the user's home.
+    if (!m_repoRoot.startsWith(QLatin1Char('/'))
+        || QDir::cleanPath(m_repoRoot) == QLatin1String("/")) {
+        // Inspecting any quoted path is harmless; installing requires an
+        // absolute directory other than the filesystem root. Check the clean
+        // path too, so "/./" and "/srv/.." cannot bypass the root refusal.
+        // Tildes are not expanded in shell-quoted paths.
         return declineInstall(
             tr("Cannot install the CodeHarbor remote service into \"%1\". Give "
                "the profile an absolute directory of its own on %2, for example "

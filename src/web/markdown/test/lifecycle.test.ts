@@ -135,3 +135,65 @@ test("a theme repaint invalidates old image work and preserves scroll position",
         dom.window.close();
     }
 });
+
+test("a non-internal source is refused before issuing a request", async () => {
+    let requests = 0;
+    const { dom, module, root } = page(async () => {
+        requests += 1;
+        return new Response("# Must not render");
+    });
+    try {
+        const host = await module.mountMarkdown(root, noImages, {
+            sourceUrl: "https://example.com/readme.md",
+            documentPath: "/docs/readme.md",
+        });
+        assert.equal(requests, 0);
+        assert.equal(root.childElementCount, 0);
+        assert.match(dom.window.document.getElementById("ch-markdown-status")!.textContent!,
+            /source address is not internal/);
+        host.dispose();
+    } finally {
+        dom.window.close();
+    }
+});
+
+test("malformed UTF-8 produces a visible error instead of replacement text", async () => {
+    const { dom, module, root } = page(async () => new Response(
+        new Uint8Array([0x23, 0x20, 0xc3, 0x28]),
+    ));
+    try {
+        const host = await module.mountMarkdown(root, noImages, options("invalid"));
+        assert.equal(root.childElementCount, 0);
+        const status = dom.window.document.getElementById("ch-markdown-status")!;
+        assert.equal(status.dataset.visible, "true");
+        assert.match(status.textContent!, /not valid UTF-8/);
+        host.dispose();
+    } finally {
+        dom.window.close();
+    }
+});
+
+test("an oversized streamed source is cancelled without publishing its prefix", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new Uint8Array(8 * 1024 * 1024));
+            controller.enqueue(new Uint8Array([0x61]));
+        },
+        cancel() {
+            cancelled = true;
+        },
+    });
+    const { dom, module, root } = page(async () => new Response(body));
+    try {
+        const host = await module.mountMarkdown(root, noImages, options("oversized"));
+        assert.equal(cancelled, true);
+        assert.equal(root.childElementCount, 0);
+        const status = dom.window.document.getElementById("ch-markdown-status")!;
+        assert.equal(status.dataset.visible, "true");
+        assert.match(status.textContent!, /too large to display/);
+        host.dispose();
+    } finally {
+        dom.window.close();
+    }
+});

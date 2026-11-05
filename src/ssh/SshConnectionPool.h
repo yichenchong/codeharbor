@@ -544,9 +544,8 @@ private:
     void setState(State next);
 #if CH_HAVE_LIBSSH
     bool verifyHostKey(const QString& host);
-    // `configIdentityFile` is the private key ~/.ssh/config or the profile
-    // named, read off the session BEFORE ssh_connect() so libssh's own
-    // unexpanded defaults are still distinguishable from a real choice.
+    // `configIdentityFile` is the expanded private key named by ~/.ssh/config
+    // or the profile for the Windows named-pipe fallback, empty for defaults.
     bool authenticate(const QString& user, const QString& configIdentityFile);
     QString authenticationFailure() const;
     void closeSession();

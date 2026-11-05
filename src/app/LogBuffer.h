@@ -99,6 +99,7 @@ private:
     static QMutex s_handlerMutex;
     static QVector<std::shared_ptr<HandlerLease>> s_handlerBuffers;
     static QtMessageHandler s_previousHandler;
+    static bool s_handlerInstalled;
 
     std::shared_ptr<HandlerLease> m_handlerLease;
     mutable QMutex m_mutex;

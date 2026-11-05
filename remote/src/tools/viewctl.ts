@@ -14,7 +14,7 @@
 // refused (the JSON on stdout carries the code and message), 2 for a usage
 // error. It never throws: a stack trace would be a worse answer than a refusal.
 
-import { pathToFileURL } from "node:url";
+import { isEntrypoint } from "./entrypoint.ts";
 
 import { CONTROL_OPS, type ControlOp } from "../control.ts";
 import { sendControlRequest } from "../control-client.ts";
@@ -128,6 +128,6 @@ export async function main(
     return 1;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isEntrypoint(import.meta.url)) {
     process.exitCode = await main();
 }

@@ -11,7 +11,7 @@ import {
     piAdapter,
     type NativeEvent,
 } from "../src/adapters/index.ts";
-import { HARNESSES } from "../src/events.ts";
+import { HARNESSES, type AgentState } from "../src/events.ts";
 import { processBridgeLine } from "../src/bridge.ts";
 import {
     createLineFramer,
@@ -32,17 +32,35 @@ const dbDir = mkdtempSync(path.join(os.tmpdir(), "codeharbord-adapters-"));
 process.env.CODEHARBOR_DB = path.join(dbDir, "codeharbor.sqlite");
 process.on("exit", () => rmSync(dbDir, { recursive: true, force: true }));
 
-test("oh-my-pi adapter maps the SPEC 6.5 table", () => {
-    assert.equal(ohMyPiAdapter.map({ type: "session_start" }), "starting");
-    assert.equal(ohMyPiAdapter.map({ type: "agent_start" }), "running");
-    assert.equal(ohMyPiAdapter.map({ type: "tool_call", tool: "ask" }), "waiting_input");
-    assert.equal(ohMyPiAdapter.map({ type: "tool_call", tool: "read" }), "running");
-    assert.equal(ohMyPiAdapter.map({ type: "tool_result", tool: "ask" }), "running");
-    assert.equal(ohMyPiAdapter.map({ type: "agent_end" }), "idle_unseen");
-    assert.equal(ohMyPiAdapter.map({ type: "settled" }), "idle_unseen");
-    assert.equal(ohMyPiAdapter.map({ type: "session_shutdown" }), "stopped");
-    assert.equal(ohMyPiAdapter.map({ type: "anything", error: true }), "error");
-    assert.equal(ohMyPiAdapter.map({ type: "unrecognized" }), null);
+test("Pi-family bridge events deliver the expected state for each harness (RI3)", () => {
+    const cases: [NativeEvent, AgentState | null][] = [
+        [{ type: "session_start" }, "starting"],
+        [{ type: "agent_start" }, "running"],
+        [{ type: "tool_call", tool: "ask" }, "waiting_input"],
+        [{ type: "tool_call", tool: "read" }, "running"],
+        [{ type: "tool_result", tool: "ask" }, "running"],
+        [{ type: "tool_result", tool: "read" }, null],
+        [{ type: "agent_end" }, "idle_unseen"],
+        [{ type: "settled" }, "idle_unseen"],
+        [{ type: "session_shutdown" }, "stopped"],
+        [{ type: "error" }, "error"],
+        [{ type: "session_start", error: true }, "error"],
+        [{ type: "unrecognized" }, null],
+        [{}, null],
+    ];
+    for (const harness of ["pi", "oh-my-pi"]) {
+        for (const [native, state] of cases) {
+            const event = processBridgeLine(JSON.stringify({
+                harness, native, devSessionId: "s", terminalId: "t",
+            }));
+            const context = `${harness}: ${JSON.stringify(native)}`;
+            assert.equal(event?.state ?? null, state, context);
+            if (event) {
+                assert.equal(event.harness, harness, context);
+                assert.deepEqual(event.metadata, native.tool ? { tool: native.tool } : undefined);
+            }
+        }
+    }
 });
 
 test("registry resolves known harnesses and skips generic", () => {
@@ -294,45 +312,6 @@ test("Claude URL elicitation notifications request user input (BH26-BRIDGE-05)",
     assert.equal(event?.state, "waiting_input");
 });
 
-// pi.ts and oh-my-pi.ts used to be byte-for-byte copies of one mapping, kept in
-// step by hand and by this test. They now SHARE the mapping (adapters/
-// pi-family.ts) and differ only in harness identity, so the strongest form of
-// this assertion is available: same function, not merely same answers.
-test("pi and oh-my-pi share one mapping rather than a copy of it", () => {
-    assert.equal(piAdapter.map, ohMyPiAdapter.map);
-    assert.equal(piAdapter.metadata, ohMyPiAdapter.metadata);
-    assert.equal(piAdapter.harness, "pi");
-    assert.equal(ohMyPiAdapter.harness, "oh-my-pi");
-    // The behaviour that identity now guarantees, still spelled out once so a
-    // future split cannot quietly drop a case.
-    const natives: NativeEvent[] = [
-        { type: "session_start" },
-        { type: "agent_start" },
-        { type: "tool_call", tool: "ask" },
-        { type: "tool_call", tool: "read" },
-        { type: "tool_result", tool: "ask" },
-        { type: "tool_result", tool: "read" },
-        { type: "agent_end" },
-        { type: "settled" },
-        { type: "session_shutdown" },
-        { type: "error" },
-        { type: "session_start", error: true },
-        { type: "unrecognized" },
-        {},
-    ];
-    for (const native of natives) {
-        assert.equal(
-            piAdapter.map(native),
-            ohMyPiAdapter.map(native),
-            `pi and oh-my-pi disagree on ${JSON.stringify(native)}`,
-        );
-        assert.deepEqual(
-            piAdapter.metadata?.(native),
-            ohMyPiAdapter.metadata?.(native),
-            `pi and oh-my-pi metadata disagree on ${JSON.stringify(native)}`,
-        );
-    }
-});
 
 // AG-N3. A shutdown is a terminal, observed fact: the session is over and
 // nothing more will arrive for this terminal. The error flag describes an agent

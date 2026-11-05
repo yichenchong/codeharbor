@@ -73,7 +73,8 @@ test("renders the supported GitHub-style Markdown structures", () => {
     );
 
     // Both task-list states render, and only the ticked one is checked.
-    const boxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    const accessibleRoot = parse(window, rewriteRelativeUrls(html, "/docs/readme.md", window.document));
+    const boxes = Array.from(accessibleRoot.querySelectorAll('input[type="checkbox"]'));
     assert.equal(boxes.length, 2);
     assert.deepEqual(
         boxes.map((box) => (box as HTMLInputElement).checked),
@@ -101,6 +102,31 @@ test("renders the supported GitHub-style Markdown structures", () => {
     // rewrite, not the renderer, is what moves them into the file namespace.
     assert.equal(root.querySelector("a")?.getAttribute("href"), "notes.md");
     assert.equal(root.querySelector("img")?.getAttribute("src"), "images/logo.png");
+});
+
+test("task checkbox names match decoded text and literal inline code", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const html = renderMarkdown(
+        "- [ ] Buy &amp; compare **A & B**\n"
+        + "- [x] Code `&amp;` and `a < b`\n"
+        + "- [ ] Quotes &quot;Hi&quot; and &#x1f41f;\n"
+        + "  - [ ] Nested &lt;task&gt;\n"
+        + "- [ ] ![Deploy](deploy.png)\n"
+        + "- [ ] Review ![A &amp; B](review.png) today\n",
+        sanitizerFor(window),
+    );
+    const root = parse(window, rewriteRelativeUrls(html, "/docs/readme.md", window.document));
+    const boxes = Array.from(root.querySelectorAll('input[type="checkbox"]'));
+    assert.deepEqual(boxes.map((box) => box.getAttribute("aria-label")), [
+        "Buy & compare A & B",
+        "Code &amp; and a < b",
+        'Quotes "Hi" and 🐟',
+        "Nested <task>",
+        "Deploy",
+        "Review A & B today",
+    ]);
+    dom.window.close();
 });
 
 test("sanitises executable and embedding markup without losing surrounding text", () => {
@@ -281,13 +307,6 @@ test("an <input type=image> cannot fetch a URL from the privileged page", () => 
     );
     assert.doesNotMatch(rewritten, /src=/i);
     assert.doesNotMatch(rewritten, /evil\.example/i);
-    // The task-list checkbox the renderer itself emits is untouched: it keeps
-    // its checked/disabled state and its accessible name, and gains no src.
-    const checklist = renderMarkdown("- [x] done", sanitizerFor(window));
-    assert.match(
-        checklist,
-        /<input type="checkbox" checked="" disabled="" aria-label="done">/,
-    );
 });
 
 test("attributes that fetch or redirect on the document's behalf are removed", () => {

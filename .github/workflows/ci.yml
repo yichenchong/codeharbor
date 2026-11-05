@@ -852,6 +852,15 @@ jobs:
           probe="$RUNNER_TEMP/probe.aab"
           mkdir -p "$RUNNER_TEMP/bundle/base/manifest"
           echo probe > "$RUNNER_TEMP/bundle/base/manifest/AndroidManifest.xml"
+          # A real bundle has a long listing, with jarsigner's META-INF
+          # signatures near the beginning. Keep this larger than a pipe buffer
+          # so an early-exiting signature grep cannot hide a SIGPIPE failure
+          # behind a passing tiny synthetic bundle.
+          i=0
+          while [ "$i" -lt 2000 ]; do
+            printf 'probe\n' >"$RUNNER_TEMP/bundle/base/probe-entry-$i.txt"
+            i=$((i + 1))
+          done
           (cd "$RUNNER_TEMP/bundle" && zip -qr "$probe" base)
           .github/scripts/sign-android.sh "$ks" ci 28 "$probe"
 

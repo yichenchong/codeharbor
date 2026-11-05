@@ -23,12 +23,14 @@ QJsonObject readParams(const QString& path)
 // file.readFile params. ALWAYS a bounded byte window: see
 // EditorController::kMaxEditableReadBytes for why an unbounded read is both a
 // memory hazard on the server and unable to report that it hit a limit.
-QJsonObject readFileParams(const QString& path)
+QJsonObject readFileParams(
+    const QString& path, int length = EditorController::kMaxEditableReadBytes,
+    qint64 offset = 0)
 {
     return QJsonObject{
         {QStringLiteral("path"), path},
-        {QStringLiteral("offset"), 0},
-        {QStringLiteral("length"), EditorController::kMaxEditableReadBytes}};
+        {QStringLiteral("offset"), offset},
+        {QStringLiteral("length"), length}};
 }
 
 QJsonObject writeParams(const QString& path, const QString& content,
@@ -226,8 +228,12 @@ void EditorController::subscribeWatch()
         });
 }
 
-void EditorController::onTransportClosed()
+void EditorController::onTransportClosed(quint64 generation)
 {
+    // An earlier signal handler can already have rebound the client. This EOF
+    // then belongs to the retired transport, not the replacement's watcher.
+    if (m_client && generation != m_client->transportGeneration())
+        return;
     // That codeharbord is unreachable for good, and its subscription registry
     // died with the process (remote/src/files.ts). Forget the id in silence: an
     // unwatch issued later would be addressed to the REPLACEMENT server, which
@@ -757,6 +763,102 @@ void EditorController::open(QString path)
                    });
 }
 
+void EditorController::readRecoverySnapshot(
+    QString path, quint64 generation, quint64 recoveryGeneration,
+    QByteArray bytes, QString revision,
+    std::function<void(QString, QString)> then)
+{
+    // A 2 MiB range needs at most 12 MiB with arbitrary JSON control-byte
+    // escaping, or under 3 MiB as base64, below the 15 MiB result ceiling.
+    constexpr int chunkBytes = 2 * 1024 * 1024;
+    if (!m_client) {
+        then({}, {});
+        return;
+    }
+    const qsizetype offset = bytes.size();
+    const QJsonObject params = readFileParams(path, chunkBytes, offset);
+    QPointer<EditorController> self(this);
+    m_client->call(
+        QString::fromLatin1(rpc::kMethodReadFile),
+        params,
+        [self, path = std::move(path), generation, recoveryGeneration, offset,
+         bytes = std::move(bytes), revision = std::move(revision),
+         then = std::move(then)](
+            QJsonValue result, std::optional<RpcError> error) mutable {
+            if (!self)
+                return;
+            if (recoveryGeneration != self->m_recoveryGeneration)
+                return;
+            if (generation != self->m_loadGeneration || error.has_value()) {
+                then({}, {});
+                return;
+            }
+            const QJsonObject obj = result.toObject();
+            const QString currentRevision = obj.value(QStringLiteral("revision")).toString();
+            const QJsonValue truncated = obj.value(QStringLiteral("truncated"));
+            const QJsonValue content = obj.value(QStringLiteral("content"));
+            const QString encoding = obj.value(QStringLiteral("encoding")).toString();
+            if (currentRevision.isEmpty() || !truncated.isBool() || !content.isString()
+                || (!revision.isEmpty() && revision != currentRevision)) {
+                then({}, {});
+                return;
+            }
+            QByteArray chunk;
+            if (encoding == QLatin1String("utf-8")) {
+                chunk = content.toString().toUtf8();
+            } else if (encoding == QLatin1String("base64")) {
+                const auto decoded = QByteArray::fromBase64Encoding(
+                    content.toString().toUtf8(),
+                    QByteArray::Base64Encoding | QByteArray::AbortOnBase64DecodingErrors);
+                if (!decoded) {
+                    then({}, {});
+                    return;
+                }
+                chunk = *decoded;
+            } else {
+                then({}, {});
+                return;
+            }
+            if (chunk.size() > chunkBytes
+                || bytes.size() + chunk.size() > kMaxRecoveryReadBytes
+                || (offset == 0 && truncated.toBool() && chunk.size() < chunkBytes)
+                || (offset > 0 && !truncated.toBool())) {
+                then({}, {});
+                return;
+            }
+            bytes.append(chunk);
+            if (offset == 0 && !truncated.toBool()) {
+                then(QString::fromUtf8(bytes), currentRevision);
+                return;
+            }
+            if (chunk.size() == chunkBytes && bytes.size() < kMaxRecoveryReadBytes) {
+                self->readRecoverySnapshot(
+                    path, generation, recoveryGeneration, std::move(bytes),
+                    currentRevision, std::move(then));
+                return;
+            }
+            // Offset ranges always report truncated=true, even the last one.
+            // A final stat proves completeness and detects mutation DURING the
+            // last range, whose token describes its pre-read stat.
+            self->m_client->call(
+                QString::fromLatin1(rpc::kMethodStat), readParams(path),
+                [self, generation, recoveryGeneration, bytes = std::move(bytes),
+                 currentRevision, then = std::move(then)](
+                    QJsonValue statResult, std::optional<RpcError> statError) {
+                    if (!self || recoveryGeneration != self->m_recoveryGeneration)
+                        return;
+                    const QJsonObject stat = statResult.toObject();
+                    if (statError.has_value() || generation != self->m_loadGeneration
+                        || stat.value(QStringLiteral("revision")).toString() != currentRevision
+                        || stat.value(QStringLiteral("size")).toInteger(-1) != bytes.size()) {
+                        then({}, {});
+                        return;
+                    }
+                    then(QString::fromUtf8(bytes), currentRevision);
+                });
+        });
+}
+
 void EditorController::checkRecovery(const QString& loadedContent, quint64 generation)
 {
     if (!m_client)
@@ -765,7 +867,7 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
     if (recoveryPath.isEmpty())
         return;  // no stable pane id / data location: recovery disabled
     // A permission-refresh callback can arrive after setRecoveryDir() already
-    // started this same probe. Keep the stat/read pair as one logical operation
+    // started this same probe. Keep the stat/range reads as one logical operation
     // so that callback cannot issue a duplicate stat.
     if (m_recoveryCheckInFlight)
         return;
@@ -773,6 +875,8 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
     // Where this pane's slot stood when the probe started; see the check in the
     // read reply below.
     const quint64 slotSerial = m_recoverySlotSerial;
+    const quint64 editSerial = m_editSerial;
+    const QString baselineRevision = m_revision;
     m_recoveryCheckInFlight = true;
 
     QPointer<EditorController> self(this);
@@ -780,8 +884,8 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), readParams(recoveryPath),
         [self, recoveryPath, loadedContent, generation, recoveryGeneration,
-         slotSerial](
-            QJsonValue statRes, std::optional<RpcError> statErr) {
+         slotSerial, editSerial, baselineRevision](
+            QJsonValue statResult, std::optional<RpcError> statErr) {
             if (!self)
                 return;
             // A key change reset the guard for the new slot; this old reply
@@ -798,59 +902,42 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                 self->m_recoveryCheckInFlight = false;
                 return;
             }
-            const QString snapshotRevision =
-                statRes.toObject().value(QStringLiteral("revision")).toString();
-            self->m_client->call(
-                QString::fromLatin1(rpc::kMethodReadFile),
-                readFileParams(recoveryPath),
-                [self, snapshotRevision, loadedContent, generation,
-                 recoveryGeneration, slotSerial](
-                    QJsonValue readRes, std::optional<RpcError> readErr) {
+            QByteArray bytes;
+            const qint64 size = statResult.toObject().value(QStringLiteral("size")).toInteger(-1);
+            if (size > kMaxRecoveryReadBytes) {
+                self->m_recoveryCheckInFlight = false;
+                return;
+            }
+            if (size > 0)
+                bytes.reserve(size);
+            self->readRecoverySnapshot(
+                recoveryPath, generation, recoveryGeneration, std::move(bytes), {},
+                [self, loadedContent, generation, recoveryGeneration, slotSerial,
+                 editSerial, baselineRevision](
+                    QString payload, QString snapshotRevision) {
                     if (!self)
                         return;
                     if (recoveryGeneration != self->m_recoveryGeneration)
                         return;
                     self->m_recoveryCheckInFlight = false;
-                    if (readErr.has_value()
+                    if (snapshotRevision.isEmpty()
                         || generation != self->m_loadGeneration)
                         return;
-                    const QJsonObject snapshot = readRes.toObject();
-                    // A snapshot write, its retry, or a truncate has installed a
-                    // newer revision for this slot since the probe started, so
-                    // this stat's revision — and the "does the slot hold
-                    // content" verdict below — describe the slot as it was
-                    // BEFORE that write. Adopting either would guard the next
-                    // write with a revision the server has already replaced, and
-                    // a REFUSED truncate leaves a stale snapshot standing behind
-                    // a successful save: the next open then offers to restore
-                    // text that save already superseded.
+                    // A snapshot write, retry, or truncate installed newer slot
+                    // state while this probe was in flight. Do not roll that
+                    // bookkeeping back to the bytes this read observed.
                     const bool slotUntouched =
                         slotSerial == self->m_recoverySlotSerial;
-                    // Otherwise adopt the snapshot's revision, so the next write
-                    // to this pane's slot is a guarded overwrite even when
-                    // nothing below is offered.
+                    // Use the read's revision, not the preceding stat's: the
+                    // slot may have changed between those two round trips.
                     if (slotUntouched)
                         self->m_recoveryRevision = snapshotRevision;
-                    // The snapshot is read through the same wire shape as any
-                    // other file, so it is decoded the same way (open() and
-                    // reload() both do): the daemon sends base64 for bytes its
-                    // strict UTF-8 decoder refused, and reading that payload as
-                    // if it were the text would hand parseRecovery() a wall of
-                    // base64 and silently discard the user's unsaved work.
-                    //
-                    // A snapshot over kMaxEditableReadBytes came back a prefix,
-                    // so its envelope will not parse; a tombstone (empty) does
-                    // not parse either, and neither does an undecodable
-                    // payload. All three fold into "nothing to offer".
-                    const std::optional<QString> payload =
-                        rpc::decodeFileContent(snapshot);
+                    // Decode only after assembling bytes: a base64 range may
+                    // end in the middle of a UTF-8 codepoint.
                     QString snapshotPath;
                     QString recovered;
                     const bool parsed =
-                        payload.has_value()
-                        && snapshot.value(QStringLiteral("truncated")).isBool()
-                        && !snapshot.value(QStringLiteral("truncated")).toBool()
-                        && parseRecovery(*payload, snapshotPath, recovered);
+                        parseRecovery(payload, snapshotPath, recovered);
                     // This pane's single slot is REUSED as it switches files,
                     // so a snapshot the envelope records against a different
                     // path is this pane's snapshot of a PREVIOUS file and must
@@ -859,7 +946,20 @@ void EditorController::checkRecovery(const QString& loadedContent, quint64 gener
                         parsed && snapshotPath == self->m_path;
                     if (slotUntouched)
                         self->m_recoveryHasContent = belongsHere;
-                    if (belongsHere && recovered != loadedContent)
+                    // A save can finish before the probe discovers the old
+                    // snapshot. Its earlier clear then saw an empty slot; retire
+                    // the snapshot now rather than offering it on the next open.
+                    if (slotUntouched && belongsHere && !self->m_dirty
+                        && !self->m_saveInFlight
+                        && self->m_revision != baselineRevision)
+                        self->clearRecovery();
+                    // A probe may finish after new edits or a save. Its bytes
+                    // must not be offered over work that superseded the probe.
+                    if (belongsHere && slotUntouched && !self->m_dirty
+                        && !self->m_saveInFlight && !self->m_readOnly
+                        && self->m_editSerial == editSerial
+                        && self->m_revision == baselineRevision
+                        && recovered != loadedContent)
                         emit self->recoveryAvailable(recovered);
                 });
         });
@@ -1415,10 +1515,6 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             QJsonValue result, std::optional<RpcError> error) {
             if (!self || generation != self->m_loadGeneration)
                 return;
-            if (error.has_value()) {
-                self->setFileState(FileState::Error);
-                return;
-            }
             // A save is in flight. Its bytes are the user's, they are not on
             // the server yet, and only its own reply can decide this file's
             // next state — exactly the rule reconcileAfterReconnect() applies
@@ -1429,7 +1525,7 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             // refused as a conflict, and the only copy of the edits is gone).
             // Checked FIRST so the pane keeps reporting the write it is waiting
             // on rather than being flagged over bytes that write is carrying.
-            if (!discardLocalEdits && self->m_fileState == FileState::Saving)
+            if (!discardLocalEdits && self->m_saveInFlight)
                 return;
             // A save SETTLED while this read was in flight. The server's bytes
             // are then this pane's own bytes, and this reply describes a world
@@ -1462,6 +1558,10 @@ void EditorController::reload(FileState transitional, bool discardLocalEdits)
             if (!discardLocalEdits && self->m_dirty) {
                 if (self->m_fileState != FileState::Conflict)
                     self->setFileState(FileState::ExternallyModified);
+                return;
+            }
+            if (error.has_value()) {
+                self->setFileState(FileState::Error);
                 return;
             }
             const QJsonObject obj = result.toObject();

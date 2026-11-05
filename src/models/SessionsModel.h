@@ -130,6 +130,9 @@ private:
     QVector<GroupRow> groups_;
     bool pinnedOnly_ = false;
     bool showArchived_ = false;
+    // A synchronous signal handler can reset/refilter this model. Pending row
+    // notifications then name indices from an obsolete structure.
+    quint64 resetSerial_ = 0;
 };
 
 } // namespace ch

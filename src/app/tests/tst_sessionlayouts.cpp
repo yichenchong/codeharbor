@@ -205,6 +205,8 @@ private slots:
     void splittingAtTheDepthLimitPreservesTheLayout();
     void aFailedTerminalMintReportsAndTakesTheHalfMadePaneBack();
     void aClosedTerminalMintFailureIsSilent();
+    void aSupersededTerminalMintCannotRemoveABoundPane_data();
+    void aSupersededTerminalMintCannotRemoveABoundPane();
     void aPaneCreatedAfterOneWithTheSameLabelWasClosedGetsItsOwnRow();
     void closingTheOnlyChildOfAOneChildSplitLeavesNoBlankSlot();
     void aTerminalMintThatIsNeverAnsweredStopsBlockingTheRegion();
@@ -2402,6 +2404,60 @@ void TstSessionLayouts::aClosedTerminalMintFailureIsSilent()
     QCoreApplication::processEvents(QEventLoop::AllEvents);
     QCOMPARE(errorSpy.count(), 0);
     QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stored));
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::aSupersededTerminalMintCannotRemoveABoundPane_data()
+{
+    QTest::addColumn<bool>("deadline");
+    QTest::newRow("failed-answer") << false;
+    QTest::newRow("deadline") << true;
+}
+
+void TstSessionLayouts::aSupersededTerminalMintCannotRemoveABoundPane()
+{
+    QFETCH(bool, deadline);
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    layouts.setTerminalMintTimeoutMs(deadline ? 1000 : 0);
+    const QJsonObject stored =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(stored));
+
+    QSignalSpy errors(&layouts, &SessionLayouts::error);
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"),
+                               QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")),
+             QStringLiteral("terminal-2"));
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+
+    // An authored snapshot replaces the pending slot with a real server row
+    // before the original mint has answered. Its identity is now authoritative.
+    const QJsonObject replacement = split(
+        QStringLiteral("horizontal"),
+        {stored, terminalLeaf(QStringLiteral("terminal-2"),
+                              QStringLiteral("already-existing-row"))},
+        {1, 1});
+    layouts.saveTree(QStringLiteral("terminal"), replacement.toVariantMap());
+    const QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(write.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject(), replacement);
+    respondResult(write.value(QStringLiteral("id")).toInt(), layoutRow(replacement));
+    if (deadline) {
+        QTest::qWait(1200);
+    } else {
+        respondError(mint.value(QStringLiteral("id")).toInt(), -32000,
+                     QStringLiteral("superseded terminal create failed"));
+        QCoreApplication::processEvents(QEventLoop::AllEvents);
+    }
+    QCOMPARE(asObject(layouts.terminalTree()), replacement);
+    QCOMPARE(errors.count(), 0);
     QVERIFY(noMoreRequests());
 }
 

@@ -376,22 +376,122 @@ test("a line past the byte bound is refused rather than buffered", async () => {
     }
 });
 
+test("a control payload exactly at the byte limit round-trips", async () => {
+    const h: Harness = await harness({
+        emit(command) {
+            h.listener.settle({ commandId: command.commandId, ok: true });
+            return true;
+        },
+    });
+    try {
+        const args = { padding: "" };
+        const request = {
+            version: CH_CONTROL_VERSION,
+            devSessionId: h.env.OMP_DEV_SESSION_ID,
+            terminalId: h.env.OMP_TERMINAL_ID,
+            op: "open",
+            args,
+        };
+        args.padding = "x".repeat(MAX_CONTROL_LINE_BYTES - Buffer.byteLength(JSON.stringify(request)));
+        assert.equal(Buffer.byteLength(JSON.stringify(request)), MAX_CONTROL_LINE_BYTES);
+        const response = await sendControlRequest("open", args, h.env);
+        assert.equal(response.ok, true, response.error?.message);
+        assert.equal(h.relayed.length, 1);
+        assert.equal(h.relayed[0].args.padding, args.padding);
+    } finally {
+        h.dispose();
+    }
+});
+
+test("a producer can half-close its request and still receive the desktop answer", { timeout: 2000 }, async () => {
+    const h = await harness();
+    const socket = net.createConnection(h.listener.socketPath);
+    socket.setEncoding("utf8");
+    let response = "";
+    socket.on("data", (chunk: string) => { response += chunk; });
+    try {
+        await eventOnce(socket, "connect");
+        const closed = eventOnce(socket, "close");
+        socket.end(`${JSON.stringify({ devSessionId: "d", terminalId: "t", op: "list" })}\n`);
+        const command = await h.command(1);
+        await once();
+        assert.equal(h.listener.pendingCount(), 1, "FIN must not cancel an accepted command");
+        h.listener.settle({ commandId: command.commandId, ok: true, data: { panes: [] } });
+        await closed;
+        assert.deepEqual(JSON.parse(response), { version: CH_CONTROL_VERSION, ok: true, data: { panes: [] } });
+        assert.equal(h.listener.pendingCount(), 0);
+    } finally {
+        socket.destroy();
+        h.dispose();
+    }
+});
+
+test("a producer ending an incomplete request is disconnected without reserving a slot", { timeout: 2000 }, async () => {
+    const h = await harness();
+    const socket = net.createConnection(h.listener.socketPath);
+    socket.resume();
+    try {
+        await eventOnce(socket, "connect");
+        const closed = eventOnce(socket, "close");
+        socket.end("{");
+        await closed;
+        assert.equal(h.listener.pendingCount(), 0);
+        assert.equal(h.relayed.length, 0);
+    } finally {
+        socket.destroy();
+        h.dispose();
+    }
+});
+
+test("an oversized desktop answer becomes a bounded actionable refusal", async () => {
+    const h = await harness();
+    try {
+        const pending = sendControlRequest("list", {}, h.env);
+        const command = await h.command(1);
+        h.listener.settle({
+            commandId: command.commandId,
+            ok: true,
+            data: { panes: [{ url: "x".repeat(MAX_CONTROL_LINE_BYTES) }] },
+        });
+        const response = await pending;
+        assert.equal(response.ok, false);
+        assert.equal(response.error?.code, "failed");
+        assert.match(response.error?.message ?? "", /operation may already have completed/);
+        assert.ok(Buffer.byteLength(JSON.stringify(response)) <= MAX_CONTROL_LINE_BYTES);
+        assert.equal(h.listener.pendingCount(), 0);
+        const next = sendControlRequest("list", {}, h.env);
+        const nextCommand = await h.command(2);
+        h.listener.settle({ commandId: nextCommand.commandId, ok: true });
+        assert.equal((await next).ok, true);
+    } finally {
+        h.dispose();
+    }
+});
+
 test("a later packet on one socket cannot dispatch a second command", async () => {
     const h = await harness();
     const socket = net.createConnection(h.listener.socketPath);
-    socket.on("error", () => {});
-    socket.resume();
+    socket.setEncoding("utf8");
+    let response = "";
+    socket.on("data", (chunk: string) => { response += chunk; });
     try {
         await eventOnce(socket, "connect");
         const line = `${JSON.stringify({ devSessionId: "d", terminalId: "t", op: "split" })}\n`;
         socket.write(line);
-        await h.command(1);
+        const command = await h.command(1);
         assert.equal(h.listener.pendingCount(), 1);
         const closed = eventOnce(socket, "close");
-        // FIN follows the second packet, so close proves the server consumed
-        // that packet rather than merely not having scheduled its read yet.
+        // Another request in a later packet must not replace the pending one.
         socket.end(line);
+        await once();
+        h.listener.settle({ commandId: command.commandId, ok: true, data: { paneId: "first-pane" } });
+        assert.equal(h.listener.pendingCount(), 0);
         await closed;
+        assert.deepEqual(JSON.parse(response), {
+            version: CH_CONTROL_VERSION,
+            ok: true,
+            data: { paneId: "first-pane" },
+        });
         assert.equal(h.relayed.length, 1);
     } finally {
         socket.destroy();

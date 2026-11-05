@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "MobileTerminalSession.h"
 #include "MobileTerminalView.h"
@@ -137,6 +138,7 @@ private slots:
     void singleRowDamageDoesNotDirtyTheWholeGrid();
     void aScrolledBackViewStaysPinnedWhileOutputArrives();
     void theCursorIsFilledOnlyWhileThePaneOwnsTheKeyboard();
+    void aFocusedCursorNeverRevealsConcealedText();
 };
 
 // The flow-control round trip ch::TerminalBridge used to carry through the page.
@@ -397,6 +399,12 @@ void TstMobileTerminal::aSwipeScrollsAnAttachedTmuxThroughWheelReports()
     QVERIFY(session.sendMouseWheel(10000, 1, 1));
     QCOMPARE(channel.written().size(),
              MobileTerminalSession::kMaxWheelNotchesPerGesture * 6);
+
+    channel.clearWritten();
+    QVERIFY(session.sendMouseWheel(std::numeric_limits<int>::min(), 1, 1));
+    QCOMPARE(channel.written(),
+             QByteArray("\x1b[Ma!!").repeated(
+                 MobileTerminalSession::kMaxWheelNotchesPerGesture));
 
     // When tmux detaches and the shell is back on the primary screen, reporting
     // stops and the local scrollback - which is real there - takes over again.
@@ -715,6 +723,31 @@ void TstMobileTerminal::theCursorIsFilledOnlyWhileThePaneOwnsTheKeyboard()
     // And a repeated report is not a change: it must not queue a repaint.
     view.setCursorFocused(false);
     QVERIFY(view.pendingDamagedRows().isEmpty());
+}
+
+void TstMobileTerminal::aFocusedCursorNeverRevealsConcealedText()
+{
+    MobileTerminalView view;
+    QFont font;
+    font.setFamily(QStringLiteral("monospace"));
+    font.setPixelSize(16);
+    view.setFont(font);
+    view.setSize(QSizeF(view.cellWidth() * 20.0, view.lineHeight() * 4.0));
+    view.setCursorFocused(true);
+
+    VtScreen screen;
+    screen.resize(20, 4);
+    view.setScreen(&screen);
+    const QImage blank = paintOnce(view);
+
+    // SGR 8 conceals the glyph. Moving back over it must not reveal it through
+    // the cursor's otherwise independent glyph-redraw path.
+    screen.write(QByteArray("\x1b[8mW\x1b[0m\r"));
+    QCOMPARE(paintOnce(view), blank);
+
+    // The comparison is sensitive to the glyph, not merely to a failed draw.
+    screen.write(QByteArray("W\r"));
+    QVERIFY(paintOnce(view) != blank);
 }
 
 QTEST_MAIN(TstMobileTerminal)

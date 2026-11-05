@@ -71,7 +71,9 @@ there is no `npm install` and no `node_modules`. You get `dist/`, `sql/` and
 
 You can also skip this step entirely: point a profile's **Repository root** at a
 directory that does not exist yet and the client installs the matching release
-there on the first connect.
+there on the first connect. Automatic installation requires an absolute,
+dedicated directory, such as `/home/you/codeharbor`, never `/` or a path that
+reduces to it. Relative paths are not installation targets.
 
 ### Updating the server
 
@@ -156,6 +158,12 @@ the server account password. Choose **Use password** to authenticate with the
 server password instead. Neither secret is stored. The first connection shows
 the host's fingerprint and refuses to continue until you accept it — an unknown
 key is never trusted silently.
+
+CodeHarbor explicitly reads the current user's `~/.ssh/config`; the saved
+profile's user and port take precedence. A missing user config does not enable
+implicit parsing of `/etc/ssh/ssh_config`. On Windows, a configured `IdentityFile`
+also works with the named-pipe agent fallback, including libssh's `~` and `%`
+path expansion.
 
 **Diagnose an SSH failure:** open **Server…** in the sessions sidebar and read the connection error
 banner. It reports whether `SSH_AUTH_SOCK` reached the CodeHarbor process,
@@ -386,10 +394,11 @@ remote-confirmed resize / reconnect), workspace CRUD + persistence, remote viewe
 remote editing, and agent awareness driven by the real hook each have a gate that
 exercises the real thing.
 
-Those gates are QTest targets labelled `live`; they **QSKIP** unless `CH_LIVE_SSH`
-is set, so `ctest --preset dev` stays portable. To run them you need a reachable SSH
-server, `tmux`, and Node on the remote side — see
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+Those gates are QTest targets labelled `live`. SSH-backed cases **QSKIP** unless
+`CH_LIVE_SSH` is set; local WebEngine probes still run when the machine supports
+them. A portable run without SSH therefore does not prove the remote paths.
+To enable those paths, use an isolated SSH fixture with `tmux` and Node on the
+remote side — see [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 Exercising real paths has repeatedly paid for itself. It exposed a missing transport
 spine (nothing carried RPC over SSH), QML that could not load at all, split panes
@@ -400,12 +409,11 @@ worst — two ways an attacker's SSH host key could be accepted: one where unkno
 were trusted silently, and one where presenting a different key ALGORITHM downgraded
 a hard refusal into a friendly "trust this new host?" prompt.
 
-The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, and the gap
-list beside it is deliberately honest about what is still missing: no UI for renaming
-a group (group deletion is wired and confirmed, including its session-count warning);
-reconnect cannot prompt for a newly-unknown host key; and a connect briefly blocks
-the GUI thread. Crash-recovery snapshots now offer an explicit Restore or Discard
-choice when the file is reopened.
+The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, along with
+the remaining gaps: reconnect cannot prompt for a newly-unknown host key, and a
+connect briefly blocks the GUI thread. Groups can be renamed from their sidebar
+context menu or with F2 while the group is selected. Crash-recovery snapshots
+offer an explicit Restore or Discard choice when the file is reopened.
 
 **Building requires Node** — the Monaco, xterm.js and Markdown bundles are build
 artifacts embedded as Qt resources, and CMake builds them at configure time (it

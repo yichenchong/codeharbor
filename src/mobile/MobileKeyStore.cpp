@@ -14,6 +14,8 @@
 #include <QVariantList>
 
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <utility>
 
 namespace ch {
@@ -312,11 +314,27 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
         if (!readWireString(blob, offset, cipher)
             || !readWireString(blob, offset, kdfName)
             || !readWireString(blob, offset, kdfOptions)
-            || !readWireUint32(blob, offset, keyCount) || keyCount < 1
+            || !readWireUint32(blob, offset, keyCount) || keyCount != 1
             || !readWireString(blob, offset, publicBlob)) {
             out.error = tr("The OpenSSH key container is malformed, so the file "
                            "was altered or truncated. Copy it again without "
                            "reformatting.");
+            return out;
+        }
+        // OpenSSH appends AEAD authentication data outside the private string's
+        // declared length (sshkey_private_to_blob2 / cipher_authlen).
+        const quint32 authenticationBytes =
+            cipher == QByteArrayLiteral("aes128-gcm@openssh.com")
+                    || cipher == QByteArrayLiteral("aes256-gcm@openssh.com")
+                    || cipher == QByteArrayLiteral("chacha20-poly1305@openssh.com")
+                ? 16 : 0;
+        quint32 privateLength = 0;
+        if (!readWireUint32(blob, offset, privateLength) || privateLength == 0
+            || quint64(privateLength) + authenticationBytes
+                != quint64(blob.size() - offset)) {
+            out.error = tr("The OpenSSH key container has no complete private "
+                           "key section, so the file was altered or truncated. "
+                           "Copy the whole key again.");
             return out;
         }
         qsizetype publicOffset = 0;
@@ -415,6 +433,11 @@ MobileKeyStore::~MobileKeyStore()
 
 void MobileKeyStore::setConnectionPool(SshConnectionPool* pool)
 {
+    if (m_pool == pool)
+        return;
+    if (m_pool)
+        m_pool->clearInMemoryIdentity();
+    m_installedIdentityName.clear();
     m_pool = pool;
 }
 
@@ -821,12 +844,25 @@ bool MobileKeyStore::deleteSavedKeyFile(const QString& name)
     // path built from a name is the one thing in this class that must never be
     // done without it.
     const QString path = savedKeyPath(name);
-    const bool removed = !path.isEmpty() && QFile::remove(path);
-    // Dropped from the list whatever the unlink did. A name whose file could not
-    // be removed is not a credential this store should keep offering, and the next
-    // launch's directory scan is the authority on what is actually there.
+    if (path.isEmpty())
+        return false;
+    if (!QFile::remove(path)) {
+        // exists() also returns false when the parent cannot be searched.
+        // Only a confirmed missing entry, not an access/IO error, is success.
+#ifdef Q_OS_WIN
+        const std::filesystem::path nativePath(path.toStdWString());
+#else
+        const std::filesystem::path nativePath(QFile::encodeName(path).constData());
+#endif
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(nativePath, error);
+        if (status.type() != std::filesystem::file_type::not_found
+            || (error && error != std::errc::no_such_file_or_directory)) {
+            return false;
+        }
+    }
     m_savedNames.removeAll(name);
-    return removed;
+    return true;
 }
 
 bool MobileKeyStore::forgetSavedKey(QString name)
@@ -862,7 +898,6 @@ bool MobileKeyStore::forgetSavedKey(QString name)
                         "this device.")
                          .arg(name));
         emit keyNamesChanged();
-        emit keyRemoved(name);
         return false;
     }
     setLastError(QString());
@@ -928,7 +963,6 @@ bool MobileKeyStore::removeKey(QString name)
                         "this device.")
                          .arg(name));
         emit keyNamesChanged();
-        emit keyRemoved(name);
         return false;
     }
     setLastError(QString());

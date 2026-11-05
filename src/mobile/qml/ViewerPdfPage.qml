@@ -1,13 +1,14 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Pdf
+import QtQuick.Shapes
 
 // Native PDF viewer (mobile SPEC 7.5).
 //
 // GATED TWICE, and both gates are load-bearing:
 //   * at CMake level by CH_HAVE_QTPDF — this file is only added to the QML module
-//     when the optional Qt6::Pdf/PdfQuick package was found, because the
-//     `import QtQuick.Pdf` above would otherwise fail the whole module;
+//     when Qt6::Pdf/PdfQuick and the QtQuick.Shapes plugin were found; otherwise
+//     the imports above would fail the whole module;
 //   * in QML by mobile.capabilities.hasPdf — PanePickerPage/PaneHostPage route a
 //     "pdf" leaf to ViewerUnsupportedPage when the capability is absent, so this
 //     page is never the thing a user is looking at on a build without QtPdf.
@@ -68,6 +69,10 @@ Item {
         root.errorText = "";
         root.documentSource = "";
         root.releaseSpool();
+        view.zoom = 1;
+        view.renderedZoom = 1;
+        view.contentX = 0;
+        view.contentY = 0;
         root.loading = false;
         if (root.remotePath.length === 0 || !root.service)
             return;
@@ -125,9 +130,9 @@ Item {
     }
 
     PdfDocument {
-        id: document
+        id: pdfDocument
         source: root.documentSource
-        onStatusChanged: {
+        onStatusChanged: function(status) {
             // Only while a document is actually loaded: clearing `source` on the
             // way to the next file also drives a status change, and reporting
             // THAT as a failure would print "could not be opened" over the
@@ -140,14 +145,143 @@ Item {
         }
     }
 
-    PdfMultiPageView {
+    PdfStyle { id: pdfStyle }
+
+    // PdfMultiPageView unconditionally calls Qt.openUrlExternally for URI
+    // annotations and exposes no link-policy hook. Compose its native building
+    // blocks instead: page rasters, selection, and document-internal links only.
+    ListView {
         id: view
         objectName: "pdfView"
         anchors.fill: parent
         anchors.bottomMargin: pageBar.height
-        document: document
+        clip: true
         visible: root.errorText.length === 0
                  && root.documentSource.toString().length > 0
+        model: pdfDocument.status === PdfDocument.Ready ? pdfDocument.pageCount : 0
+        spacing: MobileTheme.spacingSmall
+        contentWidth: width * zoom
+        flickableDirection: Flickable.HorizontalAndVerticalFlick
+        boundsBehavior: Flickable.StopAtBounds
+        property real zoom: 1
+        // Keep the current raster during a pinch; decode at the new resolution
+        // only after release rather than allocate a PDF raster on every frame.
+        property real renderedZoom: 1
+        readonly property int currentPage: count > 0
+            ? Math.max(0, indexAt(contentX + width / 2, contentY + height / 2)) : -1
+        ScrollBar.vertical: ScrollBar {}
+        ScrollBar.horizontal: ScrollBar {}
+
+        delegate: Item {
+            id: pdfPage
+            required property int index
+            readonly property size pointSize: pdfDocument.pagePointSize(index)
+            readonly property real pageScale: width > 0 && pointSize.width > 0
+                                              ? width / pointSize.width : 1
+            width: view.contentWidth
+            height: pointSize.height * pageScale
+
+            PdfPageImage {
+                id: pageImage
+                objectName: "pdfPageImage"
+                anchors.fill: parent
+                document: pdfDocument
+                currentFrame: pdfPage.index
+                asynchronous: true
+                sourceSize.width: Math.ceil(view.width * view.renderedZoom * Screen.devicePixelRatio)
+                fillMode: Image.PreserveAspectFit
+            }
+            Shape {
+                anchors.fill: parent
+                visible: pageImage.status === Image.Ready
+                ShapePath {
+                    strokeWidth: -1
+                    fillColor: pdfStyle.selectionColor
+                    scale: Qt.size(pdfPage.pageScale, pdfPage.pageScale)
+                    PathMultiline {
+                        paths: selection.geometry
+                    }
+                }
+            }
+
+            DragHandler {
+                id: selectionDrag
+                target: null
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.Stylus
+            }
+            TapHandler {
+                id: selectionTap
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.Stylus
+            }
+            TapHandler {
+                acceptedDevices: PointerDevice.TouchScreen
+                onTapped: {
+                    selection.clear();
+                    selection.forceActiveFocus();
+                }
+            }
+            PdfSelection {
+                id: selection
+                objectName: "pdfTextSelection"
+                anchors.fill: parent
+                document: pdfDocument
+                page: pdfPage.index
+                renderScale: pdfPage.pageScale
+                from: selectionDrag.centroid.pressPosition
+                to: selectionDrag.centroid.position
+                hold: !selectionDrag.active && !selectionTap.pressed
+                focus: true
+            }
+            Repeater {
+                model: PdfLinkModel {
+                    document: pdfDocument
+                    page: pdfPage.index
+                }
+                delegate: Item {
+                    required property rect rectangle
+                    required property int page
+                    required property point location
+                    x: rectangle.x * parent.pageScale
+                    y: rectangle.y * parent.pageScale
+                    width: rectangle.width * parent.pageScale
+                    height: rectangle.height * parent.pageScale
+                    TapHandler {
+                        // URI annotations have page == -1. They remain inert;
+                        // no URL is ever handed to the OS or another renderer.
+                        enabled: parent.page >= 0
+                        onTapped: {
+                            view.positionViewAtIndex(parent.page, ListView.Beginning);
+                            const targetScale = view.contentWidth
+                                / Math.max(1, pdfDocument.pagePointSize(parent.page).width);
+                            view.contentX = parent.location.x * targetScale;
+                            view.contentY += parent.location.y * targetScale;
+                            view.returnToBounds();
+                        }
+                    }
+                }
+            }
+        }
+
+        PinchHandler {
+            target: null
+            property real initialZoom: 1
+            onActiveChanged: {
+                if (active)
+                    initialZoom = view.zoom;
+                else {
+                    view.renderedZoom = view.zoom;
+                    view.returnToBounds();
+                }
+            }
+            onActiveScaleChanged: {
+                const x = (view.contentX + centroid.position.x) / view.zoom;
+                const y = (view.contentY - view.originY + centroid.position.y) / view.zoom;
+                view.zoom = Math.max(1, Math.min(8, initialZoom * activeScale));
+                view.forceLayout();
+                view.contentX = x * view.zoom - centroid.position.x;
+                view.contentY = view.originY + y * view.zoom - centroid.position.y;
+            }
+        }
     }
 
     // Page position and nothing else: a single-pane mobile surface has no room
@@ -166,8 +300,8 @@ Item {
             textFormat: Text.PlainText
             color: MobileTheme.textDim
             font.pixelSize: MobileTheme.fontSizeSmall
-            text: document.pageCount > 0
-                  ? qsTr("Page %1 of %2").arg(view.currentPage + 1).arg(document.pageCount)
+            text: pdfDocument.pageCount > 0
+                  ? qsTr("Page %1 of %2").arg(view.currentPage + 1).arg(pdfDocument.pageCount)
                   : ""
         }
     }

@@ -833,6 +833,10 @@ QString stripIndent(const QString &line, int columns)
             break;
         ++i;
     }
+    // A tab can straddle the requested column boundary. Only the columns that
+    // belong to the fence indentation are removed; its remainder stays as spaces.
+    if (removed > columns)
+        return QString(removed - columns, QLatin1Char(' ')) + line.mid(i);
     return line.mid(i);
 }
 
@@ -1049,7 +1053,10 @@ QVector<MarkdownModel::Block> MarkdownModel::parse(const QString &source)
         }
 
         const ListMarker marker = listMarkerAt(line);
-        if (marker.valid) {
+        // Four columns at top level start literal code, even if its first
+        // character looks like a list marker. Deeper markers are only list
+        // items when a containing list is already open.
+        if (marker.valid && (marker.indent <= 3 || !listIndents.isEmpty())) {
             flushParagraph();
             while (!listIndents.isEmpty() && marker.indent < listIndents.last())
                 listIndents.removeLast();

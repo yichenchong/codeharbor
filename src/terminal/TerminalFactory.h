@@ -473,6 +473,8 @@ private:
     // AppController declared above it.
     WorkspaceDb* m_workspace = nullptr;
     QString m_serverId;
+    // Invalidates queued/cache and RPC completions even across A -> B -> A.
+    quint64 m_resolutionEpoch = 0;
     // The current daemon's viewer control socket; empty when it reported none.
     QString m_controlSocket;
     // RPC peer for the `tmux.listSessions` diagnostic; injected, not owned, and

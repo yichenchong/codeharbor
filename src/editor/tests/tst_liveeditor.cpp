@@ -386,6 +386,7 @@ private slots:
     void remoteFileLoadsIntoRealMonaco();
     // A rejected WebChannel handshake must render an error, not an empty pane.
     void rejectedEditorHandshakeShowsAnActionableError();
+    void repeatedSaveAfterAnEditAndRevertReconcilesDirtyState();
     // (3) An edit made inside the page, saved with Ctrl+S, lands on the server.
     void pageEditSavesToRemoteDisk();
     // (4) SPEC 8.6 live: stale revision refused, page's Reload recovers.
@@ -874,6 +875,126 @@ void TstLiveEditor::rejectedEditorHandshakeShowsAnActionableError()
     QCOMPARE(outcome.value(QStringLiteral("message")).toString(),
              QStringLiteral("This page could not reach the CodeHarbor host."));
     QCOMPARE(outcome.value(QStringLiteral("statuses")).toInt(), 1);
+    QCOMPARE(monacoValue(), before);
+}
+
+void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
+{
+    const QString before = monacoValue();
+    const QString result = runJs(QStringLiteral(R"JS(
+(function () {
+    function signal() {
+        var handlers = [];
+        return {
+            connect: function (handler) { handlers.push(handler); },
+            disconnect: function (handler) {
+                handlers = handlers.filter(function (other) { return other !== handler; });
+            },
+            emit: function () {
+                var args = arguments;
+                handlers.slice().forEach(function (handler) { handler.apply(null, args); });
+            }
+        };
+    }
+    var saves = [];
+    var observations = [];
+    var bridge = {
+        contentLoaded: signal(), fileStateChanged: signal(),
+        readOnlyChanged: signal(), saved: signal(),
+        saveConflict: signal(), saveError: signal(),
+        save: function (content, revision) { saves.push([content, revision]); },
+        reportDirty: function (dirty, revision) { observations.push([dirty, revision]); },
+        reportContent: function () {},
+        requestReload: function () {}
+    };
+    var siblingSaves = [];
+    var siblingBridge = Object.assign({}, bridge, {
+        contentLoaded: signal(), fileStateChanged: signal(),
+        readOnlyChanged: signal(), saved: signal(),
+        saveConflict: signal(), saveError: signal(),
+        save: function (content, revision) { siblingSaves.push([content, revision]); },
+        reportDirty: function () {}
+    });
+    var siblingRoot = document.createElement("div");
+    siblingRoot.style.cssText = "position:fixed;inset:0;width:600px;height:400px";
+    document.body.appendChild(siblingRoot);
+    var priorEditor = window.monaco.editor.getEditors()[0];
+    var root = document.createElement("div");
+    root.style.cssText = "position:fixed;inset:0;width:600px;height:400px";
+    document.body.appendChild(root);
+    var host;
+    var siblingHost;
+    try {
+        siblingHost = CodeHarborEditor.mountEditor(siblingRoot, siblingBridge);
+        var siblingEditor = window.monaco.editor.getEditors().find(function (candidate) {
+            return siblingRoot.contains(candidate.getDomNode());
+        });
+        siblingBridge.contentLoaded.emit("sibling bytes", "s1");
+        siblingBridge.fileStateChanged.emit("clean");
+        host = CodeHarborEditor.mountEditor(root, bridge);
+        var editor = window.monaco.editor.getEditors().find(function (candidate) {
+            return root.contains(candidate.getDomNode());
+        });
+        function save(targetEditor = editor) {
+            targetEditor.focus();
+            targetEditor.getDomNode().querySelector("textarea").dispatchEvent(
+                new KeyboardEvent("keydown", {
+                    key: "s", code: "KeyS", keyCode: 83, which: 83,
+                    ctrlKey: true, bubbles: true, cancelable: true, composed: true
+                }));
+        }
+        bridge.contentLoaded.emit("orig", "r1");
+        bridge.fileStateChanged.emit("clean");
+        editor.setValue("saved bytes");
+        save();
+        bridge.fileStateChanged.emit("saving");
+        editor.setValue("later edit");
+        editor.setValue("saved bytes");
+        // The second save joins the first write on the host because the bytes
+        // are identical, despite the edit observations made during that write.
+        save();
+        bridge.saved.emit("r2");
+        bridge.fileStateChanged.emit("clean");
+        var outcome = {
+            saves: saves,
+            lastObservation: observations[observations.length - 1],
+            status: root.querySelector(".ch-editor-state").textContent,
+            content: editor.getValue()
+        };
+        host.dispose();
+        host = undefined;
+        // The disposed mount must neither retain a global Ctrl+S binding nor
+        // prevent the other live editor's own save action from receiving it.
+        save(siblingEditor);
+        outcome.siblingSaves = siblingSaves;
+        outcome.savesAfterDisposal = saves.length;
+        return JSON.stringify(outcome);
+    } finally {
+        if (host) host.dispose();
+        if (siblingHost) siblingHost.dispose();
+        siblingRoot.remove();
+        root.remove();
+        if (priorEditor) priorEditor.focus();
+    }
+})()
+)JS"));
+    const QJsonDocument reply = QJsonDocument::fromJson(result.toUtf8());
+    QVERIFY2(reply.isObject(), qPrintable(result));
+    const QJsonObject outcome = reply.object();
+    const QJsonArray saves = outcome.value(QStringLiteral("saves")).toArray();
+    QCOMPARE(saves.size(), 2);
+    for (const QJsonValue& save : saves) {
+        QCOMPARE(save.toArray(), (QJsonArray{QStringLiteral("saved bytes"),
+                                           QStringLiteral("r1")}));
+    }
+    QCOMPARE(outcome.value(QStringLiteral("lastObservation")).toArray(),
+             (QJsonArray{false, QStringLiteral("r2")}));
+    QCOMPARE(outcome.value(QStringLiteral("status")).toString(), QStringLiteral("clean"));
+    QCOMPARE(outcome.value(QStringLiteral("content")).toString(),
+             QStringLiteral("saved bytes"));
+    QCOMPARE(outcome.value(QStringLiteral("siblingSaves")).toArray(),
+             (QJsonArray{QJsonArray{QStringLiteral("sibling bytes"), QStringLiteral("s1")}}));
+    QCOMPARE(outcome.value(QStringLiteral("savesAfterDisposal")).toInt(), 2);
     QCOMPARE(monacoValue(), before);
 }
 
