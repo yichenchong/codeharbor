@@ -461,18 +461,13 @@ export function createBridgeLineFramer(
 export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
     const paused = new Set<net.Socket>();
     let failed = false;
-    // Sockets that already carry the cleanup listener below. A long-lived
-    // producer can be paused and resumed many times, and attaching a fresh
-    // 'close' listener on every pause piles them up on the same socket: Node
-    // warns at eleven ("possible EventEmitter memory leak") and every one of
-    // them is retained until the socket finally closes. Weak so a closed socket
-    // is still collectable.
-    const hooked = new WeakSet<net.Socket>();
+    // Keep idle producers too: after a complete event their watchdogs are
+    // disarmed, so an output failure must explicitly close them.
+    const sources = new Set<net.Socket>();
     const fail = (): void => {
         failed = true;
-        // A throwing write need not emit an 'error' event afterward. Release
-        // every producer already waiting for a drain that can no longer arrive.
-        for (const socket of paused) socket.destroy();
+        for (const socket of sources) socket.destroy();
+        sources.clear();
         paused.clear();
     };
     out.on("drain", () => {
@@ -490,6 +485,13 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         if (failed) {
             source.destroy();
             return;
+        }
+        if (!sources.has(source)) {
+            sources.add(source);
+            source.once("close", () => {
+                sources.delete(source);
+                paused.delete(source);
+            });
         }
         // The line framer normally stops before invoking us again for a paused
         // source. Keep this guard for custom callers so a full output stream
@@ -529,16 +531,12 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
             ok = out.write(line);
         } catch {
             fail();
-            source.destroy();
             return;
         }
+        if (failed || source.destroyed) return;
         if (!ok) {
             source.pause();
             paused.add(source);
-            if (!hooked.has(source)) {
-                hooked.add(source);
-                source.once("close", () => paused.delete(source));
-            }
         }
     };
 }

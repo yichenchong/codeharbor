@@ -40,6 +40,8 @@
 #include <QTemporaryDir>
 #include <QVariant>
 
+#include <cmath>
+
 #include "EditorFactory.h"
 #include "MarkdownModel.h"
 #include "MobileKeyStore.h"
@@ -2409,6 +2411,8 @@ void TstMobileShell::pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork()
     const QPoint internal = first->mapToScene(QPointF(first->width() * 3 / 4, 50)).toPoint();
     QTest::mouseClick(host.window(), Qt::LeftButton, Qt::NoModifier, internal);
     QTRY_COMPARE(view->property("currentPage").toInt(), 1);
+    QVERIFY(std::isfinite(view->property("contentX").toReal()));
+    QVERIFY(std::isfinite(view->property("contentY").toReal()));
     QVERIFY(recorder.urls.isEmpty());
 #endif
 }

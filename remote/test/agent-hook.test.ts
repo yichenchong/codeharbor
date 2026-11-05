@@ -5,7 +5,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { fileURLToPath } from "node:url";
 import {
     main,
@@ -850,6 +850,37 @@ test("a bridge output error disconnects both stalled and future producers", () =
     out.emit("drain");
     assert.equal(stalled.resumes, 0);
     assert.equal(newcomer.resumes, 0);
+});
+
+test("an output failure disconnects a producer idle after a complete event", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-idle-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const out = new PassThrough();
+    const forwarded = once(out, "data");
+    const server = await startBridge(socketPath, makeStreamSink(out));
+    const producer = net.createConnection(socketPath);
+    producer.on("error", () => {});
+    try {
+        await once(producer, "connect");
+        producer.write(`${JSON.stringify({
+            harness: "oh-my-pi",
+            devSessionId: "s1",
+            terminalId: "idle",
+            native: { type: "agent_start" },
+        })}\n`);
+        const [bytes] = await forwarded;
+        assert.equal(JSON.parse(bytes.toString()).terminalId, "idle");
+        const disconnected = once(producer, "close", {
+            signal: AbortSignal.timeout(1000),
+        });
+        out.emit("error", new Error("SSH channel closed"));
+        await disconnected;
+    } finally {
+        producer.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        out.destroy();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("a throwing bridge output releases producers already awaiting drain", () => {
