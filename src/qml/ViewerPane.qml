@@ -28,6 +28,11 @@ Item {
 
     property url url
     property string paneId: ""
+    property string acceptedServerId: ""
+    property string sessionId: ""
+    // The empty leaf left after closing the last pane has no persisted identity.
+    // Its first navigation fills that leaf through the host's ordinary split path.
+    property bool placeholder: false
 
     // This is the pane the user is working in. Written by the region that owns
     // the pane cache (ViewerRegion.applyFocusFlags) rather than derived here:
@@ -212,9 +217,15 @@ Item {
     // object. The Loader fallback covers every other content kind, including
     // internal image/PDF resources and the binary metadata view.
     function reloadCurrent() {
-        if (!pane.canReload || !pane.allowContentReplacement())
+        if (!pane.canReload)
             return false;
         const handler = contentLoader.item;
+        const preservesDirty = handler && typeof handler.reload === "function"
+                               && handler.reloadPreservesDirtyContent === true;
+        if (pane.contentDirty && preservesDirty)
+            pane.probePath = "";
+        else if (!pane.allowContentReplacement())
+            return false;
         if (handler && typeof handler.reload === "function") {
             handler.reload();
             return true;
@@ -401,9 +412,9 @@ Item {
     // this signal is how those arrive.
     signal urlOpened(string paneId, string url)
 
-    // A directory row chose a target for another viewer pane. The region relays
-    // this to Main.qml, which calls SessionLayouts::splitPane and therefore
-    // preserves the existing pane-identity/persistence path.
+    // Ask the host for a persisted pane, either beside this one or in place of
+    // the empty-id placeholder. SessionLayouts::splitPane handles both cases
+    // through the same identity and persistence path.
     signal openInNewPaneRequested(string paneId, string url, string kind)
 
     // Shell-level failures (invalid custom schemes, or a desktop with no
@@ -437,6 +448,10 @@ Item {
     // to be asked about first), and leaving that fragment sitting in the bar
     // would have the pane claim to be showing something it is not.
     onUrlChanged: {
+        // A save can finish while the close confirmation is open, allowing a
+        // newer navigation. Its replacement must not inherit that confirmation.
+        if (closeEditorDialog)
+            closeEditorDialog.close();
         pane.probePath = "";
         pane.recordNavigation(pane.currentNavigationAddress());
         pane.reportUrl();
@@ -464,10 +479,7 @@ Item {
     // Open a remote path in THIS pane. A trailing slash means a directory, which
     // is what ViewerHandlerRegistry::resolve() reads to pick the listing view.
     function openRemotePath(path) {
-        if (!pane.allowContentReplacement())
-            return;
-        pane.forcedKind = "";
-        pane.url = pane.fileUrlFor(path);
+        pane.openTarget(pane.fileUrlFor(path), "");
     }
     // A link inside a WebEngine handler is still ordinary pane navigation.
     // Remote file links become the pane's canonical file:// address; HTTP(S)
@@ -477,10 +489,7 @@ Item {
         if (target === pane.url.toString())
             return;
         if (/^file:\/\//i.test(target) || /^https?:\/\//i.test(target)) {
-            if (!pane.allowContentReplacement())
-                return;
-            pane.forcedKind = "";
-            pane.url = target;
+            pane.openTarget(target, "");
         }
     }
 
@@ -514,11 +523,7 @@ Item {
             pane.messageRequested(qsTr("That viewer cannot display this target."));
             return false;
         }
-        if (!pane.allowContentReplacement())
-            return false;
-        pane.forcedKind = selected;
-        pane.url = targetUrl;
-        return true;
+        return pane.navigateTo(targetUrl, selected);
     }
 
     // Open `targetUrl` in this pane, letting the handler REGISTRY choose when no
@@ -538,9 +543,17 @@ Item {
                                  ? "" : requestedKind);
         if (requested.length > 0)
             return pane.openUrlWithKind(targetUrl, requested);
+        return pane.navigateTo(targetUrl, "");
+    }
+
+    function navigateTo(targetUrl, kind) {
         if (!pane.allowContentReplacement())
             return false;
-        pane.forcedKind = "";
+        if (pane.placeholder) {
+            pane.openInNewPaneRequested(pane.paneId, String(targetUrl), kind);
+            return true;
+        }
+        pane.forcedKind = kind;
         pane.url = targetUrl;
         return true;
     }
@@ -623,7 +636,7 @@ Item {
             // refreshes contentDirty. Wait until this binding notification has
             // completed before changing the handler, and recheck for new edits.
             Qt.callLater(() => {
-                if (!pane.contentDirty)
+                if (pane && !pane.contentDirty)
                     pane.dirtyHandlerKind = "";
             });
         }
@@ -642,6 +655,16 @@ Item {
         // its target equals the current URL and urlChanged will not fire.
         pane.probePath = "";
         return true;
+    }
+
+    function retireLayoutRequests() {
+        pane.probePath = "";
+        pane.cancelFocusRestore();
+        if (closeEditorDialog)
+            closeEditorDialog.close();
+        const handler = contentLoader.item;
+        if (handler && typeof handler.retireLayoutRequests === "function")
+            handler.retireLayoutRequests();
     }
 
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
@@ -828,9 +851,7 @@ Item {
         // An explicit scheme is an address in its own right (https://…, and a
         // file:// URL a user pasted out of this very field).
         if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(text)) {
-            pane.probePath = "";
-            pane.forcedKind = "";
-            pane.url = text;
+            pane.navigateTo(text, "");
             return;
         }
         const path = text.charAt(0) === "/"
@@ -1412,7 +1433,15 @@ Item {
             onNavigated: (address) => pane.openWebNavigation(address)
         }
     }
-    Component { id: editorComponent; EditorPaneView { fileUrl: pane.effectiveUrl; recoveryPaneId: pane.paneId } }
+    Component {
+        id: editorComponent
+        EditorPaneView {
+            fileUrl: pane.effectiveUrl
+            recoveryServerId: pane.acceptedServerId
+            recoverySessionId: pane.sessionId
+            recoveryPaneId: pane.paneId
+        }
+    }
 
     // Nothing open AND no Dev Session to fall back on. A pane a user can land on
     // must say what it is and how to fill it — the internal pane id is plumbing,

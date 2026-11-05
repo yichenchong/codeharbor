@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtWebView
+import CodeHarbor.Mobile.Core
 
 // http(s) web view for the mobile client (mobile SPEC 7.5).
 //
@@ -10,18 +11,11 @@ import QtWebView
 // mobile.capabilities.hasWebView in QML, so nothing routes here on a build without
 // it.
 //
-// QtWebView is the PLATFORM's web view — Android's WebView, iOS's WKWebView —
-// rendered inside this app's own window. It is not Qt WebEngine and it is not a
-// browser handoff: nothing here calls QDesktopServices, and no URL leaves this
-// process.
-//
-// SCHEME ASSERTION. The ONLY thing this page will load is http or https, and the
-// check is an assertion rather than a filter: anything else is refused, reported
-// as text, and the web view is never given a URL at all. A remote file:// URL or a
-// codeharbor-internal:// URL reaching a web view is the SPEC 7.4 mistake the whole
-// internal-scheme design exists to prevent — on the desktop such a URL would be
-// read as a CLIENT-machine path, and on a phone the platform web view would do
-// exactly the same with the app's own sandbox.
+// The native backend is guarded before it sees an untrusted address. A unique
+// app-created about:blank marker identifies this page's native view; the policy
+// controller releases the http(s) address only after native navigation and
+// new-window enforcement is installed. Missing/failed policy is a visible error,
+// never permission to fall back to Qt's external-URL handling.
 Item {
     id: root
 
@@ -44,31 +38,28 @@ Item {
     // itself and needs the way back).
     signal closeRequested()
 
-    // The one scheme test, used both for the address this page is handed and for
-    // every navigation the page attempts afterwards.
+    // Initial addresses are http(s); platform guards enforce every later
+    // navigation, redirect and new-window request before Qt's default handler.
     function allowsScheme(candidate) {
         return /^https?:\/\//i.test(candidate);
     }
     readonly property bool schemeAllowed: root.allowsScheme(root.webUrl)
 
-    // The last navigation this page REFUSED, shown as text. Cleared whenever the
-    // address changes, so a refusal never outlives the page it happened on.
-    property string refusedNavigation: ""
-    onWebUrlChanged: root.refusedNavigation = ""
+    property bool started: false
+    onWebUrlChanged: {
+        if (root.started && root.allowsScheme(root.webUrl))
+            policy.attach(web);
+    }
+    Component.onCompleted: {
+        root.started = true;
+        if (root.schemeAllowed)
+            policy.attach(web);
+    }
+    Component.onDestruction: web.stop()
 
-    // The one navigation rule, stated once: a destination this page will not
-    // load is STOPPED and reported, an allowed one clears the last refusal.
-    // Returns whether `started` was allowed. The loadingChanged handler below is
-    // its only production caller; keeping the rule out of the handler body is
-    // what lets it be stated, read and exercised as one thing.
-    function noteNavigation(started) {
-        if (started.length === 0 || root.allowsScheme(started)) {
-            root.refusedNavigation = "";
-            return true;
-        }
-        web.stop();
-        root.refusedNavigation = started;
-        return false;
+    MobileWebViewPolicy {
+        id: policy
+        objectName: "mobileWebViewPolicy"
     }
 
     Rectangle {
@@ -96,7 +87,9 @@ Item {
                 color: MobileTheme.textDim
                 font.family: MobileTheme.monoFamily
                 font.pixelSize: MobileTheme.fontSizeSmall
-                text: root.webUrl
+                text: root.schemeAllowed && policy.ready
+                      && root.allowsScheme(web.url.toString())
+                      ? web.url.toString() : root.webUrl
             }
 
             Button {
@@ -115,32 +108,6 @@ Item {
             height: 1
             color: MobileTheme.borderSubtle
         }
-
-        // A refused NAVIGATION, as opposed to a refused starting address. See
-        // the WebView below for why this can happen at all.
-        Rectangle {
-            width: parent.width
-            height: visible ? Math.max(MobileTheme.touchTarget,
-                                       refusal.implicitHeight + 2 * MobileTheme.spacing)
-                            : 0
-            visible: root.refusedNavigation.length > 0
-            color: MobileTheme.warningSurface()
-            Text {
-                id: refusal
-                anchors.fill: parent
-                anchors.margins: MobileTheme.spacing
-                textFormat: Text.PlainText
-                wrapMode: Text.WrapAnywhere
-                verticalAlignment: Text.AlignVCenter
-                color: MobileTheme.text
-                font.pixelSize: MobileTheme.fontSizeSmall
-                // The destination is page-controlled text. PlainText, like every
-                // other string on every mobile surface.
-                text: qsTr("This page tried to open an address that is not http or https, and was stopped: %1")
-                      .arg(root.refusedNavigation)
-            }
-        }
-
         Item {
             width: parent.width
             height: parent.height - y
@@ -149,30 +116,12 @@ Item {
                 id: web
                 objectName: "mobileWebView"
                 anchors.fill: parent
-                visible: root.schemeAllowed
-                // The assertion, expressed where it cannot be bypassed: the URL
-                // handed to the platform web view is EMPTY unless the scheme
-                // passed. There is no branch in which a non-http(s) address is
-                // loaded and then stopped.
-                url: root.schemeAllowed ? root.webUrl : ""
-
-                // THE SAME ASSERTION, APPLIED TO NAVIGATION. `url` above only
-                // covers the address this page was handed; a loaded page can
-                // navigate itself — a tapped link, a redirect, a meta refresh —
-                // and QtWebView has no request interceptor, so the earliest
-                // point this client can act is the start of the load.
-                //
-                // stop() is the cancellation API (re-assigning `url` starts
-                // ANOTHER load instead of cancelling this one), and it maps
-                // straight onto Android's WebView.stopLoading() and iOS's
-                // [WKWebView stopLoading], so a file:// or intent:// destination
-                // is aborted rather than merely reported. Without this the
-                // platform web view would happily render the app's own sandbox.
-                onLoadingChanged: function(loadRequest) {
-                    if (loadRequest.status !== WebView.LoadStartedStatus)
-                        return;
-                    root.noteNavigation(loadRequest.url.toString());
-                }
+                // Keep the bootstrap native view attached while the guard
+                // locates it. On failure hide it so the explanation is visible.
+                visible: root.schemeAllowed && policy.errorText.length === 0
+                url: root.schemeAllowed && policy.ready ? root.webUrl : policy.marker
+                settings.allowFileAccess: false
+                settings.localContentCanAccessFileUrls: false
             }
 
             Text {
@@ -189,9 +138,22 @@ Item {
                       : qsTr("Only http and https addresses can be opened. This one was refused and nothing was loaded.")
             }
 
+            Text {
+                anchors.centerIn: parent
+                width: parent.width - 2 * MobileTheme.spacingLarge
+                visible: root.schemeAllowed && policy.errorText.length > 0
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: MobileTheme.textDim
+                font.pixelSize: MobileTheme.fontSizeBody
+                text: policy.errorText
+            }
+
             BusyIndicator {
                 anchors.centerIn: parent
-                running: root.schemeAllowed && web.loading
+                running: root.schemeAllowed
+                         && (policy.installing || (policy.ready && web.loading))
                 visible: running
             }
         }

@@ -27,6 +27,54 @@ Item {
     // SplitView.resizing; a key resize never sets that flag, so without this
     // signal a keyboard-only resize would be forgotten on the next launch.
     signal resized()
+    signal resizeStarted()
+    signal resizeCancelled()
+
+    property bool resizePending: false
+    property var pendingBefore: null
+    property var pendingAfter: null
+    property real pendingBeforeSize: 0
+    property real pendingAfterSize: 0
+    property real pendingViewWidth: 0
+    property real pendingViewHeight: 0
+
+    function cancelResize(notify) {
+        const wasPending = handle.resizePending;
+        handle.resizePending = false;
+        handle.pendingBefore = null;
+        handle.pendingAfter = null;
+        if (wasPending && notify !== false)
+            handle.resizeCancelled();
+    }
+
+    function finishResize() {
+        if (!handle.resizePending)
+            return;
+        if (!handle.view || !handle.pendingBefore || !handle.pendingAfter
+                || handle.view.width !== handle.pendingViewWidth
+                || handle.view.height !== handle.pendingViewHeight) {
+            handle.cancelResize();
+            return;
+        }
+        const before = handle.horizontal ? handle.pendingBefore.width : handle.pendingBefore.height;
+        const after = handle.horizontal ? handle.pendingAfter.width : handle.pendingAfter.height;
+        if (Math.abs(before - handle.pendingBeforeSize) > 0.5
+                || Math.abs(after - handle.pendingAfterSize) > 0.5)
+            return; // SplitView's private polish has not applied the key yet.
+        handle.cancelResize(false);
+        handle.resized();
+    }
+
+    Connections {
+        target: handle.pendingBefore
+        function onWidthChanged() { if (handle.horizontal) Qt.callLater(handle.finishResize); }
+        function onHeightChanged() { if (!handle.horizontal) Qt.callLater(handle.finishResize); }
+    }
+    Connections {
+        target: handle.pendingAfter
+        function onWidthChanged() { if (handle.horizontal) Qt.callLater(handle.finishResize); }
+        function onHeightChanged() { if (!handle.horizontal) Qt.callLater(handle.finishResize); }
+    }
 
     // One arrow press, and one Page press. Sixteen pixels is small enough to
     // land on an exact width and large enough that crossing a 260-pixel sidebar
@@ -153,12 +201,56 @@ Item {
         if (!before || !after)
             return;
 
+        // Clamp the shared delta, not each requested size independently:
+        // otherwise a neighbor at its limit takes space from the unrelated
+        // fill item and moves a divider the user did not touch.
+        if (handle.resizePending
+                && (handle.view.width !== handle.pendingViewWidth
+                    || handle.view.height !== handle.pendingViewHeight))
+            handle.cancelResize();
+        const continuing = handle.resizePending && handle.pendingBefore === before
+                           && handle.pendingAfter === after;
+        // Coalesce keys delivered before the next polish without losing steps.
+        var beforeSize = continuing ? handle.pendingBeforeSize
+                                   : (handle.horizontal ? before.width : before.height);
+        var afterSize = continuing ? handle.pendingAfterSize
+                                  : (handle.horizontal ? after.width : after.height);
+        var beforeMinimum = handle.horizontal ? before.SplitView.minimumWidth
+                                              : before.SplitView.minimumHeight;
+        var beforeMaximum = handle.horizontal ? before.SplitView.maximumWidth
+                                              : before.SplitView.maximumHeight;
+        var afterMinimum = handle.horizontal ? after.SplitView.minimumWidth
+                                             : after.SplitView.minimumHeight;
+        var afterMaximum = handle.horizontal ? after.SplitView.maximumWidth
+                                             : after.SplitView.maximumHeight;
+        var minimumDelta = Math.max(beforeMinimum - beforeSize, afterSize - afterMaximum);
+        var maximumDelta = Math.min(beforeMaximum - beforeSize, afterSize - afterMinimum);
+        if (minimumDelta > maximumDelta)
+            return;
+        delta = Math.max(minimumDelta, Math.min(maximumDelta, delta));
+        if (delta === 0)
+            return;
+        if (!continuing) {
+            handle.cancelResize();
+            handle.pendingBefore = before;
+            handle.pendingAfter = after;
+            handle.pendingViewWidth = handle.view.width;
+            handle.pendingViewHeight = handle.view.height;
+            handle.resizePending = true;
+            handle.resizeStarted();
+        }
+        handle.pendingBeforeSize = beforeSize + delta;
+        handle.pendingAfterSize = afterSize - delta;
+
         var fill = handle.fillItem(items);
         if (before !== fill)
-            handle.setPreferred(before, (handle.horizontal ? before.width : before.height) + delta);
+            handle.setPreferred(before, beforeSize + delta);
         if (after !== fill)
-            handle.setPreferred(after, (handle.horizontal ? after.width : after.height) - delta);
-        handle.resized();
+            handle.setPreferred(after, afterSize - delta);
+        // Geometry notifications arrive from SplitView's private polish.
+        // Report on the following turn, once both neighbors and their hosted
+        // panes have consumed it; a bare callLater before polish is too early.
+        Qt.callLater(handle.finishResize);
     }
 
     // Only the keys that move the divider are accepted; everything else — Tab

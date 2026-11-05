@@ -48,6 +48,10 @@ private slots:
     void aSetextUnderlineBeatsAThematicBreak();
     void quotesAndRules();
     void emphasisBecomesSpansAndNotMarkup();
+    void nestedEmphasisPreservesTextAndStyles();
+    void adjacentEmphasisClosersCanOpenAnotherSpan();
+    void codeSpanBracketsDoNotCloseLinkOrImageLabels();
+    void quoteDepthChangesPreserveSeparateBlocks();
     void inlineImagesInProseAreReducedToTheirAltText();
     void everyRoleIsPublishedUnderItsContractedName();
     void destinationValidatorsInIsolation();
@@ -494,6 +498,111 @@ void TstMarkdownModel::emphasisBecomesSpansAndNotMarkup()
     QCOMPARE(spansOf(escaped, 0).size(), 0);
 }
 
+void TstMarkdownModel::nestedEmphasisPreservesTextAndStyles()
+{
+    for (const QString &source : {QStringLiteral("*outer **inner** outer*"),
+                                  QStringLiteral("_outer __inner__ outer_")}) {
+        MarkdownModel model;
+        model.setMarkdown(source);
+        QCOMPARE(textOf(model, 0), QStringLiteral("outer inner outer"));
+        const QVariantList spans = spansOf(model, 0);
+        QCOMPARE(spans.size(), 3);
+        for (int i = 0; i < spans.size(); ++i) {
+            const QVariantMap span = spans.at(i).toMap();
+            QVERIFY(span.value(QStringLiteral("emphasis")).toBool());
+            QCOMPARE(span.value(QStringLiteral("strong")).toBool(), i == 1);
+        }
+        QCOMPARE(spans.at(1).toMap().value(QStringLiteral("start")).toInt(), 6);
+        QCOMPARE(spans.at(1).toMap().value(QStringLiteral("length")).toInt(), 5);
+    }
+
+    for (const QString &source : {QStringLiteral("**outer *inner***"),
+                                  QStringLiteral("__outer _inner___")}) {
+        MarkdownModel model;
+        model.setMarkdown(source);
+        QCOMPARE(textOf(model, 0), QStringLiteral("outer inner"));
+        const QVariantList spans = spansOf(model, 0);
+        QCOMPARE(spans.size(), 2);
+        QVERIFY(spans.at(0).toMap().value(QStringLiteral("strong")).toBool());
+        QVERIFY(!spans.at(0).toMap().value(QStringLiteral("emphasis")).toBool());
+        QVERIFY(spans.at(1).toMap().value(QStringLiteral("strong")).toBool());
+        QVERIFY(spans.at(1).toMap().value(QStringLiteral("emphasis")).toBool());
+    }
+}
+
+void TstMarkdownModel::adjacentEmphasisClosersCanOpenAnotherSpan()
+{
+    for (const QString &source : {QStringLiteral("*a***b***c*"),
+                                  QStringLiteral("**a***b***c**")}) {
+        MarkdownModel model;
+        model.setMarkdown(source);
+        QCOMPARE(textOf(model, 0), QStringLiteral("abc"));
+        const QVariantList spans = spansOf(model, 0);
+        QCOMPARE(spans.size(), 3);
+        const bool strongOutside = source.startsWith(QLatin1String("**"));
+        for (int i = 0; i < spans.size(); ++i) {
+            const QVariantMap span = spans.at(i).toMap();
+            QCOMPARE(span.value(QStringLiteral("start")).toInt(), i);
+            QCOMPARE(span.value(QStringLiteral("length")).toInt(), 1);
+            const bool strong = i == 1 ? !strongOutside : strongOutside;
+            QCOMPARE(span.value(QStringLiteral("strong")).toBool(), strong);
+            QCOMPARE(span.value(QStringLiteral("emphasis")).toBool(), !strong);
+        }
+    }
+
+    // Both flanking is not sufficient to close when the multiple-of-three
+    // delimiter rule instead makes the double run a nested strong opener.
+    MarkdownModel nested;
+    nested.setMarkdown(QStringLiteral("*a**b**c*"));
+    QCOMPARE(textOf(nested, 0), QStringLiteral("abc"));
+    const QVariantList spans = spansOf(nested, 0);
+    QCOMPARE(spans.size(), 3);
+    for (int i = 0; i < spans.size(); ++i) {
+        const QVariantMap span = spans.at(i).toMap();
+        QVERIFY(span.value(QStringLiteral("emphasis")).toBool());
+        QCOMPARE(span.value(QStringLiteral("strong")).toBool(), i == 1);
+    }
+}
+
+void TstMarkdownModel::codeSpanBracketsDoNotCloseLinkOrImageLabels()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("[`]` and `[`](https://example.com)\n\n"
+                                     "![`]` and `[`](badge.png)"));
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(textOf(model, 0), QStringLiteral("] and ["));
+    for (const QVariant &value : spansOf(model, 0)) {
+        const QVariantMap span = value.toMap();
+        QVERIFY(span.value(QStringLiteral("link")).toBool());
+        QCOMPARE(span.value(QStringLiteral("target")).toString(),
+                 QStringLiteral("https://example.com"));
+    }
+    const QVariantList spans = spansOf(model, 0);
+    QCOMPARE(spans.size(), 3);
+    QVERIFY(spans.first().toMap().value(QStringLiteral("code")).toBool());
+    QVERIFY(!spans.at(1).toMap().value(QStringLiteral("code")).toBool());
+    QVERIFY(spans.last().toMap().value(QStringLiteral("code")).toBool());
+    QCOMPARE(kindOf(model, 1), QStringLiteral("image"));
+    QCOMPARE(textOf(model, 1), QStringLiteral("] and ["));
+    QCOMPARE(blockOf(model, 1).value(QStringLiteral("imagePath")).toString(),
+             QStringLiteral("badge.png"));
+}
+
+void TstMarkdownModel::quoteDepthChangesPreserveSeparateBlocks()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("> outer\n>> inner\n>> continued\n> outer again"));
+    QCOMPARE(model.rowCount(), 3);
+    for (int row = 0; row < model.rowCount(); ++row)
+        QCOMPARE(kindOf(model, row), QStringLiteral("quote"));
+    QCOMPARE(blockOf(model, 0).value(QStringLiteral("level")).toInt(), 1);
+    QCOMPARE(blockOf(model, 1).value(QStringLiteral("level")).toInt(), 2);
+    QCOMPARE(blockOf(model, 2).value(QStringLiteral("level")).toInt(), 1);
+    QCOMPARE(textOf(model, 0), QStringLiteral("outer"));
+    QCOMPARE(textOf(model, 1), QStringLiteral("inner\ncontinued"));
+    QCOMPARE(textOf(model, 2), QStringLiteral("outer again"));
+}
+
 void TstMarkdownModel::inlineImagesInProseAreReducedToTheirAltText()
 {
     MarkdownModel model;
@@ -680,6 +789,8 @@ void TstMarkdownModel::adversarialInlineInputCannotHangOrOverflowTheParser()
         {"deeply nested matched emphasis",
          QString(50000, QLatin1Char('*')) + QStringLiteral("x")
              + QString(50000, QLatin1Char('*'))},
+        {"alternating nested emphasis",
+         QStringLiteral("*a **b ").repeated(10000) + QStringLiteral("tail")},
         // A single very long line, which the old flatten() sized a 28-byte
         // per-character table against.
         {"one very long line",

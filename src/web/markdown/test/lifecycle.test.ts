@@ -28,7 +28,7 @@ function deferred<T>() {
     return { promise, resolve };
 }
 
-function page(fetchSource: (url: string) => Promise<Response>) {
+function page(fetchSource: (url: string, init?: RequestInit) => Promise<Response>) {
     const dom = new JSDOM(
         '<div id="preview"></div><div id="ch-markdown-status"></div>',
         { runScripts: "outside-only" },
@@ -59,6 +59,33 @@ test("a late source response cannot replace a newer Markdown mount", async () =>
         assert.equal(root.querySelector("h1")?.textContent, "New document");
         current.dispose();
         assert.equal(root.childElementCount, 0);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test("retargeting aborts a pending source request without publishing its error", async () => {
+    let oldSignal: AbortSignal | undefined;
+    const { dom, module, root } = page(async (url, init) => {
+        if (!url.endsWith("/old")) {
+            return new Response("# Current");
+        }
+        oldSignal = init?.signal ?? undefined;
+        assert.ok(oldSignal);
+        return new Promise<Response>((_resolve, reject) => {
+            oldSignal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+    });
+    try {
+        const previous = module.mountMarkdown(root, noImages, options("old"));
+        const current = await module.mountMarkdown(root, noImages, options("new"));
+        const stale = await previous;
+        assert.equal(oldSignal?.aborted, true);
+        assert.equal(root.querySelector("h1")?.textContent, "Current");
+        assert.equal(dom.window.document.getElementById("ch-markdown-status")!.textContent, "");
+        stale.dispose();
+        assert.equal(root.querySelector("h1")?.textContent, "Current");
+        current.dispose();
     } finally {
         dom.window.close();
     }
@@ -195,5 +222,36 @@ test("an oversized streamed source is cancelled without publishing its prefix", 
         host.dispose();
     } finally {
         dom.window.close();
+    }
+});
+
+test("sources rejected from response headers cancel their unread bodies", async () => {
+    for (const responseOptions of [
+        { status: 503 },
+        { headers: { "content-length": String(8 * 1024 * 1024 + 1) } },
+    ]) {
+        let cancelled = false;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new Uint8Array([0x23, 0x20, 0x61]));
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+        const { dom, module, root } = page(async () => new Response(body, responseOptions));
+        try {
+            const host = await module.mountMarkdown(root, noImages, options("rejected"));
+            assert.equal(cancelled, true);
+            assert.equal(body.locked, false);
+            assert.equal(root.childElementCount, 0);
+            const status = dom.window.document.getElementById("ch-markdown-status")!;
+            assert.equal(status.dataset.visible, "true");
+            assert.match(status.textContent!, responseOptions.status
+                ? /remote file request failed \(503\)/ : /too large to display/);
+            host.dispose();
+        } finally {
+            dom.window.close();
+        }
     }
 });

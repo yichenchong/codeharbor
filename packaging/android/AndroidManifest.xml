@@ -30,8 +30,10 @@
       known_hosts file (ch::MobileKeyStore). Android's auto-backup would copy
       that directory to the user's Google Drive, moving key material off the
       device into a place the user never chose.
-    application/@usesCleartextTraffic=false — nothing here speaks plaintext
-      HTTP. Remote bytes arrive over SSH, which is a raw socket and unaffected.
+    application/@usesCleartextTraffic=false — native web browsing does not grant
+      an app-wide plaintext HTTP exception. HTTPS pages remain available; HTTP
+      pages are subject to this platform restriction. Remote files and RPC
+      arrive over SSH, which is a raw socket and unaffected.
     application/@enableOnBackInvokedCallback=false — this is Qt's own template
       value and it must not be dropped. For a package targeting SDK 34 or
       higher the flag defaults to TRUE, and when it is on the platform stops

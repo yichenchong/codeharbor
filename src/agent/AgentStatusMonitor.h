@@ -71,7 +71,8 @@ public:
     // authoritative server tree, so a Dev Session the server no longer lists is
     // dropped wholesale — NEVER on a mere terminal close, which would destroy
     // the finished-with-unseen-output signal the sidebar badge derives from. A
-    // removed Dev Session has no live row, so nothing is emitted.
+    // removed Dev Session has no live row, so nothing is emitted, and any
+    // remaining signals for an event currently being delivered are cancelled.
     void retainDevSessions(const QSet<QString>& liveDevSessionIds);
 
     // ---- SPEC 6.6: activity detection for the adapterless "generic" harness

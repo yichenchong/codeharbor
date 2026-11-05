@@ -36,8 +36,8 @@ QByteArray jsonLine(const QJsonObject& obj)
     return QJsonDocument(obj).toJson(QJsonDocument::Compact) + '\n';
 }
 
-// An in-process QIODevice the test drives byte for byte. Four things a real
-// socket cannot be made to do on demand live here:
+// An in-process QIODevice the test drives byte for byte. Transport transitions a
+// real socket cannot be made to perform on demand live here:
 //  * queueSilently() followed by announceEof() delivers an end-of-stream while a
 //    COMPLETE frame is still sitting unread. Qt is free to pick that ordering on
 //    a real socket, and it is the ordering that used to lose the response.
@@ -48,6 +48,7 @@ QByteArray jsonLine(const QJsonObject& obj)
 //  * setStallRead() makes bytesAvailable() advertise bytes readData() then
 //    refuses to release, which is how a reader that treats that count as a
 //    promise is caught.
+//  * setReadHook() re-enters the client before a virtual read returns its chunk.
 // No Q_OBJECT: only inherited QIODevice signals are emitted, so no moc is needed.
 class ScriptedDevice : public QIODevice {
 public:
@@ -69,6 +70,8 @@ public:
     {
         m_writeHook = std::move(hook);
     }
+    // Run once after extracting a read chunk but before read() returns.
+    void setReadHook(std::function<void()> hook) { m_readHook = std::move(hook); }
     void setShortWrite(bool on) { m_shortWrite = on; }
     // Advertise queued bytes through bytesAvailable() but hand back NOTHING
     // from readData(), which is all a QIODevice subclass has to do to make a
@@ -95,6 +98,8 @@ protected:
         const qint64 n = qMin<qint64>(maxSize, m_in.size());
         std::memcpy(data, m_in.constData(), static_cast<size_t>(n));
         m_in.remove(0, n);
+        if (auto hook = std::exchange(m_readHook, {}))
+            hook();
         return n;
     }
     qint64 writeData(const char* data, qint64 maxSize) override
@@ -109,6 +114,7 @@ protected:
     QByteArray m_in;
     QByteArray m_out;
     std::function<void(const QByteArray&)> m_writeHook;
+    std::function<void()> m_readHook;
     bool m_shortWrite = false;
     bool m_stallRead = false;
     int m_readCalls = 0;
@@ -270,6 +276,16 @@ private slots:
     void transportClosedGenerationIdentifiesASupersededLoss();
     void transportChangingDefersSynchronousIngressUntilInvalidationFinishes();
     void transportChangingDefersEofWithoutLosingItsFinalResponse();
+    void rebindDuringReadDiscardsTheOldChunk();
+    void deletingClientDuringReadIsSafe();
+    void eofDuringReadDeliversTheFinalResponse();
+    void nestedReadPreservesFrameOrder();
+    void emptyReadPreservesNestedReadiness();
+    void deferredEmptyReadsDoNotSpin();
+    void nativeJsonEnvelopeDepthBoundary_data();
+    void nativeJsonEnvelopeDepthBoundary();
+    void decodeAgentSocketValidatesRemoteEndpoint_data();
+    void decodeAgentSocketValidatesRemoteEndpoint();
 
 private:
     void makePair();
@@ -284,6 +300,242 @@ private:
     CodeharbordClient* m_client = nullptr;
     static int s_seq;
 };
+
+void TstRpcClient::rebindDuringReadDiscardsTheOldChunk()
+{
+    ScriptedDevice oldDevice;
+    ScriptedDevice replacement;
+    m_client->setTransport(&oldDevice);
+    QSignalSpy notifications(m_client, &CodeharbordClient::notificationReceived);
+    int failures = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_client->call(QStringLiteral("ping"), {}, [&](QJsonValue, auto error) {
+        QVERIFY(error.has_value());
+        ++failures;
+    });
+    replacement.queueSilently(
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "replacement"}}));
+    oldDevice.setReadHook([&] { m_client->setTransport(&replacement); });
+    oldDevice.deliver(jsonLine({{"jsonrpc", "2.0"}, {"method", "old-peer"}}));
+    QCOMPARE(failures, 1);
+    QCOMPARE(notifications.size(), 1);
+    QCOMPARE(notifications.first().first().toString(), QStringLiteral("replacement"));
+    QCOMPARE(m_client->transport(), &replacement);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::deletingClientDuringReadIsSafe()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    int failures = 0;
+    const auto teardown = qScopeGuard([&] {
+        if (m_client)
+            m_client->setTransport(nullptr);
+    });
+    m_client->call(QStringLiteral("ping"), {}, [&](QJsonValue, auto error) {
+        QVERIFY(error.has_value());
+        ++failures;
+    });
+    device.setReadHook([&] {
+        delete m_client;
+        m_client = nullptr;
+    });
+    device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"method", "discarded"}}));
+    QCOMPARE(failures, 1);
+    QVERIFY(!m_client);
+}
+
+void TstRpcClient::eofDuringReadDeliversTheFinalResponse()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QSignalSpy closed(m_client, &CodeharbordClient::transportClosed);
+    int successes = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    const qint64 id = m_client->call(
+        QStringLiteral("ping"), {}, [&](QJsonValue result, auto error) {
+            QVERIFY(!error.has_value());
+            QVERIFY(result.toBool());
+            ++successes;
+        });
+    device.setReadHook([&] { device.announceEof(); });
+    device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", true}}));
+    QCOMPARE(successes, 1);
+    QCOMPARE(closed.size(), 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::nestedReadPreservesFrameOrder()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    QStringList methods;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    connect(m_client, &CodeharbordClient::notificationReceived, m_client,
+            [&](const QString& method, const QJsonValue&) { methods.append(method); });
+    device.setReadHook([&] {
+        device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"method", "second"}}));
+    });
+    device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"method", "first"}}));
+    QTRY_COMPARE(methods.size(), 2);
+    QCOMPARE(methods, QStringList({QStringLiteral("first"), QStringLiteral("second")}));
+}
+
+void TstRpcClient::emptyReadPreservesNestedReadiness()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    int callbacks = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    const qint64 id = m_client->call(
+        QStringLiteral("ping"), {}, [&](QJsonValue result, auto error) {
+            QVERIFY(!error.has_value());
+            QVERIFY(result.toBool());
+            ++callbacks;
+        });
+    device.setReadHook([&] {
+        device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"id", id}, {"result", true}}));
+    });
+    // The first read extracts no bytes; the hook makes a response readable and
+    // emits its sole readyRead before that empty read returns.
+    device.deliver({});
+    QTRY_COMPARE(callbacks, 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstRpcClient::deferredEmptyReadsDoNotSpin()
+{
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    std::function<void()> announceAgain;
+    announceAgain = [&] {
+        device.setReadHook(announceAgain);
+        device.deliver({});
+    };
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    device.setReadHook(announceAgain);
+    device.deliver({});
+    // One initial attempt plus one deferred attempt is permitted without any
+    // bytes. A device emitting readiness from every empty read must then stop.
+    QTRY_COMPARE(device.readCalls(), 2);
+    QTest::qWait(20);
+    QCOMPARE(device.readCalls(), 2);
+}
+
+void TstRpcClient::nativeJsonEnvelopeDepthBoundary_data()
+{
+    QTest::addColumn<int>("envelopeDepth");
+    QTest::addColumn<bool>("supported");
+    QTest::newRow("full-envelope-depth-1024") << 1024 << true;
+    QTest::newRow("full-envelope-depth-1025") << 1025 << false;
+}
+
+void TstRpcClient::nativeJsonEnvelopeDepthBoundary()
+{
+    QFETCH(int, envelopeDepth);
+    QFETCH(bool, supported);
+    ScriptedDevice device;
+    m_client->setTransport(&device);
+    int firstCallbacks = 0;
+    int secondCallbacks = 0;
+    int failures = 0;
+    int adoptedValue = 0;
+    bool appliedTrailingMutation = false;
+    QSignalSpy notifications(m_client, &CodeharbordClient::notificationReceived);
+    QSignalSpy closed(m_client, &CodeharbordClient::transportClosed);
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    const qint64 firstId = m_client->call(
+        QStringLiteral("opaque.read"), {}, [&](QJsonValue value, auto error) {
+            ++firstCallbacks;
+            if (error) {
+                ++failures;
+                QCOMPARE(error->code, ch::rpc::kInternalError);
+                return;
+            }
+            // Count the envelope object separately from its nested result.
+            for (int depth = 1; depth < envelopeDepth; ++depth) {
+                QVERIFY(value.isArray());
+                const QJsonArray array = value.toArray();
+                QCOMPARE(array.size(), 1);
+                value = array.first();
+            }
+            QCOMPARE(value.toInt(), 7);
+            adoptedValue = value.toInt();
+        });
+    const qint64 secondId = m_client->call(
+        QStringLiteral("workspace.list"), {}, [&](QJsonValue value, auto error) {
+            ++secondCallbacks;
+            if (error) {
+                ++failures;
+                QCOMPARE(error->code, ch::rpc::kInternalError);
+                return;
+            }
+            appliedTrailingMutation = value.toBool();
+        });
+    // Build raw, valid JSON without asking QJsonDocument to serialize a tree:
+    // one envelope object plus envelopeDepth-1 nested array containers.
+    QByteArray frame = "{\"jsonrpc\":\"2.0\",\"id\":" + QByteArray::number(firstId)
+                     + ",\"result\":";
+    frame += QByteArray(envelopeDepth - 1, '[');
+    frame += '7';
+    frame += QByteArray(envelopeDepth - 1, ']');
+    frame += "}\n";
+    device.deliver(
+        frame +
+        jsonLine({{"jsonrpc", "2.0"}, {"id", secondId}, {"result", true}}) +
+        jsonLine({{"jsonrpc", "2.0"}, {"method", "old-stream-tail"}}));
+    QTRY_COMPARE(firstCallbacks, 1);
+    QTRY_COMPARE(secondCallbacks, 1);
+    QCOMPARE(failures, supported ? 0 : 2);
+    QCOMPARE(adoptedValue, supported ? 7 : 0);
+    QCOMPARE(appliedTrailingMutation, supported);
+    QCOMPARE(notifications.size(), supported ? 1 : 0);
+    QCOMPARE(closed.size(), supported ? 0 : 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+    if (!supported) {
+        // Even separately delivered bytes from the rejected binding stay inert.
+        device.deliver(jsonLine({{"jsonrpc", "2.0"}, {"id", secondId}, {"result", true}}));
+        QCOMPARE(firstCallbacks, 1);
+        QCOMPARE(secondCallbacks, 1);
+        QVERIFY(!appliedTrailingMutation);
+        QCOMPARE(closed.size(), 1);
+    }
+}
+
+void TstRpcClient::decodeAgentSocketValidatesRemoteEndpoint_data()
+{
+    QTest::addColumn<QJsonValue>("value");
+    QTest::addColumn<bool>("accepted");
+    QTest::newRow("missing") << QJsonValue(QJsonValue::Undefined) << false;
+    QTest::newRow("null") << QJsonValue(QJsonValue::Null) << false;
+    QTest::newRow("number") << QJsonValue(7) << false;
+    QTest::newRow("object") << QJsonValue(QJsonObject{}) << false;
+    QTest::newRow("array") << QJsonValue(QJsonArray{}) << false;
+    QTest::newRow("empty") << QJsonValue("") << false;
+    QTest::newRow("relative") << QJsonValue("run/codeharbor.sock") << false;
+    QTest::newRow("windows-drive") << QJsonValue("C:/run/codeharbor.sock") << false;
+    QTest::newRow("windows-unc") << QJsonValue("\\\\host\\share\\agent.sock") << false;
+    QTest::newRow("nul")
+        << QJsonValue(QStringLiteral("/run/agent") + QChar::Null + QStringLiteral(".sock"))
+        << false;
+    QTest::newRow("posix") << QJsonValue("/run/user/1000/codeharbor/agent.sock") << true;
+    QTest::newRow("literal-spaces-and-unicode")
+        << QJsonValue(QStringLiteral("/srv/agent events/测试.sock")) << true;
+}
+
+void TstRpcClient::decodeAgentSocketValidatesRemoteEndpoint()
+{
+    QFETCH(QJsonValue, value);
+    QFETCH(bool, accepted);
+    QJsonObject metadata;
+    if (!value.isUndefined())
+        metadata.insert(QStringLiteral("agentSocket"), value);
+    const std::optional<QString> endpoint = ch::rpc::decodeAgentSocket(metadata);
+    QCOMPARE(endpoint.has_value(), accepted);
+    if (endpoint)
+        QCOMPARE(*endpoint, value.toString());
+}
 
 void TstRpcClient::transportChangingDefersSynchronousIngressUntilInvalidationFinishes()
 {
@@ -2502,6 +2754,10 @@ void TstRpcClient::liveServerInfoOverProcess()
     QProcessEnvironment envp = QProcessEnvironment::systemEnvironment();
     envp.insert(QStringLiteral("CODEHARBOR_DB"),
                 dbDir.filePath(QStringLiteral("ws.db")));
+    const QString advertisedEndpoint =
+        QStringLiteral("/tmp/codeharbor-rpc-test-%1.sock")
+            .arg(QCoreApplication::applicationPid());
+    envp.insert(QStringLiteral("CODEHARBOR_AGENT_SOCKET"), advertisedEndpoint);
     proc.setProcessEnvironment(envp);
     proc.setProgram(node);
     proc.setArguments({QStringLiteral(CH_REPO_ROOT "/remote/src/codeharbord.ts"),
@@ -2526,6 +2782,9 @@ void TstRpcClient::liveServerInfoOverProcess()
     QVERIFY(!err.has_value());
     QCOMPARE(result.toObject().value("name").toString(),
              QStringLiteral("codeharbord"));
+    const auto agentSocket = ch::rpc::decodeAgentSocket(result.toObject());
+    QVERIFY(agentSocket.has_value());
+    QCOMPARE(*agentSocket, advertisedEndpoint);
 
     m_client->setTransport(nullptr);
     proc.closeWriteChannel();

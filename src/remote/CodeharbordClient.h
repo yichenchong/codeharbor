@@ -37,6 +37,13 @@ struct RpcError {
 // connection pool, tests wire a QBuffer or QLocalSocket pair. Distinct from the
 // server-side implementation in remote/.
 //
+// Native JSON interoperability: QJsonDocument in Qt 6.10 supports at most 1024
+// nested containers, counting the JSON-RPC envelope itself. The Node daemon's
+// opaque JSON domain is broader; valid server JSON is not necessarily decodable
+// by this client. A DeepNesting parse failure closes the current binding and
+// fails every pending request once, discarding its remaining frames. Ordinary
+// malformed JSON lines still warn and allow the following line to resynchronize.
+//
 // Liveness: there are no per-request deadlines, but an optional transport-level
 // HEARTBEAT (enableHeartbeat()) detects a peer that has stopped answering at
 // all. See enableHeartbeat() for exactly what that does and does not cover.
@@ -202,14 +209,15 @@ signals:
     // response is not allowed to carry `method`, so the message is malformed
     // whichever way it was meant) and always emits a protocolWarning().
     void notificationReceived(const QString& method, const QJsonValue& params);
-    // A malformed line, unknown/duplicate response id, or otherwise unroutable
-    // message was received. Non-fatal; the stream continues.
+    // A malformed line, unknown/duplicate response id, otherwise unroutable
+    // message, or fatal stream/parser limit was received. Ordinary malformed
+    // JSON is non-fatal; frame overflow and DeepNesting also close the binding.
     void protocolWarning(const QString& message);
     // The transport closed/disconnected, was DESTROYED by its owner while still
-    // bound, or its byte stream became untrustworthy (an unframed line past the
-    // size cap). Emitted after any bytes still readable on the transport have
-    // been routed, then all remaining pending callbacks have been failed with a
-    // synthetic error, the pending map cleared and the read buffer released.
+    // bound, or became unusable (a line past the size cap or JSON past Qt's
+    // nesting limit). For ordinary EOF, bytes still readable on the transport
+    // are routed; unusable-stream bytes are discarded. Remaining pending callbacks
+    // are failed with a synthetic error, the pending map cleared and buffer released.
     // Emitted at most once per bound transport. Once it has fired, no further
     // frame from that transport is routed — not even one already sitting in the
     // read buffer — and every call() fails synchronously until a transport is
@@ -267,6 +275,9 @@ private slots:
     void onHeartbeatTick();
 
 private:
+    // Retry a deferred readyRead once after an empty virtual read; require
+    // actual progress before another retry in that queued chain.
+    void readAvailable(bool allowDeferredRetry);
     void processLine(const QByteArray& line);
     void failAllPending(const RpcError& error);
     // Drain/announce only the current binding, once all nested invalidation
@@ -315,17 +326,15 @@ private:
     // back while remove() keeps it, and every caller here is releasing a buffer
     // that may hold up to the 16 MiB line cap.
     void releaseReadBuffer();
-    // The byte stream is no longer framable: a line arrived unframed, or past
-    // the size cap, so we can no longer tell where the next message begins and
-    // nothing else the peer queued is a message. Release the garbage, latch the
-    // stream untrusted, announce it, and take the ordinary transport-loss path
-    // against `transportGeneration` — the binding the offending bytes came
-    // from, which a protocolWarning slot may already have replaced.
+    // The stream cannot be consumed safely: framing was lost or a JSON document
+    // exceeds Qt's supported nesting. Release buffered bytes, prevent the close
+    // path from draining further frames, announce the reason, and take the
+    // ordinary transport-loss path against the offending binding's generation.
     //
     // Touch NO member after this returns: it emits a signal and dispatches
-    // pending failures, either of which may delete this client. Both call sites
-    // return immediately, which is why nothing is reported back.
-    void dropUntrustedStream(quint64 transportGeneration);
+    // pending failures, either of which may delete this client. Callers return
+    // immediately and touch no members afterwards.
+    void dropUntrustedStream(quint64 transportGeneration, const QString& warning);
 
     // QPointer, not a raw pointer: the transport is owned by the CALLER and can
     // be destroyed while still bound. A raw pointer would dangle, and the next
@@ -341,6 +350,9 @@ private:
     int m_transportChangeDepth = 0;
     bool m_bindingNeedsAnnouncement = false;
     bool m_readDeferred = false;
+    // A virtual readData() may emit signals or spin an event loop. Finish that
+    // read before draining another read, announcing a replacement, or closing.
+    bool m_readInProgress = false;
     bool m_closeDeferred = false;
     // Incremented for every non-empty read, including a synchronous response
     // delivered inside write(). Heartbeat ticks use it to recognize that
@@ -371,13 +383,10 @@ private:
     // Set once the transport is gone or untrustworthy; CLEARED again by
     // setTransport(), which is how a reconnect revives the client.
     bool m_closed = false;
-    // Set when the BYTE STREAM has been declared untrustworthy: an unframed or
-    // over-cap line means we can no longer tell where the next frame begins, so
-    // whatever else the peer has queued is not a message any more. It exists
-    // only to suppress onTransportClosed()'s last-gasp drain, which otherwise
-    // reads and routes those very bytes back — and, because each 16 MiB chunk
-    // trips the cap again, re-enters onTransportClosed() once per chunk. Cleared
-    // by setTransport(), like m_closed.
+    // Suppress the close path's last-gasp drain after framing loss or an
+    // unsupported JSON document. Further bytes from a rejected binding must
+    // not be routed or repeatedly trigger the same limit. setTransport()
+    // clears this flag, like m_closed.
     bool m_streamUntrusted = false;
     // Set at the top of ~CodeharbordClient and never cleared. m_closed alone is
     // not enough during teardown precisely because setTransport() clears it: a

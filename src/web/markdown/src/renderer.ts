@@ -331,9 +331,20 @@ export function rewriteRelativeUrls(
             const separator = href.search(/[?#]/);
             const path = separator < 0 ? href : href.slice(0, separator);
             const suffix = separator < 0 ? "" : href.slice(separator);
-            link.setAttribute("href", remotePathToFileUrl(
-                resolveRemotePath(documentPath, path),
-            ) + suffix);
+            let decodedPath = path;
+            try {
+                decodedPath = decodeURIComponent(path);
+            } catch {
+                // Keep malformed escapes as literal POSIX filename content.
+            }
+            let resolved = resolveRemotePath(documentPath, path);
+            // The file viewer uses a trailing slash to distinguish directories
+            // from files. Normalisation removes it, including the implicit
+            // directory in "." and "..", so restore that intent for links.
+            if (/(?:^|\/)\.{0,2}$/.test(decodedPath) && !resolved.endsWith("/")) {
+                resolved += "/";
+            }
+            link.setAttribute("href", remotePathToFileUrl(resolved) + suffix);
         }
         // target was forbidden by the sanitizer. Keep all navigation in the
         // current pane so QML can apply the external-profile boundary.

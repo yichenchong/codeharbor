@@ -4,6 +4,7 @@ target_link_libraries(tst_appcontroller PRIVATE
     Qt6::Test
     Qt6::Core
     Qt6::Gui
+    Qt6::Network
 )
 add_test(NAME tst_appcontroller COMMAND tst_appcontroller)
 
@@ -113,8 +114,8 @@ set_tests_properties(tst_livereconnect PROPERTIES
 
 # Notifier (a Phase 4 deliverable in SPEC 16; it has no section of its own).
 # tst_notifier forces a bus-less environment in its own main() so it exercises
-# the headless no-op path everywhere; tst_notifierlive is the only proof that a
-# notification reaches a real display.
+# the headless no-op path everywhere; tst_notifierlive verifies the real daemon
+# acknowledges notification requests, not that a person saw them on a display.
 qt_add_executable(tst_notifier tst_notifier.cpp)
 target_link_libraries(tst_notifier PRIVATE ch_app Qt6::Test Qt6::Core)
 add_test(NAME tst_notifier COMMAND tst_notifier)
@@ -124,7 +125,7 @@ add_test(NAME tst_notifier COMMAND tst_notifier)
 #
 #  * LABELS desktop, NOT live. Every `live` target needs the SSH fixture; this
 #    one needs a desktop session and nothing else, so `ctest -L live` must not
-#    imply notifications were exercised. Demand the proof with `-L desktop`.
+#    imply daemon acknowledgement was exercised. Request that with `-L desktop`.
 #    (Unlabelled runs such as `ctest --preset dev` still include it.)
 #  * SKIP_REGULAR_EXPRESSION on the banner the test prints when no daemon is
 #    present, so ctest reports Skipped instead of Passed. Failing outright

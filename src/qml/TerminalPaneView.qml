@@ -43,6 +43,11 @@ Rectangle {
 
     // ---- split-tree identity ----
     property string paneId: ""
+    // Supplied explicitly by TerminalRegion for its stored empty-id leaf.
+    // A standalone pane can temporarily have no id while its identity settles.
+    property bool placeholder: false
+    readonly property string emptyRegionMessage:
+        qsTr("This terminal region is empty. Split to open a terminal.")
     // Which Dev Session this pane belongs to, and which LAYOUT SLOT of it this
     // pane occupies (SPEC 4.5). `terminalId` is the layout pane id —
     // "terminal-1", "terminal-2", … from ch::SessionLayouts — and that is ALL
@@ -67,6 +72,8 @@ Rectangle {
     }
 
     function beginRename() {
+        if (pane.placeholder)
+            return
         pane.paneActivated(pane.paneId)
         renameDialog.open()
     }
@@ -76,6 +83,8 @@ Rectangle {
     // before the dialog opens, so the host records this pane as the source of
     // the destructive action.
     function beginClose() {
+        if (pane.placeholder)
+            return
         pane.paneActivated(pane.paneId)
         killDialog.open()
     }
@@ -130,6 +139,8 @@ Rectangle {
     property var appController: (typeof app !== "undefined" && app) ? app : null
 
     function beginSetHarness() {
+        if (pane.placeholder)
+            return
         pane.paneActivated(pane.paneId)
         harnessDialog.open()
     }
@@ -186,28 +197,9 @@ Rectangle {
     // out of one could hand a brand new pane the name of a shell another client
     // left running — and `tmux new-session -A` would silently attach it.
     property string tmuxTarget: ""
-    // A resolveTarget() round trip is outstanding. Its answer arrives on the
-    // factory's targetResolved signal, which re-enters attachNow().
+    // A current resolveTarget() round trip is outstanding. The factory cancels
+    // its delivery on detach or supersession; only the latest request answers.
     property bool resolving: false
-    // The slot the outstanding resolution was started FOR, as
-    // "<devSessionId>/<terminalId>/<terminalPaneId>". A pane can be pointed at
-    // another Dev Session while its lookup is still travelling, and the answer
-    // to the old question must never be adopted as the new slot's target —
-    // which is two panes on one shell, the exact failure this whole path
-    // removes.
-    property string resolvingFor: ""
-    // The pane was retargeted while that lookup was in flight, so the answer
-    // still travelling names a slot this pane has LEFT.
-    //
-    // Comparing `resolvingFor` against slotKey() cannot catch that on its own.
-    // If a retarget were allowed to ask its new question straight away, TWO
-    // lookups would be outstanding at once, `resolvingFor` would already hold
-    // the NEW key, and the OLD answer — which carries nothing but a controller
-    // and a target string — would sail through the comparison and attach this
-    // pane to the previous Dev Session's shell. So exactly ONE lookup is ever
-    // outstanding: a retarget marks the flight stale instead of starting a
-    // second one, and the answer, once it lands, asks the current question.
-    property bool resolveStale: false
 
     // ---- focus reporting (SPEC 4.5) ----
     // The user is working in THIS pane. TerminalRegion connects this when it
@@ -264,6 +256,8 @@ Rectangle {
     property bool bridgeRegistered: false
 
     function initializeController() {
+        if (pane.placeholder)
+            return
         if (!pane.controller && pane.factory)
             pane.controller = pane.factory.create(pane)
         if (!pane.bridge && pane.controller && pane.factory)
@@ -295,11 +289,55 @@ Rectangle {
     readonly property string connectionState: pane.bridge ? pane.bridge.connectionState : "unloaded"
     property bool attached: false
     property bool pageLoaded: false
+    // Loading the document does not finish the asynchronous WebChannel mount.
+    // Its page APIs are installed only after xterm exists; retain host state
+    // until then instead of silently dropping settings and restored focus.
+    property bool rendererReady: false
+    property int rendererLoadSerial: 0
+    property int rendererProbeRemaining: 0
+    property bool rendererProbeInFlight: false
+
+    Timer {
+        interval: 50
+        repeat: true
+        running: pane.pageLoaded && !pane.rendererReady
+                 && pane.rendererProbeRemaining > 0
+        onTriggered: {
+            pane.rendererProbeRemaining -= 1
+            pane.probeRendererReady()
+        }
+    }
+
+    function probeRendererReady() {
+        if (!pane.pageLoaded || pane.rendererReady
+                || pane.rendererProbeInFlight || !viewLoader.item)
+            return
+        const serial = pane.rendererLoadSerial
+        const view = viewLoader.item
+        pane.rendererProbeInFlight = true
+        view.runJavaScript(
+            "typeof window.applyTheme === 'function'"
+          + " && typeof window.codeharborSetTerminalPreferences === 'function'"
+          + " && typeof window.codeharborFocusTerminal === 'function'",
+            function(ready) {
+                if (serial !== pane.rendererLoadSerial
+                        || view !== viewLoader.item || !pane.pageLoaded)
+                    return
+                pane.rendererProbeInFlight = false
+                if (ready !== true)
+                    return
+                pane.rendererReady = true
+                pane.applyTerminalTheme()
+                pane.applyTerminalSettings()
+                pane.focusTerminalPage()
+            })
+    }
     // Human-readable reason the pane is not live; shown instead of a blank pane.
     // Whole sentences, because this is the only thing on screen when a terminal
     // fails to come up — "unloaded" is a state name, not an explanation.
-    property string statusText: pane.factory ? qsTr("Not attached to a shell yet.")
-                                             : qsTr("No terminal service in this window.")
+    property string statusText: pane.placeholder ? pane.emptyRegionMessage
+        : pane.factory ? qsTr("Not attached to a shell yet.")
+                       : qsTr("No terminal service in this window.")
     // Live means: a PTY is attached AND the renderer is showing it.
     readonly property bool live: pane.attached && pane.pageLoaded
                                  && pane.connectionState === "ready"
@@ -364,7 +402,7 @@ Rectangle {
     // (ch::toString(TerminalState), src/models/SessionState.cpp). `resolving` is
     // the step before all of them: the server round trip that tells this pane
     // WHICH tmux session is its own.
-    readonly property bool comingUp: pane.attaching
+    readonly property bool comingUp: !pane.placeholder && (pane.attaching
                                      || pane.resolving
                                      // Spelled out rather than calling
                                      // awaitingIdentity(): a binding must name
@@ -375,7 +413,7 @@ Rectangle {
                                          && !pane.terminalLegacy
                                          && !pane.identityStalled)
                                      || pane.connectionState === "opening_channel"
-                                     || pane.connectionState === "attaching_tmux"
+                                     || pane.connectionState === "attaching_tmux")
 
     // The pane's state in ONE word, for the header. Deliberately not
     // `connectionState` verbatim: that publishes machine words ("unloaded",
@@ -386,7 +424,8 @@ Rectangle {
     // "attaching…" is the shell coming up; "starting…" is the shell already up
     // (or not started yet) with the RENDERER still loading, which is the other
     // half of `live`.
-    readonly property string stateLabel: pane.live ? qsTr("live")
+    readonly property string stateLabel: pane.placeholder ? qsTr("empty")
+        : pane.live ? qsTr("live")
         : pane.comingUp ? qsTr("attaching\u2026")
         : pane.attached ? qsTr("starting\u2026")
         : pane.connectionState === "error" ? qsTr("error")
@@ -427,13 +466,6 @@ Rectangle {
     // creates and never says which, so the factory asks the host afterwards.
     property bool sessionReplaced: false
 
-    // The identity an outstanding resolution was started FOR: Dev Session, slot
-    // label and row id. Used to tell an answer meant for what this pane is NOW
-    // from one meant for what it was when the question was asked.
-    function slotKey() {
-        return pane.devSessionId + "/" + pane.terminalId + "/" + pane.terminalPaneId
-    }
-
     // Open (or re-open) this pane's PTY. Idempotent while attached; safe to call
     // from the host whenever the session or the SSH connection changes.
     //
@@ -444,6 +476,10 @@ Rectangle {
     // resolved, the target stays on the pane, so a reconnect or a Retry goes
     // straight to the attach.
     function attachNow() {
+        if (pane.placeholder) {
+            pane.statusText = pane.emptyRegionMessage
+            return
+        }
         if (pane.attaching || pane.attached || pane.resolving || pane.sessionKilled
                 || !pane.factory || !pane.controller)
             return
@@ -453,6 +489,10 @@ Rectangle {
         }
         if (!pane.factory.connected()) {
             pane.statusText = qsTr("Not connected to a server.")
+            return
+        }
+        if (!pane.factory.workspaceReady) {
+            pane.statusText = qsTr("Waiting for the server workspace\u2026")
             return
         }
         if (pane.tmuxTarget.length === 0) {
@@ -474,12 +514,11 @@ Rectangle {
                 }
                 return
             }
-            // Phase one. The factory answers on targetResolved (always
-            // asynchronously, so `resolving` is set before the answer can
-            // arrive); a false return means it refused outright and has already
-            // written the reason through error(). An EMPTY terminalPaneId here
-            // is the legacy case checked just above: resolve by label, once.
-            pane.resolvingFor = pane.slotKey()
+            // Phase one. A current request answers asynchronously, so
+            // `resolving` is assigned before delivery; detach/supersession
+            // cancels that answer. A false return means outright refusal,
+            // already reported through error(). Empty terminalPaneId is the
+            // legacy case checked above: resolve by label, once.
             pane.resolving = pane.factory.resolveTarget(pane.controller, pane.devSessionId,
                                                         pane.terminalId, pane.terminalPaneId,
                                                         pane.workingDir)
@@ -530,6 +569,9 @@ Rectangle {
 
     // Release the PTY channel; the remote tmux session keeps running.
     function detachNow() {
+        // detach() also cancels a lookup that has not attached yet. Its stale
+        // answer will not arrive, so do not retain a wait for that signal.
+        pane.resolving = false
         if (pane.factory && pane.controller)
             pane.factory.detach(pane.controller)
         pane.attached = false
@@ -554,6 +596,8 @@ Rectangle {
     // otherwise so the pane can try again. Comparing it across the call is
     // therefore how QML learns what happened.
     function killSession() {
+        if (pane.placeholder)
+            return false
         if (!pane.factory || !pane.controller) {
             pane.statusText = qsTr("No terminal service in this window.")
             return false
@@ -601,17 +645,17 @@ Rectangle {
     // attaching the new slot to it would put two panes on one shell — and open
     // the new one.
     function retarget() {
-        if (pane.attached)
-            pane.detachNow()
+        // These dialogs describe the terminal that was here when they opened.
+        // A cached layout slot can be republished with a different row id;
+        // accepting its old confirmation must never act on that replacement.
+        if (renameDialog)
+            renameDialog.close()
+        if (harnessDialog)
+            harnessDialog.close()
+        if (killDialog)
+            killDialog.close()
+        pane.detachNow()
         pane.tmuxTarget = ""
-        // A lookup still in flight was asked about the slot this pane has just
-        // left. It is NOT cancelled and no second one is started beside it:
-        // marking it stale keeps exactly one answer outstanding, which is the
-        // only way an answer that carries no slot of its own can be told apart
-        // from the one this pane wants now. onTargetResolved discards it and
-        // asks the current question.
-        if (pane.resolving)
-            pane.resolveStale = true
         // The new slot gets a fresh window, and a stalled report about the old
         // one must not stick to it. Neither may "the user killed this one":
         // that verdict belongs to the terminal this pane has just left, and
@@ -664,10 +708,23 @@ Rectangle {
     onWorkingDirChanged: if (!pane.attached) pane.attachNow()
     // Hidden panes keep their PTY but must stop being treated as renderable, so
     // output buffers instead of being flushed at a view nobody can see (SPEC 5.4).
-    onVisibleChanged: if (pane.bridge) pane.bridge.notifyViewVisible(pane.visible)
+    onVisibleChanged: {
+        if (pane.bridge)
+            pane.bridge.notifyViewVisible(pane.visible)
+        if (pane.visible)
+            pane.attachNow()
+    }
 
     Connections {
         target: pane.factory
+        function onWorkspaceReadyChanged() {
+            if (!pane.factory.workspaceReady) {
+                // The factory cancels delivery while the peer is unidentified.
+                pane.resolving = false
+            } else if (pane.visible && pane.factory.connected()) {
+                pane.attachNow()
+            }
+        }
         // Channel diagnostics are reported for every pane on this factory; only
         // this pane's own failures belong in its chrome.
         function onError(controller, message) {
@@ -681,21 +738,10 @@ Rectangle {
         function onTargetResolved(controller, target) {
             if (controller !== pane.controller)
                 return
-            // The one outstanding lookup is over either way. Clearing this
-            // FIRST is what lets the stale branch below ask again: attachNow()
-            // declines while a resolution is in flight, so a stale answer that
-            // left `resolving` set would strand the pane for good — its own
-            // Retry button included.
+            // The factory suppresses cancelled/superseded deliveries. Retarget
+            // can therefore start its current lookup immediately, without
+            // waiting for an abandoned request to finish.
             pane.resolving = false
-            if (pane.resolveStale || pane.resolvingFor !== pane.slotKey()) {
-                // Answer to a question this pane no longer has: it was pointed
-                // at another slot while the lookup travelled. Adopting it would
-                // attach this pane to the OTHER slot's shell. Ask the question
-                // it has now instead — nothing else will.
-                pane.resolveStale = false
-                pane.attachNow()
-                return
-            }
             if (target.length === 0)
                 return
             pane.tmuxTarget = target
@@ -793,12 +839,14 @@ Rectangle {
                 // what make it the same comfortable target as split and rename.
                 text: qsTr("Close this pane and kill its remote session")
                 glyph: "\u00d7"
+                enabled: !pane.placeholder
                 onClicked: pane.beginClose()
             },
             AppPaneHeader.Action {
                 objectName: "terminalRenameButton"
                 text: qsTr("Rename this pane")
                 glyph: "R"
+                enabled: !pane.placeholder
                 onClicked: pane.beginRename()
             },
             AppPaneHeader.Action {
@@ -1002,7 +1050,7 @@ Rectangle {
     }
 
     function focusTerminalPage() {
-        if (!pane.focusPending || !pane.paneActive
+        if (!pane.focusPending || !pane.paneActive || !pane.rendererReady
                 || !pane.pageLoaded || !viewLoader.item)
             return;
         viewLoader.item.runJavaScript(
@@ -1091,7 +1139,8 @@ Rectangle {
     // binding cannot reach xterm; the page installs this tiny function during
     // mount and keeps the terminal instance alive while it applies settings.
     function applyTerminalSettings() {
-        if (!pane.settingsObject || !pane.pageLoaded || !viewLoader.item)
+        if (!pane.settingsObject || !pane.rendererReady
+                || !pane.pageLoaded || !viewLoader.item)
             return
         const fontPoints = Number(pane.settingsObject.terminalFontSize)
         const pixelRatio = Number(pane.settingsObject.terminalPixelRatio)
@@ -1110,7 +1159,7 @@ Rectangle {
     // a JSON object rather than attempting a direct binding. The page keeps a
     // dark standalone default and makes this operation safe to repeat.
     function applyTerminalTheme() {
-        if (!pane.pageLoaded || !viewLoader.item || !Theme.roles)
+        if (!pane.rendererReady || !pane.pageLoaded || !viewLoader.item || !Theme.roles)
             return
         const roles = JSON.stringify(Theme.roles)
         if (!roles)
@@ -1235,11 +1284,16 @@ Rectangle {
                 onLoadingChanged: function(request) {
                     if (request.status === WebEngineView.LoadStartedStatus) {
                         pane.pageLoaded = false
+                        pane.rendererLoadSerial += 1
+                        pane.rendererReady = false
+                        pane.rendererProbeInFlight = false
+                        pane.rendererProbeRemaining = 0
                     } else if (request.status === WebEngineView.LoadSucceededStatus) {
                         pane.pageLoaded = true
-                        Qt.callLater(pane.applyTerminalTheme)
-                        Qt.callLater(pane.applyTerminalSettings)
-                        Qt.callLater(pane.focusTerminalPage)
+                        // Match the existing 20-second setup window, without
+                        // making a broken page poll for the pane's whole life.
+                        pane.rendererProbeRemaining = 400
+                        Qt.callLater(pane.probeRendererReady)
                     } else if (request.status === WebEngineView.LoadFailedStatus) {
                         pane.pageLoaded = false
                         pane.statusText = qsTr("The terminal renderer failed to load: %1")
@@ -1282,7 +1336,7 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 // The headline is what this pane IS. The id it is keyed by is
                 // plumbing and belongs in the small print below.
-                text: qsTr("Terminal")
+                text: pane.placeholder ? qsTr("No terminals open") : qsTr("Terminal")
                 color: Theme.text
                 font.pixelSize: Theme.fontSizeTitle
             }
@@ -1322,7 +1376,7 @@ Rectangle {
                 id: attachButton
                 objectName: "terminalConnectButton"
                 anchors.horizontalCenter: parent.horizontalCenter
-                visible: pane.factory !== null && !pane.attached
+                visible: !pane.placeholder && pane.factory !== null && !pane.attached
                 text: qsTr("Connect")
                 implicitHeight: 30
                 leftPadding: 14

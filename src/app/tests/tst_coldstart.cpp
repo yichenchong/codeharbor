@@ -31,9 +31,10 @@
 //     the settings window, and the known_hosts store can only be the default
 //     one under the fresh config dir. If any of that were still env-driven,
 //     this file would fail to connect at all.
-//   * QSettings/QStandardPaths are redirected to a throwaway XDG_CONFIG_HOME
-//     before anything exists, so the developer's ~/.config/CodeHarbor is never
-//     read or written.
+//   * Settings/trust use a throwaway root. Linux exercises genuine native
+//     defaults through XDG_CONFIG_HOME; other platforms use explicit isolated
+//     settings/trust paths because native registry/CFPreferences stores are not
+//     redirected by that variable.
 //   * Remote effects are verified OUT OF BAND: a plain SSH exec channel running
 //     `cat`/`tmux has-session`, never the same RPC path that produced them.
 //   * A step that catches the product misbehaving REPORTS it and keeps walking.
@@ -84,6 +85,7 @@
 #include <QMetaObject>
 #include <QModelIndex>
 #include <QPoint>
+#include <QPointer>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQmlError>
@@ -141,8 +143,11 @@ struct LiveEnv {
 };
 LiveEnv g_live;
 
-// Throwaway config root, installed as XDG_CONFIG_HOME by main().
+// Linux keeps the production default-path gate; other platforms inject files
+// beneath this same throwaway root instead of opening native user stores.
 QString g_configHome;
+QString g_settingsPath;
+QString g_knownHostsOverride;
 
 // QObject behind a QML property, whether it arrived as a raw pointer or boxed
 // in a QJSValue (a `property var` holding a QObject can be either).
@@ -339,13 +344,16 @@ struct AppGraph {
 
     AppGraph()
         : bootstrap(&pool, &client, &monitor)
-        , app(&client)
+        , app(&client, nullptr, g_settingsPath)
         , viewerProfiles(&client)
         , viewers(&client)
+        , serverProfiles(g_settingsPath)
         , layouts(app.workspaceDb(), app.uiState())
         , editorFactory(&client)
         , terminalFactory(&pool)
     {
+        if (!g_knownHostsOverride.isEmpty())
+            bootstrap.setKnownHostsPath(g_knownHostsOverride);
         QObject::connect(&bootstrap, &ch::SessionBootstrap::error, &bootstrap,
                          [this](const QString& text) { bootstrapErrors << stamped(text); });
         QObject::connect(&app, &ch::AppController::error, &app,
@@ -367,8 +375,6 @@ struct AppGraph {
         // table, so the factory needs the workspace repository and adopted
         // server id before the first pane can attach.
         terminalFactory.setWorkspace(app.workspaceDb());
-        QObject::connect(&app, &ch::AppController::serverIdChanged, &terminalFactory,
-                         [this]() { terminalFactory.setServerId(app.serverId()); });
         // SPEC 6.6: generic harness panes report output activity through this
         // factory because they have no adapter lifecycle events.
         terminalFactory.setAgentMonitor(&monitor);
@@ -379,9 +385,6 @@ struct AppGraph {
         app.setTerminalFactory(&terminalFactory);
         QObject::connect(&monitor, &ch::AgentStatusMonitor::notify, &notifier,
                          &ch::Notifier::notify);
-
-        // --- main.cpp, line for line ------------------------------------
-        wiredFromEnvironment = bootstrap.connectAndWireFromEnvironment();
 
         // Engine-level QML warnings only: binding loops, type errors, undefined
         // property reads — everything Main.qml and its children can raise while
@@ -416,6 +419,8 @@ struct AppGraph {
                                                  &terminalFactory);
 
         engine.loadFromModule("CodeHarbor", "Main");
+        if (!engine.rootObjects().isEmpty())
+            wiredFromEnvironment = bootstrap.connectAndWireFromEnvironment();
     }
 
     QQuickWindow* window() const
@@ -641,12 +646,16 @@ void TstColdStart::buildGraph()
 
 QString TstColdStart::knownHostsPath() const
 {
+    if (!g_knownHostsOverride.isEmpty())
+        return g_knownHostsOverride;
     return QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
         .filePath(QStringLiteral("known_hosts"));
 }
 
 QString TstColdStart::configFilePath() const
 {
+    if (!g_settingsPath.isEmpty())
+        return g_settingsPath;
     return g_configHome + QLatin1Char('/') + QLatin1String(kOrganization)
            + QLatin1Char('/') + QLatin1String(kApplication) + QStringLiteral(".conf");
 }
@@ -696,7 +705,13 @@ QByteArray TstColdStart::runExec(const QString& command, int timeoutMs)
 bool TstColdStart::waitForConnected(int timeoutMs)
 {
     return QTest::qWaitFor(
-        [this] { return m_graph->app.connectionState() == QLatin1String("connected"); },
+        [this] {
+            // Wired is published before the accepted server.info reply. A
+            // workspace action must wait for that identity handoff as well.
+            return m_graph->app.connectionState() == QLatin1String("connected")
+                && m_graph->terminalFactory.workspaceReady()
+                && m_graph->layouts.workspaceReady();
+        },
         timeoutMs);
 }
 
@@ -729,13 +744,22 @@ QString TstColdStart::paneText() const
 bool TstColdStart::typeUntil(const QByteArray& command,
                              const std::function<bool()>& done, int timeoutMs)
 {
+    const QPointer<ch::TerminalBridge> bridge = m_terminalBridge;
+    if (!bridge)
+        return false;
+    const quint64 generation = bridge->inputGeneration();
+    const QString input = QString::fromLatin1(command) + QLatin1Char('\n');
     QElapsedTimer clock;
     clock.start();
     qint64 nextSend = 0;
     while (!done() && clock.elapsed() < timeoutMs) {
+        if (!bridge || bridge != m_terminalBridge
+            || generation != bridge->inputGeneration())
+            return false;
         if (clock.elapsed() >= nextSend) {
             // Through the BRIDGE slot the xterm.js page calls, not the C++ API.
-            m_terminalBridge->sendInput(QString::fromLatin1(command) + QLatin1Char('\n'));
+            if (!bridge->sendInput(input, generation))
+                return false;
             nextSend = clock.elapsed() + kRetypeIntervalMs;
         }
         QTest::qWait(100);
@@ -1639,20 +1663,20 @@ int main(int argc, char* argv[])
         return 2;
     }
 
-    // Linux's native QSettings path follows XDG_CONFIG_HOME. macOS and
-    // Windows ignore that variable; when the live fixture is absent, Qt's
-    // test-mode path keeps this skipped gate away from the user's settings.
+    // QStandardPaths test mode also isolates ancillary cache/config paths on
+    // platforms where native QSettings cannot follow XDG_CONFIG_HOME.
 #if !defined(Q_OS_LINUX)
-    if (!g_live.present)
-        QStandardPaths::setTestModeEnabled(true);
+    QStandardPaths::setTestModeEnabled(true);
 #endif
 #if defined(Q_OS_LINUX)
     g_configHome = configRoot.filePath(QStringLiteral("config"));
     QDir().mkpath(g_configHome);
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(g_configHome));
 #else
-    g_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    g_configHome = configRoot.filePath(QStringLiteral("config"));
     QDir().mkpath(g_configHome);
+    g_settingsPath = QDir(g_configHome).filePath(QStringLiteral("CodeHarbor.ini"));
+    g_knownHostsOverride = QDir(g_configHome).filePath(QStringLiteral("known_hosts"));
 #endif
 
     // main.cpp's startup order: URL scheme, then WebEngine, then the GUI app.

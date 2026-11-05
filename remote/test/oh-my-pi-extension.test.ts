@@ -8,9 +8,10 @@ import ohMyPiExtension, {
     toHookInput,
     FORWARDED_EVENTS,
     type OhMyPiHookApi,
+    MAX_PENDING_HOOK_EVENTS,
 } from "../src/hooks/oh-my-pi-extension.ts";
-import { processBridgeLine } from "../src/bridge.ts";
-import type { AgentState } from "../src/events.ts";
+import { processBridgeLine, MAX_BRIDGE_LINE_BYTES } from "../src/bridge.ts";
+import { AGENT_SOCKET_ENV, type AgentState } from "../src/events.ts";
 import { startFakeBridge } from "./fake-bridge.ts";
 
 /** Stands in for the harness's extension API and lets a test fire events. */
@@ -287,4 +288,98 @@ test("toHookInput normalizes the harness's own event shape", () => {
         toHookInput("agent_end", { willContinue: true }, "s", "t").willContinue,
         true,
     );
+});
+
+test("a burst of lifecycle events retains a bounded recent backlog and final shutdown", async () => {
+    const bridge = await startFakeBridge();
+    try {
+        const forwarder = createForwarder(
+            { OMP_DEV_SESSION_ID: "s", OMP_TERMINAL_ID: "t" }, bridge.socketPath,
+        );
+        assert.ok(forwarder);
+        forwarder.forward("session_start", {});
+        // No event-loop turn: the first socket write is still pending while a
+        // fast harness queues many more transitions.
+        for (let i = 0; i < MAX_PENDING_HOOK_EVENTS * 10; i += 1) {
+            forwarder.forward("tool_call", { toolName: "bash" });
+        }
+        forwarder.forward("session_shutdown", {});
+        await forwarder.flush();
+        await bridge.waitForLines(MAX_PENDING_HOOK_EVENTS + 1);
+        assert.equal(bridge.connections, MAX_PENDING_HOOK_EVENTS + 1);
+        const states = statesOf(bridge.lines);
+        assert.equal(states.at(-1), "stopped");
+        assert.equal(states[0], "starting");
+    } finally {
+        await bridge.close();
+    }
+});
+
+test("a failed delivery skips stale queued prompts but still delivers the newest state", async () => {
+    const bridge = await startFakeBridge();
+    try {
+        const forwarder = createForwarder(
+            { OMP_DEV_SESSION_ID: "s", OMP_TERMINAL_ID: "t" }, bridge.socketPath,
+        );
+        assert.ok(forwarder);
+        // This required field cannot fit and is refused before connecting.
+        forwarder.forward("tool_call", { toolName: "x".repeat(MAX_BRIDGE_LINE_BYTES) });
+        forwarder.forward("tool_call", { toolName: "ask" });
+        forwarder.forward("tool_result", { toolName: "ask" });
+        forwarder.forward("session_shutdown", {});
+        await forwarder.flush();
+        await bridge.waitForLines(1);
+        assert.deepEqual(statesOf(bridge.lines), ["stopped"]);
+        assert.equal(bridge.connections, 1);
+    } finally {
+        await bridge.close();
+    }
+});
+
+test("extension forwarding uses the advertised socket rather than inherited runtime paths (NTC9)", { timeout: 10000 }, async () => {
+    const target = await startFakeBridge();
+    const inherited = await startFakeBridge();
+    const wrongEndpoint = inherited.waitForLines(1).then(() => false);
+    try {
+        const forwarder = createForwarder({
+            [AGENT_SOCKET_ENV]: target.socketPath,
+            XDG_RUNTIME_DIR: inherited.dir,
+            HOME: path.join(inherited.dir, "old-home"),
+            OMP_DEV_SESSION_ID: "advertised", OMP_TERMINAL_ID: "term",
+        });
+        assert.ok(forwarder);
+        forwarder.forward("tool_call", { toolName: "ask" });
+        forwarder.forward("tool_result", { toolName: "ask" });
+        await forwarder.flush();
+        assert.equal(await Promise.race([
+            target.waitForLines(2).then(() => true), wrongEndpoint,
+        ]), true);
+        assert.deepEqual(statesOf(target.lines), ["waiting_input", "running"]);
+        assert.equal(inherited.connections, 0);
+    } finally {
+        await target.close();
+        await inherited.close();
+    }
+});
+
+test("an invalid advertised socket leaves extension initialization inert without throwing (NTC9)", async () => {
+    const inherited = await startFakeBridge();
+    try {
+        for (const endpoint of ["", "relative.sock", "/run/invalid\0.sock"]) {
+            const env = {
+                [AGENT_SOCKET_ENV]: endpoint,
+                XDG_RUNTIME_DIR: inherited.dir,
+                OMP_DEV_SESSION_ID: "s", OMP_TERMINAL_ID: "t",
+            };
+            const pi = new FakePi();
+            assert.doesNotThrow(() => {
+                assert.equal(createForwarder(env), null);
+                ohMyPiExtension(pi, env);
+            });
+            assert.deepEqual(pi.registrations, []);
+        }
+        assert.equal(inherited.connections, 0);
+    } finally {
+        await inherited.close();
+    }
 });

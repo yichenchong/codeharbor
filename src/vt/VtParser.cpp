@@ -700,7 +700,19 @@ void VtParser::dispatchCsi(quint8 finalByte)
     if (m_intermediateOverflow)
         return;
 
+    // Sub-parameters belong to SGR, not to cursor coordinates, reports or
+    // mode lists. Never reinterpret their values as semicolon parameters.
+    for (int i = 0; i < m_paramCount; ++i) {
+        if (m_paramIsSub[i]
+            && (finalByte != 'm' || m_privateMarker != 0 || m_intermediate != 0))
+            return;
+    }
+
     if (m_privateMarker == '?') {
+        // An intermediate is part of the command identity: "?25!l" is not
+        // DECTCEM and must not hide the cursor.
+        if (m_intermediate != 0)
+            return;
         if (finalByte == 'h' || finalByte == 'l')
             dispatchPrivateMode(finalByte);
         // CSI ? Ps n (DECDSR) and the rest are not answered: unlike DSR proper,

@@ -549,6 +549,7 @@ private:
     AgentStatusMonitor m_monitor;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     std::unique_ptr<AppController> m_controller;
+    std::unique_ptr<ch::ServerProfiles> m_shellProfiles;
     std::unique_ptr<QSignalSpy> m_refreshedSpy;
     std::unique_ptr<FreshView> m_freshView;
     QTemporaryDir m_scratch;
@@ -709,6 +710,7 @@ void TstLiveShell::cleanupTestCase()
 
     m_refreshedSpy.reset();
     m_controller.reset();
+    m_shellProfiles.reset();
     m_bootstrap.reset();
     m_pool.disconnectFromHost();
 
@@ -1432,19 +1434,17 @@ void TstLiveShell::liveTerminalsAfterTheFirstComeUp()
     ch::ViewerProfiles profiles(&m_client);
     ch::ViewerModel viewers(&m_client);
     viewers.setProfiles(&profiles);
-    ch::ServerProfiles serverProfiles;
+    // Borrowed by the long-lived controller: keep it alive through row cleanup.
+    m_shellProfiles = std::make_unique<ch::ServerProfiles>(
+        m_scratch.filePath(QStringLiteral("terminal-profiles.ini")));
     ch::SessionLayouts layouts(controller.workspaceDb(), controller.uiState());
     ch::EditorFactory editorFactory(&m_client);
     ch::TerminalFactory terminalFactory(&m_pool);
     ch::WindowChromeNative windowChrome;
     ch::GroupPaletteService groupPalette;
 
-    controller.setConnection(&m_pool, m_bootstrap.get(), &serverProfiles, &layouts);
+    controller.setConnection(&m_pool, m_bootstrap.get(), m_shellProfiles.get(), &layouts);
     terminalFactory.setWorkspace(controller.workspaceDb());
-    connect(&controller, &AppController::serverIdChanged, &terminalFactory,
-            [&controller, &terminalFactory]() {
-                terminalFactory.setServerId(controller.serverId());
-            });
     terminalFactory.setAgentMonitor(&m_monitor);
     connect(&terminalFactory, &ch::TerminalFactory::paneRowResolved, &layouts,
             &ch::SessionLayouts::bindTerminalPaneRow);
@@ -1458,17 +1458,18 @@ void TstLiveShell::liveTerminalsAfterTheFirstComeUp()
     // verdicts.
     QString phase = QStringLiteral("setup");
     QStringList appErrors;
-    connect(&controller, &AppController::error, this,
+    QStringList factoryErrors;
+    QStringList layoutErrors;
+    QObject diagnostics;
+    connect(&controller, &AppController::error, &diagnostics,
             [&appErrors, &phase](const QString& text) {
                 appErrors << QStringLiteral("[%1] %2").arg(phase, text);
             });
-    QStringList factoryErrors;
-    connect(&terminalFactory, &ch::TerminalFactory::error, this,
+    connect(&terminalFactory, &ch::TerminalFactory::error, &diagnostics,
             [&factoryErrors, &phase](ch::TerminalController*, const QString& text) {
                 factoryErrors << QStringLiteral("[%1] %2").arg(phase, text);
             });
-    QStringList layoutErrors;
-    connect(&layouts, &ch::SessionLayouts::error, this,
+    connect(&layouts, &ch::SessionLayouts::error, &diagnostics,
             [&layoutErrors, &phase](const QString& text) {
                 layoutErrors << QStringLiteral("[%1] %2").arg(phase, text);
             });
@@ -1481,7 +1482,7 @@ void TstLiveShell::liveTerminalsAfterTheFirstComeUp()
                                  && !controller.serverId().isEmpty(),
                              kRpcTimeoutMs);
     const QString serverId = controller.serverId();
-    terminalFactory.setServerId(serverId);
+    QTRY_VERIFY_WITH_TIMEOUT(terminalFactory.workspaceReady(), kRpcTimeoutMs);
 
     RawRpc group;
     QVERIFY2(group.call(m_client, QStringLiteral("workspace.createGroup"),

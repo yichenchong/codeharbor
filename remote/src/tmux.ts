@@ -6,8 +6,8 @@
 //
 //  1. Absence is not failure. A host with no tmux binary, or with tmux present
 //     but no server running, is the normal state of a fresh box. Both yield an
-//     empty/false RESULT — never a thrown RPC error. Only a malformed request
-//     (a missing/blank session name) throws.
+//     empty/false RESULT — never a thrown RPC error. Malformed requests and
+//     other operational failures remain errors rather than invented absences.
 //
 //  2. No shell. Every tmux invocation goes through execFile with an argv array,
 //     so names cannot interpolate shell commands. tmux ALSO parses command-list
@@ -536,11 +536,9 @@ interface SessionActivity {
 }
 
 /**
- * Where the pane rows come from: the workspace database in the daemon, a fixture
- * in the tests. Injected rather than imported because workspace.ts already
- * imports THIS module (isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH),
- * so a static import back would close a module cycle for the sake of the one
- * tmux method that needs workspace state.
+ * Where pane rows come from: the daemon passes its workspace database source,
+ * while tests inject a fixture without opening a database. The handler table
+ * below supplies terminalPaneTargets; the import cycle is described above.
  */
 export type TerminalPaneSource = (
     devSessionIds: readonly string[],

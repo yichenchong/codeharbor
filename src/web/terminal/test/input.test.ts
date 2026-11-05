@@ -18,6 +18,57 @@ function noBinaryInput(): never {
     assert.fail("this case produces no binary input");
 }
 
+test("input waits for acceptance and keeps a paste bound to its original PTY", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let generation = 1;
+    const calls: { data: string; generation: number; done: (accepted: boolean) => void }[] = [];
+    const writer = new TerminalInputWriter({
+        get inputGeneration() { return generation; },
+        sendInput(data, observedGeneration, done) {
+            calls.push({ data, generation: observedGeneration, done });
+        },
+        sendBinaryInput: noBinaryInput,
+    }, 2);
+    writer.write("abcdefgh");
+    t.mock.timers.runAll();
+    assert.equal(calls.length, 1, "no next chunk before backend acceptance");
+    generation = 2;
+    calls[0].done(true);
+    t.mock.timers.runAll();
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].generation, 1, "queued suffix keeps the old PTY token");
+    calls[1].done(false);
+    t.mock.timers.runAll();
+    assert.equal(calls.length, 2, "a refusal stops the remaining paste");
+    assert.equal(writer.backlogSize, 0);
+    writer.write("ok");
+    assert.equal(calls[2].generation, 2);
+    calls[2].done(true);
+    writer.close();
+});
+
+test("a cancelled input reply cannot discard fresh input after reconnect", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const calls: { data: string; done: (accepted: boolean) => void }[] = [];
+    const writer = new TerminalInputWriter({
+        inputGeneration: 1,
+        sendInput(data, _generation, done) { calls.push({ data, done }); },
+        sendBinaryInput: noBinaryInput,
+    }, 2);
+    writer.write("old paste");
+    writer.cancelPending();
+    writer.write("new");
+    calls[0].done(false);
+    t.mock.timers.runAll();
+    assert.equal(calls[1].data, "ne");
+    calls[1].done(true);
+    t.mock.timers.runAll();
+    assert.equal(calls[2].data, "w");
+    calls[2].done(true);
+    assert.equal(writer.backlogSize, 0);
+    writer.close();
+});
+
 function assertEscapeSequencesStayInOneChunk(
     chunks: string[],
     sequences: string[] = ["\x1b[200~", "\x1b[31m", "\x1b]0;title\x07", "\x1b[201~"],
@@ -124,12 +175,14 @@ test("a throwing sink retains the failed chunk for a later retry", async () => {
     let failures = 0;
     let available = false;
     const writer = new TerminalInputWriter({
-        sendInput(data) {
+        inputGeneration: 1,
+        sendInput(data, _generation, done) {
             if (!available) {
                 failures += 1;
                 throw new Error("bridge temporarily unavailable");
             }
             sent.push(data);
+            done(true);
         },
         sendBinaryInput: noBinaryInput,
     }, 2);
@@ -149,7 +202,9 @@ test("a throwing sink retains the failed chunk for a later retry", async () => {
 test("fractional chunk bounds are rejected", () => {
     assert.throws(() => chunkTerminalInput("data", 1.5), RangeError);
     assert.throws(
-        () => new TerminalInputWriter({ sendInput() {}, sendBinaryInput: noBinaryInput }, 1.5),
+        () => new TerminalInputWriter({
+            inputGeneration: 1, sendInput() {}, sendBinaryInput: noBinaryInput,
+        }, 1.5),
         RangeError,
     );
 });
@@ -157,8 +212,10 @@ test("fractional chunk bounds are rejected", () => {
 test("a paste larger than one flow-control window drains in order", async () => {
     const sent: string[] = [];
     const writer = new TerminalInputWriter({
-        sendInput(data) {
+        inputGeneration: 1,
+        sendInput(data, _generation, done) {
             sent.push(data);
+            done(true);
         },
         sendBinaryInput: noBinaryInput,
     }, 128);
@@ -180,7 +237,8 @@ test("a queued paste yields to other tasks and new input cannot bypass that yiel
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const sent: string[] = [];
     const writer = new TerminalInputWriter({
-        sendInput(data) { sent.push(data); },
+        inputGeneration: 1,
+        sendInput(data, _generation, done) { sent.push(data); done(true); },
         sendBinaryInput: noBinaryInput,
     }, 2);
     try {
@@ -202,7 +260,7 @@ test("invalid chunk bounds are rejected instead of disabling pacing", () => {
     assert.throws(() => chunkTerminalInput("data", 0), RangeError);
     assert.throws(
         () => new TerminalInputWriter(
-            { sendInput() {}, sendBinaryInput: noBinaryInput },
+            { inputGeneration: 1, sendInput() {}, sendBinaryInput: noBinaryInput },
             Number.NaN,
         ),
         RangeError,
@@ -223,11 +281,14 @@ function recordingSink(): { sink: TerminalInputSink; calls: RecordedInputCall[] 
     return {
         calls,
         sink: {
-            sendInput(data) {
+            inputGeneration: 1,
+            sendInput(data, _generation, done) {
                 calls.push({ kind: "text", payload: data });
+                done(true);
             },
-            sendBinaryInput(base64) {
+            sendBinaryInput(base64, _generation, done) {
                 calls.push({ kind: "binary", payload: base64 });
+                done(true);
             },
         },
     };

@@ -26,11 +26,14 @@
 #include "EditorFactory.h"
 #include "InternalUrlSchemeHandler.h"
 #include "RpcTypes.h"
+#include "SessionLayouts.h"
 #include "SshConnectionPool.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
+#include "UiStateStore.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
+#include "WorkspaceDb.h"
 
 #include <QtTest>
 
@@ -40,6 +43,7 @@
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -61,6 +65,7 @@
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QVariant>
 #include <QVariantList>
@@ -108,6 +113,20 @@ Window {
 
     function regionItem() { return regionLoader.item }
     function setNode(n) { if (regionLoader.item) regionLoader.item.node = n }
+
+    function bindViewerLayouts(facade) {
+        const region = regionLoader.item;
+        region.serverId = Qt.binding(() => facade.serverId);
+        region.acceptedServerId = Qt.binding(() => facade.serverId);
+        region.sessionId = Qt.binding(() => facade.devSessionId);
+        region.layoutGeneration = Qt.binding(() => facade.generation);
+        region.paneGeneration = Qt.binding(() => facade.paneGeneration);
+        region.node = Qt.binding(() => facade.viewerTree);
+        region.paneUrlReportedForSession.connect((session, generation, pane, url) =>
+            facade.setPaneUrlForSession(session, generation, "viewer", pane, url));
+        region.splitRatiosAdjustedForSession.connect((session, generation, path, ratios) =>
+            facade.setRatiosForSession(session, generation, "viewer", path, ratios));
+    }
 
     // Destroy the component under test WITHOUT destroying this window. A test
     // that wants to prove something about a view's teardown wants exactly this
@@ -265,6 +284,16 @@ public:
         m_files.insert(path, content);
     }
 
+    int readCount(const QString &path) const { return m_reads.value(path); }
+    void setLayout(const QString &region, const QJsonObject &tree)
+    {
+        m_layouts.insert(region, tree);
+    }
+    int layoutReadCount() const { return m_layoutReads; }
+    int layoutWriteCount() const { return m_layoutWrites; }
+    const QList<QJsonObject> &fileWrites() const { return m_fileWrites; }
+    QString fileContent(const QString &path) const { return m_files.value(path); }
+
 private:
     void serve()
     {
@@ -276,13 +305,51 @@ private:
             const QJsonObject request =
                 QJsonDocument::fromJson(m_buffer.left(newline)).object();
             m_buffer.remove(0, newline + 1);
-            if (request.value(QStringLiteral("method")).toString()
-                != QString::fromLatin1(ch::rpc::kMethodReadFile))
+            const QString method = request.value(QStringLiteral("method")).toString();
+            if (method == QString::fromLatin1(ch::rpc::kMethodWorkspaceGetLayout)
+                || method == QString::fromLatin1(ch::rpc::kMethodWorkspaceSetLayout)) {
+                const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+                const QString region = params.value(QStringLiteral("region")).toString();
+                if (method == QString::fromLatin1(ch::rpc::kMethodWorkspaceSetLayout)) {
+                    ++m_layoutWrites;
+                    m_layouts.insert(region, params.value(QStringLiteral("tree")).toObject());
+                } else {
+                    ++m_layoutReads;
+                }
+                const QJsonObject response{
+                    {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                    {QStringLiteral("id"), request.value(QStringLiteral("id"))},
+                    {QStringLiteral("result"),
+                     QJsonObject{{QStringLiteral("id"), QStringLiteral("layout-fixture")},
+                                 {QStringLiteral("tree"), m_layouts.value(region)}}}};
+                m_serverSide->write(
+                    QJsonDocument(response).toJson(QJsonDocument::Compact) + '\n');
+                m_serverSide->flush();
+                continue;
+            }
+            if (method == QString::fromLatin1(ch::rpc::kMethodWriteFile)) {
+                const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+                const QString path = params.value(QStringLiteral("path")).toString();
+                m_fileWrites.append(params);
+                m_files.insert(path, params.value(QStringLiteral("content")).toString());
+                const QJsonObject response{
+                    {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                    {QStringLiteral("id"), request.value(QStringLiteral("id"))},
+                    {QStringLiteral("result"),
+                     QJsonObject{{QStringLiteral("path"), path},
+                                 {QStringLiteral("revision"), QStringLiteral("r1")}}}};
+                m_serverSide->write(
+                    QJsonDocument(response).toJson(QJsonDocument::Compact) + '\n');
+                m_serverSide->flush();
+                continue;
+            }
+            if (method != QString::fromLatin1(ch::rpc::kMethodReadFile))
                 continue;
             const QString path = request.value(QStringLiteral("params"))
                                      .toObject()
                                      .value(QStringLiteral("path"))
                                      .toString();
+            ++m_reads[path];
             QJsonObject response{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
                                  {QStringLiteral("id"),
                                   request.value(QStringLiteral("id"))}};
@@ -313,6 +380,11 @@ private:
     QLocalSocket *m_serverSide = nullptr;  // owned by m_server
     QByteArray m_buffer;
     QHash<QString, QString> m_files;
+    QHash<QString, int> m_reads;
+    QHash<QString, QJsonObject> m_layouts;
+    QList<QJsonObject> m_fileWrites;
+    int m_layoutReads = 0;
+    int m_layoutWrites = 0;
     QPointer<ch::CodeharbordClient> m_client;
 };
 
@@ -466,6 +538,13 @@ QVariantList asList(const QVariant &value)
     return value.toList();
 }
 
+QVariantMap asMap(const QVariant &value)
+{
+    if (value.userType() == qMetaTypeId<QJSValue>())
+        return value.value<QJSValue>().toVariant().toMap();
+    return value.toMap();
+}
+
 // The index path a region reports its ratios under, printed so a failure names
 // it: [] is the root branch, ["1"] its second child.
 QString pathText(const QVariantList &path)
@@ -581,6 +660,8 @@ private:
 class TerminalFactoryStub : public QObject
 {
     Q_OBJECT
+    Q_PROPERTY(bool workspaceReady READ workspaceReady WRITE setWorkspaceReady
+                   NOTIFY workspaceReadyChanged)
 
 public:
     struct Resolution {
@@ -588,23 +669,41 @@ public:
         QString paneName;
         QString terminalPaneId;
         QString workingDir;
+        QObject *controller;
     };
 
     Q_INVOKABLE QObject *create(QObject *)
     {
         // Parented here, so the object has C++ ownership: a QObject* returned
         // to QML with no parent is handed to the JavaScript collector.
+        ++m_controllersCreated;
         m_controller = new QObject(this);
         return m_controller;
     }
-    Q_INVOKABLE QObject *createBridge(QObject *, QObject *) { return nullptr; }
-    Q_INVOKABLE bool connected() const { return true; }
+    Q_INVOKABLE QObject *createBridge(QObject *, QObject *)
+    {
+        ++m_bridgeRequests;
+        return nullptr;
+    }
+    Q_INVOKABLE bool connected() const { return m_connected; }
+    void setConnected(bool connected) { m_connected = connected; }
+    bool workspaceReady() const { return m_workspaceReady; }
+    void setWorkspaceReady(bool ready)
+    {
+        if (m_workspaceReady == ready)
+            return;
+        m_workspaceReady = ready;
+        if (!ready)
+            m_pending.clear();
+        emit workspaceReadyChanged();
+    }
 
-    Q_INVOKABLE bool resolveTarget(QObject *, const QString &devSessionId,
+    Q_INVOKABLE bool resolveTarget(QObject *controller, const QString &devSessionId,
                                    const QString &paneName, const QString &terminalPaneId,
                                    const QString &workingDir)
     {
-        m_resolutions.append({devSessionId, paneName, terminalPaneId, workingDir});
+        m_pending.insert(controller, m_resolutions.size());
+        m_resolutions.append({devSessionId, paneName, terminalPaneId, workingDir, controller});
         return true;
     }
 
@@ -613,15 +712,30 @@ public:
         m_attached.append(target);
         return true;
     }
-    Q_INVOKABLE void detach(QObject *) { }
+    Q_INVOKABLE void detach(QObject *controller) { m_pending.remove(controller); }
     Q_INVOKABLE QString targetFor(QObject *) const { return QString(); }
     Q_INVOKABLE void kill(QObject *) { }
 
     QObject *controller() const { return m_controller; }
     const QList<Resolution> &resolutions() const { return m_resolutions; }
     const QStringList &attached() const { return m_attached; }
+    int controllersCreated() const { return m_controllersCreated; }
+    int bridgeRequests() const { return m_bridgeRequests; }
+
+    // Match the factory's latest-request contract: detach/supersession drops
+    // delivery altogether, rather than sending an empty stale answer to QML.
+    bool completeResolution(qsizetype index, const QString &target)
+    {
+        QObject *const controller = m_resolutions.at(index).controller;
+        if (m_pending.value(controller, -1) != index)
+            return false;
+        m_pending.remove(controller);
+        emit targetResolved(controller, target);
+        return true;
+    }
 
 signals:
+    void workspaceReadyChanged();
     void error(QObject *controller, const QString &message);
     void targetResolved(QObject *controller, const QString &target);
     // The real factory reports this after an attach it discovers CREATED the
@@ -633,6 +747,23 @@ private:
     QObject *m_controller = nullptr;
     QList<Resolution> m_resolutions;
     QStringList m_attached;
+    QHash<QObject *, qsizetype> m_pending;
+    bool m_workspaceReady = true;
+    bool m_connected = true;
+    int m_controllersCreated = 0;
+    int m_bridgeRequests = 0;
+};
+
+// Recovery-offer state tests do not load a browser document. Their adapter only
+// exposes the host-side restoration notification; browser cases use the real one.
+class EditorPageBridgeStub : public QObject
+{
+    Q_OBJECT
+public:
+    using QObject::QObject;
+signals:
+    void bufferRestored(QString content, QString baselineContent, QString revision,
+                        QString pendingSaveContent, bool savePending);
 };
 
 // The slice of ch::EditorController an editor pane binds to. The pane documents
@@ -645,10 +776,14 @@ class EditorControllerStub : public QObject
     Q_OBJECT
     Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
     Q_PROPERTY(bool dirty READ dirty NOTIFY dirtyChanged)
+    Q_PROPERTY(bool recoveryEnabled READ recoveryEnabled CONSTANT)
+    Q_PROPERTY(quint64 recoveryContextRevision READ recoveryContextRevision CONSTANT)
 
 public:
     QString fileState() const { return m_fileState; }
     bool dirty() const { return m_dirty; }
+    bool recoveryEnabled() const { return true; }
+    quint64 recoveryContextRevision() const { return 0; }
     void setDirty(bool dirty)
     {
         if (m_dirty == dirty)
@@ -669,16 +804,28 @@ public:
     }
 
     Q_INVOKABLE void open(const QString &path) { m_opened.append(path); }
+    Q_INVOKABLE QObject *createPageBridge()
+    {
+        auto *bridge = new EditorPageBridgeStub(this);
+        bridge->setObjectName(QStringLiteral("editor-stub-%1").arg(++m_bridgeSerial));
+        return bridge;
+    }
+    Q_INVOKABLE void releasePageBridge(QObject *bridge)
+    {
+        if (bridge && bridge->parent() == this)
+            bridge->deleteLater();
+    }
+    Q_INVOKABLE bool hasPageReloadContent(QObject *) const { return false; }
+    Q_INVOKABLE bool preparePageReload(const QString &, quint64) { return false; }
     Q_INVOKABLE void save(const QString &, const QString &) { }
     Q_INVOKABLE void reportContent(const QString &content) { m_reported.append(content); }
     Q_INVOKABLE void reportDirty(bool dirty, const QString &) { setDirty(dirty); }
     Q_INVOKABLE void requestReload() { }
     Q_INVOKABLE void ready() { }
-    Q_INVOKABLE void setRecoveryId(const QString &id) { m_recoveryId = id; }
+    Q_INVOKABLE void setRecoveryScope(const QString &, const QString &, const QString &) { }
 
     const QStringList &opened() const { return m_opened; }
     const QStringList &reported() const { return m_reported; }
-    QString recoveryId() const { return m_recoveryId; }
 
 signals:
     void contentLoaded(const QString &content, const QString &revision);
@@ -695,7 +842,7 @@ private:
     bool m_dirty = false;
     QStringList m_opened;
     QStringList m_reported;
-    QString m_recoveryId;
+    int m_bridgeSerial = 0;
 };
 } // namespace
 
@@ -773,7 +920,10 @@ private slots:
     void navigationButtonsAreDisabledAtHistoryEnds();
     void reloadRefreshesNonWebContent();
     void reloadKeepsTheEditorHandlerAlive();
-    void dirtyEditorRejectsNavigationAndReload();
+    void editorReloadPreservesDirtyBufferAndRejectsStaleCapture();
+    void remoteWebReloadRecoversAfterAReadFailure();
+    void navigationDismissesAnOlderEditorClosePrompt();
+    void dirtyEditorRejectsNavigation();
     void narrowViewerKeepsItsAddressUsable_data();
     void narrowViewerKeepsItsAddressUsable();
     void supersededAddressProbesCannotNavigate();
@@ -870,6 +1020,9 @@ private slots:
     // outlives X, and a region that keeps believing it goes BLANK — with the
     // right pane ids still in the layout and nothing at all on screen.
     void aLayoutReloadRebuildsEveryPaneInTheTree();
+    void reconnectRefreshPreservesDirtyEditorAndRetiresOldIntents();
+    void editorRecoveryUsesScopedContextAndWarnsWhenUnavailable_data();
+    void editorRecoveryUsesScopedContextAndWarnsWhenUnavailable();
 
     // The editor's drop/conflict banner. It is the only thing that tells a user
     // typing into a buffer that the buffer cannot be saved, and a banner with
@@ -931,6 +1084,20 @@ private slots:
     // empty shell has to SAY so — once, dismissibly, and to a screen reader too.
     void aTerminalPaneSaysWhenItsRemoteSessionWasSilentlyReplaced();
 
+    void keyboardSplitRatiosPersistAfterLayout_data();
+    void keyboardSplitRatiosPersistAfterLayout();
+    void keyboardSplitLimitsLeaveTheThirdPaneAlone_data();
+    void keyboardSplitLimitsLeaveTheThirdPaneAlone();
+    void terminalRetargetDismissesStaleDialogs_data();
+    void terminalRetargetDismissesStaleDialogs();
+    void terminalHostStateWaitsForTheBrowserApis_data();
+    void terminalHostStateWaitsForTheBrowserApis();
+    void detachedTerminalLookupCanBeRestarted();
+    void terminalLookupWaitsForWorkspaceReadiness();
+    void keyboardSplitPublicationCoalescesAndCancels_data();
+    void keyboardSplitPublicationCoalescesAndCancels();
+    void emptyTerminalRegionDoesNotAllocateUntilSplit();
+
 private:
     // Load one qrc component into the harness window with `props` as its
     // initial properties, and hand back the loaded item. The region types are
@@ -941,6 +1108,7 @@ private:
     QObject *openInShell(const QString &file, const QVariantMap &props);
     QObject *openRegion(const QString &file, const QVariantMap &node, bool terminal);
     void setNode(const QVariantMap &node);
+    std::unique_ptr<QObject> installMonacoProbe();
     QString evalJs(QObject *paneItem, const QString &script, int timeoutMs = kProbeTimeoutMs);
     bool waitForJs(QObject *paneItem, const QString &script, const QString &needle, int timeoutMs);
     // Wait until the pane's page has loaded; false means Chromium never got
@@ -1000,6 +1168,38 @@ void TstPaneIdentity::cleanup()
     m_app.setActiveSessionRepoRoot(QString());
     m_app.clearHarness();
     QTest::qWait(50);
+}
+
+std::unique_ptr<QObject> TstPaneIdentity::installMonacoProbe()
+{
+    QQmlComponent component(m_engine.get());
+    component.setData(R"QML(
+        import QtQuick
+        import QtWebEngine
+        QtObject {
+            property var previousScripts: []
+            function install() {
+                const profile = viewers.internalProfile();
+                previousScripts = profile.userScripts.collection;
+                profile.userScripts.collection = [{
+                    name: "chPaneIdentityMonacoApi",
+                    sourceCode: "globalThis.MonacoEnvironment = { globalAPI: true };",
+                    injectionPoint: WebEngineScript.DocumentCreation,
+                    worldId: WebEngineScript.MainWorld,
+                    runsOnSubFrames: false
+                }];
+            }
+            function restore() {
+                viewers.internalProfile().userScripts.collection = previousScripts;
+            }
+        }
+    )QML", QUrl());
+    std::unique_ptr<QObject> probe(component.create());
+    if (!probe || !QMetaObject::invokeMethod(probe.get(), "install")) {
+        QTest::qFail(qPrintable(component.errorString()), __FILE__, __LINE__);
+        return {};
+    }
+    return probe;
 }
 
 QObject *TstPaneIdentity::openInShell(const QString &file, const QVariantMap &props)
@@ -1186,11 +1386,6 @@ void TstPaneIdentity::editorPaneSurvivesASplit()
         qobject_cast<ch::EditorController *>(asObject(originalEditor->property("controller")));
     QVERIFY2(controller != nullptr, "the editor pane never minted a controller");
     QPointer<ch::EditorController> controllerGuard(controller);
-    // ED15: the per-pane recovery key must be THIS pane's id, never the empty
-    // string a pane starts with before its layout id settles (two panes keyed by
-    // "" would share one crash-recovery snapshot). QTRY: the id can arrive a beat
-    // after the controller is minted.
-    QTRY_COMPARE(controller->recoveryId(), QStringLiteral("viewer-1"));
 
     setNode(branchNode(QStringLiteral("vertical"),
                        QVariantList{leafNode(QStringLiteral("viewer-1"), fileUrl),
@@ -2223,7 +2418,194 @@ void TstPaneIdentity::reloadKeepsTheEditorHandlerAlive()
     QCOMPARE(asObject(original->property("controller")), controller);
 }
 
-void TstPaneIdentity::dirtyEditorRejectsNavigationAndReload()
+void TstPaneIdentity::editorReloadPreservesDirtyBufferAndRejectsStaleCapture()
+{
+    ReadFileServer server;
+    QVERIFY(server.bind(&m_client));
+    const QString firstPath = QStringLiteral("/repo/editor-a.txt");
+    server.setFile(firstPath, QString(QChar(0xfeff)) + QStringLiteral("SERVER_BASELINE_A\r\n"));
+    server.setFile(QStringLiteral("/repo/editor-b.txt"), QStringLiteral("SERVER_BASELINE_B"));
+    std::unique_ptr<QObject> monacoProbe = installMonacoProbe();
+    QVERIFY(monacoProbe);
+    const auto restoreScripts = qScopeGuard([&monacoProbe] {
+        QMetaObject::invokeMethod(monacoProbe.get(), "restore");
+    });
+    QObject *const pane = openInShell(
+        QStringLiteral("ViewerPane.qml"),
+        {{QStringLiteral("url"), QUrl(QStringLiteral("file:///repo/editor-a.txt"))},
+         {QStringLiteral("acceptedServerId"), QStringLiteral("server-reload")},
+         {QStringLiteral("sessionId"), QStringLiteral("dev-reload")},
+         {QStringLiteral("paneId"), QStringLiteral("viewer-reload")}});
+    QVERIFY(pane);
+    QTRY_COMPARE(collect(pane, isEditorPane).size(), 1);
+    QObject *const editor = collect(pane, isEditorPane).constFirst();
+    auto *const controller =
+        qobject_cast<ch::EditorController *>(asObject(editor->property("controller")));
+    QVERIFY(controller);
+    const QString capture = QStringLiteral(
+        "typeof window.captureEditorContent === 'function'"
+        " ? window.captureEditorContent() : null");
+    QVERIFY2(waitForJs(editor, capture, QStringLiteral("SERVER_BASELINE_A"), kPageLoadTimeoutMs),
+             "the real editor did not receive the first file through its document adapter");
+    const QString firstCodePoint =
+        QStringLiteral("String(window.captureEditorContent().charCodeAt(0))");
+    QCOMPARE(evalJs(editor, firstCodePoint), QStringLiteral("65279"));
+    const QString typed = evalJs(editor, QStringLiteral(
+        "(function(){var e=window.monaco.editor.getEditors()[0];"
+        "var m=e.getModel(); e.focus(); var last=m.getLineCount();"
+        "e.setPosition({lineNumber:last,column:m.getLineMaxColumn(last)});"
+        "e.trigger('keyboard','type',{text:'UNSAVED_RELOAD_TEXT'});"
+        "return window.captureEditorContent();})()"));
+    QVERIFY2(typed.contains(QStringLiteral("UNSAVED_RELOAD_TEXT")),
+             "Monaco did not accept the regression's unsaved edit");
+    QVERIFY(typed.contains(QStringLiteral("\r\n")));
+    QTRY_VERIFY(controller->dirty());
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    const QString revision = controller->revision();
+    const QString oldBridgeId = editor->property("pageBridgeId").toString();
+    QPointer<QObject> oldBridge = asObject(editor->property("pageBridge"));
+    const int originalReads = server.readCount(firstPath);
+    QPointer<QObject> editorGuard(editor);
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    auto *const reloadButton =
+        qobject_cast<QQuickItem *>(childNamed(pane, QStringLiteral("viewerReloadButton")));
+    QVERIFY(window && reloadButton);
+    QTRY_VERIFY(reloadButton->isVisible() && reloadButton->width() > 4
+                && reloadButton->height() > 4);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      reloadButton->mapToScene(QPointF(reloadButton->width() / 2,
+                                                       reloadButton->height() / 2)).toPoint());
+    QTRY_VERIFY(editorGuard && editor->property("pageBridgeId").toString() != oldBridgeId);
+    QCOMPARE(collect(pane, isEditorPane).constFirst(), editor);
+    QCOMPARE(asObject(editor->property("controller")), controller);
+    QTRY_VERIFY_WITH_TIMEOUT(editor->property("pageReady").toBool(), kPageLoadTimeoutMs);
+    QVERIFY2(waitForJs(editor, capture, QStringLiteral("UNSAVED_RELOAD_TEXT"), kPageLoadTimeoutMs),
+             "host reload replaced the live dirty buffer with server or recovery bytes");
+    QCOMPARE(evalJs(editor, capture), typed);
+    QCOMPARE(evalJs(editor, firstCodePoint), QStringLiteral("65279"));
+    QVERIFY(controller->dirty());
+    QCOMPARE(controller->revision(), revision);
+    QCOMPARE(server.readCount(firstPath), originalReads);
+    QTRY_VERIFY(oldBridge.isNull());
+
+    // Directory changes retire recovery authority even though the live path,
+    // controller and page adapter stay the same. An old capture cannot cross it.
+    const QString bridgeBeforeContext = editor->property("pageBridgeId").toString();
+    const quint64 contextBeforeCapture = controller->recoveryContextRevision();
+    QVERIFY(QMetaObject::invokeMethod(pane, "reloadCurrent"));
+    controller->setRecoveryDir(QStringLiteral("/owned-fixture/reload"));
+    QVERIFY(controller->recoveryContextRevision() != contextBeforeCapture);
+    QTest::qWait(kSettleMs);
+    QCOMPARE(editor->property("pageBridgeId").toString(), bridgeBeforeContext);
+    QCOMPARE(evalJs(editor, capture), typed);
+    QCOMPARE(evalJs(editor, firstCodePoint), QStringLiteral("65279"));
+    QVERIFY(controller->dirty());
+    QCOMPARE(controller->revision(), revision);
+
+    // A failed replacement document cannot capture its DOM, but the native
+    // controller still owns the prepared dirty RAM buffer for this adapter.
+    const QUrl validBundle = editor->property("editorBundleUrl").toUrl();
+    editor->setProperty("editorBundleUrl",
+                        QUrl(QStringLiteral("qrc:/codeharbor/web/editor/missing-retry.html")));
+    QTRY_VERIFY_WITH_TIMEOUT(!editor->property("pageError").toString().isEmpty(),
+                             kPageLoadTimeoutMs);
+    QVERIFY(!editor->property("pageReady").toBool());
+    QVERIFY(controller->dirty());
+    QCOMPARE(controller->revision(), revision);
+    editor->setProperty("editorBundleUrl", validBundle);
+    QTRY_VERIFY_WITH_TIMEOUT(editor->property("pageReady").toBool(), kPageLoadTimeoutMs);
+    QVERIFY2(waitForJs(editor, capture, QStringLiteral("UNSAVED_RELOAD_TEXT"), kPageLoadTimeoutMs),
+             "a failed bundle load stranded the controller-owned dirty reload buffer");
+    QCOMPARE(evalJs(editor, capture), typed);
+    QCOMPARE(evalJs(editor, firstCodePoint), QStringLiteral("65279"));
+    QVERIFY(controller->dirty());
+    QCOMPARE(controller->revision(), revision);
+    QCOMPARE(server.readCount(firstPath), originalReads);
+
+    // Capture is asynchronous. A direct newer file navigation must invalidate
+    // that callback instead of reloading the replacement with the old capture.
+    QVERIFY(QMetaObject::invokeMethod(pane, "reloadCurrent"));
+    pane->setProperty("url", QUrl(QStringLiteral("file:///repo/editor-b.txt")));
+    // A second reload before the new LoadStarted signal must not capture A's
+    // still-visible DOM while attributing it to B's freshly registered adapter.
+    QVERIFY(!editor->property("pageReady").toBool());
+    QVERIFY(QMetaObject::invokeMethod(pane, "reloadCurrent"));
+    QVERIFY2(waitForJs(editor, capture, QStringLiteral("SERVER_BASELINE_B"), kPageLoadTimeoutMs),
+             "a stale reload capture took over the newer file");
+    QTest::qWait(600); // Also allow the retiring page's 500ms report to arrive.
+    QCOMPARE(evalJs(editor, capture), QStringLiteral("SERVER_BASELINE_B"));
+    QCOMPARE(controller->path(), QStringLiteral("/repo/editor-b.txt"));
+    QVERIFY(!controller->dirty());
+    QCOMPARE(server.readCount(firstPath), originalReads);
+}
+
+void TstPaneIdentity::remoteWebReloadRecoversAfterAReadFailure()
+{
+    ReadFileServer server;
+    QVERIFY(server.bind(&m_client));
+    const QString path = QStringLiteral("/repo/retry.html");
+    QObject *const handler = openInShell(
+        QStringLiteral("ViewerWebView.qml"),
+        {{QStringLiteral("url"), QUrl(QStringLiteral("file:///repo/retry.html"))},
+         {QStringLiteral("remoteFile"), true}});
+    QVERIFY(handler);
+    QObject *const browser = webViewIn(handler);
+    QVERIFY(browser);
+    QTRY_VERIFY_WITH_TIMEOUT(server.readCount(path) > 0, kPageLoadTimeoutMs);
+    QTRY_VERIFY_WITH_TIMEOUT(!handler->property("errorText").toString().isEmpty(),
+                             kPageLoadTimeoutMs);
+    QTRY_VERIFY(!handler->property("loading").toBool());
+    QVERIFY(!browser->property("visible").toBool());
+
+    server.setFile(path, QStringLiteral("<!doctype html><p>The retry succeeded.</p>"));
+    const int previousReads = server.readCount(path);
+    QVERIFY(QMetaObject::invokeMethod(handler, "reload"));
+    QTRY_VERIFY_WITH_TIMEOUT(server.readCount(path) > previousReads, kPageLoadTimeoutMs);
+    QTRY_VERIFY_WITH_TIMEOUT(!handler->property("loading").toBool(), kPageLoadTimeoutMs);
+    QCOMPARE(handler->property("errorText").toString(), QString());
+    QVERIFY(browser->property("visible").toBool());
+}
+
+void TstPaneIdentity::navigationDismissesAnOlderEditorClosePrompt()
+{
+    EditorControllerStub controller;
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"),
+                                QStringLiteral("file:///repo/original.txt")),
+                       /*terminal=*/false));
+    QTRY_COMPARE(collect(m_region, isLeafPane).size(), 1);
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const pane = collect(m_region, isLeafPane).constFirst();
+    QObject *const editor = collect(m_region, isEditorPane).constFirst();
+    editor->setProperty("controller", QVariant::fromValue<QObject *>(&controller));
+    QSignalSpy closed(pane, SIGNAL(closeRequested(QString)));
+    QVERIFY(closed.isValid());
+    controller.setDirty(true);
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+    QObject *const dialog = childNamed(pane, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QCOMPARE(closed.size(), 0);
+
+    // A save already in flight can complete while the dialog is open. A newer
+    // host navigation is then allowed, but must retire the old confirmation.
+    controller.setDirty(false);
+    QTRY_VERIFY(!pane->property("contentDirty").toBool());
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                      Q_ARG(QVariant, QStringLiteral("file:///repo/new.txt")),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(accepted.toBool());
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QCOMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///repo/new.txt")));
+    QCOMPARE(closed.size(), 0);
+
+    QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+    QCOMPARE(closed.size(), 1);
+}
+
+void TstPaneIdentity::dirtyEditorRejectsNavigation()
 {
     EditorControllerStub controller;
     QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
@@ -2262,7 +2644,7 @@ void TstPaneIdentity::dirtyEditorRejectsNavigationAndReload()
                                  QStringLiteral("error"), QStringLiteral("read_only")}) {
         controller.setFileState(state);
         QTRY_VERIFY(pane->property("contentDirty").toBool());
-        for (const char *action : {"goBack", "goForward", "goHome", "reloadCurrent"}) {
+        for (const char *action : {"goBack", "goForward", "goHome"}) {
             QVERIFY(QMetaObject::invokeMethod(pane, action));
             QCOMPARE(pane->property("url").toUrl(), originalUrl);
             QCOMPARE(pane->property("navigationIndex").toInt(), 1);
@@ -2290,13 +2672,6 @@ void TstPaneIdentity::dirtyEditorRejectsNavigationAndReload()
         QVERIFY(pane->property("contentActive").toBool());
     }
 
-    // The agent-facing region must propagate refusal, not acknowledge a reload
-    // which never happened.
-    QVariant reloaded;
-    QVERIFY(QMetaObject::invokeMethod(m_region, "reloadPane",
-                                      Q_RETURN_ARG(QVariant, reloaded),
-                                      Q_ARG(QVariant, QStringLiteral("viewer-1"))));
-    QVERIFY(!reloaded.toBool());
     controller.setDirty(false);
     QTRY_VERIFY(!pane->property("contentDirty").toBool());
     QTRY_COMPARE(pane->property("kind").toString(), QStringLiteral("markdown"));
@@ -2852,12 +3227,9 @@ void TstPaneIdentity::theAddressBarShowsWhatARelativeNameResolvedTo()
 // (12) A terminal pane must not adopt the answer to a question it no longer
 // has.
 //
-// Naming a pane's remote shell is a server round trip. A user who switches Dev
-// Session while it is travelling leaves an answer in flight that describes the
-// PREVIOUS session's shell, and ch::TerminalFactory delivers it as nothing but
-// (controller, target) — there is no slot in the reply to check. Adopting it
-// attaches this pane to the other session's tmux session, which is two panes on
-// one shell.
+// The factory suppresses answers cancelled by detach or supersession. QML must
+// start the replacement immediately: waiting for the cancelled answer would
+// strand the pane, because that signal is deliberately never delivered.
 // ---------------------------------------------------------------------------
 void TstPaneIdentity::aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup()
 {
@@ -2882,29 +3254,83 @@ void TstPaneIdentity::aTerminalPaneNeverAdoptsTheAnswerToASupersededLookup()
     pane->setProperty("workingDir", QStringLiteral("/srv/b"));
     pane->setProperty("devSessionId", QStringLiteral("dev-b"));
     pane->setProperty("terminalPaneId", QStringLiteral("row-b"));
-    QTest::qWait(80);
-    QVERIFY2(factory.resolutions().size() == 1,
-             "a second lookup was started beside the one still in flight: their answers carry "
-             "nothing but a controller and a target, so neither could then be told apart");
-
-    // ...and the answer to the ABANDONED question lands.
-    emit factory.targetResolved(factory.controller(), QStringLiteral("ch-dev-a-terminal-1"));
-    QTest::qWait(80);
-    QVERIFY2(pane->property("tmuxTarget").toString().isEmpty(),
-             qPrintable(QStringLiteral("the pane adopted \"%1\", the shell belonging to the Dev "
-                                       "Session it has already left")
-                            .arg(pane->property("tmuxTarget").toString())));
-    QVERIFY2(factory.attached().isEmpty(), "the pane attached a PTY to the wrong shell");
-
-    // Discarding it is only half the job: nothing else would ever ask again, so
-    // the pane has to put its current question instead of stranding itself.
-    QTRY_COMPARE(factory.resolutions().size(), 2);
+    QTRY_COMPARE(factory.resolutions().size(), 3);
     QCOMPARE(factory.resolutions().constLast().devSessionId, QStringLiteral("dev-b"));
     QCOMPARE(factory.resolutions().constLast().terminalPaneId, QStringLiteral("row-b"));
+    QCOMPARE(factory.resolutions().constLast().workingDir, QStringLiteral("/srv/b"));
+    QVERIFY(pane->property("resolving").toBool());
 
-    emit factory.targetResolved(factory.controller(), QStringLiteral("ch-dev-b-terminal-1"));
+    // Both the abandoned Dev Session and the intermediate identity can finish
+    // late. Neither delivers a signal or attaches a PTY to the wrong shell.
+    QSignalSpy answered(&factory, &TerminalFactoryStub::targetResolved);
+    QVERIFY(!factory.completeResolution(0, QStringLiteral("ch-dev-a-terminal-1")));
+    QVERIFY(!factory.completeResolution(1, QStringLiteral("ch-dev-b-old-row")));
+    QCOMPARE(answered.size(), 0);
+    QVERIFY(pane->property("tmuxTarget").toString().isEmpty());
+    QVERIFY(factory.attached().isEmpty());
+    QVERIFY(factory.completeResolution(2, QStringLiteral("ch-dev-b-terminal-1")));
     QTRY_COMPARE(pane->property("tmuxTarget").toString(), QStringLiteral("ch-dev-b-terminal-1"));
     QCOMPARE(factory.attached(), QStringList{QStringLiteral("ch-dev-b-terminal-1")});
+}
+
+void TstPaneIdentity::detachedTerminalLookupCanBeRestarted()
+{
+    TerminalFactoryStub factory;
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")}});
+    QVERIFY(pane);
+    QTRY_COMPARE(factory.resolutions().size(), 1);
+    QVERIFY(pane->property("resolving").toBool());
+    QVERIFY(QMetaObject::invokeMethod(pane, "detachNow"));
+    QVERIFY(!pane->property("resolving").toBool());
+    QVERIFY(!factory.completeResolution(0, QStringLiteral("cancelled-target")));
+    QVERIFY(factory.attached().isEmpty());
+    QVERIFY(QMetaObject::invokeMethod(pane, "reconnectNow"));
+    QTRY_COMPARE(factory.resolutions().size(), 2);
+    QVERIFY(factory.completeResolution(1, QStringLiteral("current-target")));
+    QTRY_COMPARE(factory.attached(), QStringList{QStringLiteral("current-target")});
+    QVERIFY(!pane->property("resolving").toBool());
+}
+
+void TstPaneIdentity::terminalLookupWaitsForWorkspaceReadiness()
+{
+    TerminalFactoryStub factory;
+    factory.setWorkspaceReady(false);
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")}});
+    QVERIFY(pane);
+    QVERIFY(factory.resolutions().isEmpty());
+    QVERIFY(!pane->property("resolving").toBool());
+    factory.setWorkspaceReady(true);
+    QTRY_COMPARE(factory.resolutions().size(), 1);
+    QVERIFY(pane->property("resolving").toBool());
+
+    // The transport can retain the same peer id after reconnect. Retiring its
+    // readiness cancels the old answer without leaving a permanent QML wait.
+    factory.setWorkspaceReady(false);
+    QVERIFY(!pane->property("resolving").toBool());
+    QVERIFY(!factory.completeResolution(0, QStringLiteral("old-target")));
+    factory.setConnected(false);
+    factory.setWorkspaceReady(true);
+    QCOMPARE(factory.resolutions().size(), 1);
+    factory.setWorkspaceReady(false);
+    factory.setConnected(true);
+    pane->setProperty("visible", false);
+    factory.setWorkspaceReady(true);
+    QCOMPARE(factory.resolutions().size(), 1);
+    pane->setProperty("visible", true);
+    QTRY_COMPARE(factory.resolutions().size(), 2);
+    QVERIFY(factory.completeResolution(1, QStringLiteral("current-target")));
+    QTRY_COMPARE(factory.attached(), QStringList{QStringLiteral("current-target")});
+    QVERIFY(!pane->property("resolving").toBool());
 }
 
 // ---------------------------------------------------------------------------
@@ -3021,6 +3447,8 @@ QVariantMap recoveryPaneProps(QObject *controller)
 {
     return {{QStringLiteral("controller"), QVariant::fromValue(controller)},
             {QStringLiteral("editorBundleUrl"), QString()},
+            {QStringLiteral("recoveryServerId"), QStringLiteral("server-recovery")},
+            {QStringLiteral("recoverySessionId"), QStringLiteral("dev-recovery")},
             {QStringLiteral("recoveryPaneId"), QStringLiteral("viewer-1")},
             {QStringLiteral("fileUrl"), QStringLiteral("file:///srv/repos/app/notes.md")}};
 }
@@ -3359,15 +3787,14 @@ void TstPaneIdentity::aRefusedInternalResourceSaysWhyInsteadOfShowingABlankPage(
 }
 
 // ---------------------------------------------------------------------------
-// A layout RELOAD (SPEC 4.5). ch::SessionLayouts republishes a tree and bumps
-// its load generation; the region drops every cached pane, because a reloaded
-// tree can name the very same pane ids and a stale pane would otherwise be
-// handed to a load it does not belong to.
+// An explicit layout RELOAD (SPEC 4.5) advances SessionLayouts.paneGeneration
+// as well as the request epoch. A reconnect refresh deliberately does not, so
+// unchanged documents retain their live buffers.
 //
 // Dropping them is only half of it. Each region in the recursive tree keeps its
 // own note of which pane it is showing, and that note survives the pane. The
-// host binds `node` and `layoutGeneration` to the same object, so a reload that
-// republishes an IDENTICAL tree moves only the generation — no `node` change
+// host binds node and paneGeneration to the same facade, so an explicit reload
+// of an IDENTICAL tree moves its document generation — no node change
 // re-runs the leaves — and every region went on believing a destroyed pane was
 // on screen. The layout looked right in every property and the column was
 // empty.
@@ -3392,9 +3819,10 @@ void TstPaneIdentity::aLayoutReloadRebuildsEveryPaneInTheTree()
     for (QObject *pane : live)
         before.append(QPointer<QObject>(pane));
 
-    // Exactly what a reload of the same layout does: the generation moves and
-    // the tree does not.
+    // An explicit reload advances both authority and document generations
+    // while retaining the same stored tree.
     m_region->setProperty("layoutGeneration", 1.0);
+    m_region->setProperty("paneGeneration", 1.0);
     QTest::qWait(kSettleMs);
 
     const QList<QObject *> after = panes();
@@ -3438,6 +3866,292 @@ void TstPaneIdentity::aLayoutReloadRebuildsEveryPaneInTheTree()
                                 .arg(item->width())
                                 .arg(item->height())));
     }
+}
+
+void TstPaneIdentity::reconnectRefreshPreservesDirtyEditorAndRetiresOldIntents()
+{
+    ReadFileServer server;
+    QVERIFY(server.bind(&m_client));
+    const QString path = QStringLiteral("/repo/reconnect.txt");
+    const QString address = QStringLiteral("file:///repo/reconnect.txt");
+    server.setFile(path, QStringLiteral("RECONNECT_SERVER_BASELINE"));
+    server.setLayout(QStringLiteral("viewer"),
+        QJsonObject{{QStringLiteral("type"), QStringLiteral("split")},
+                    {QStringLiteral("orientation"), QStringLiteral("horizontal")},
+                    {QStringLiteral("children"),
+                     QJsonArray{
+                         QJsonObject{{QStringLiteral("type"), QStringLiteral("leaf")},
+                                     {QStringLiteral("paneId"), QStringLiteral("viewer-1")},
+                                     {QStringLiteral("url"), address}},
+                         QJsonObject{{QStringLiteral("type"), QStringLiteral("leaf")},
+                                     {QStringLiteral("paneId"), QStringLiteral("viewer-2")},
+                                     {QStringLiteral("url"), QStringLiteral("file:///repo/other.bin")}}}},
+                    {QStringLiteral("ratios"), QJsonArray{0.5, 0.5}}});
+    server.setLayout(QStringLiteral("terminal"),
+        QJsonObject{{QStringLiteral("type"), QStringLiteral("leaf")},
+                    {QStringLiteral("paneId"), QString()}});
+    QTemporaryDir settings;
+    QVERIFY(settings.isValid());
+    ch::UiStateStore uiState(settings.filePath(QStringLiteral("ui.ini")));
+    ch::WorkspaceDb workspace(&m_client);
+    ch::SessionLayouts layouts(&workspace, &uiState);
+    const auto retireShell = qScopeGuard([this] { cleanup(); });
+    layouts.setServerId(QStringLiteral("server-reconnect"));
+    QSignalSpy loaded(&layouts, &ch::SessionLayouts::loaded);
+    layouts.load(QStringLiteral("dev-reconnect"));
+    QTRY_COMPARE(loaded.size(), 1);
+    std::unique_ptr<QObject> monacoProbe = installMonacoProbe();
+    QVERIFY(monacoProbe);
+    const auto restoreScripts = qScopeGuard([&monacoProbe] {
+        QMetaObject::invokeMethod(monacoProbe.get(), "restore");
+    });
+    m_region = openInShell(
+        QStringLiteral("ViewerRegion.qml"),
+        {{QStringLiteral("node"), layouts.viewerTree()},
+         {QStringLiteral("serverId"), layouts.serverId()},
+         {QStringLiteral("acceptedServerId"), layouts.serverId()},
+         {QStringLiteral("sessionId"), layouts.devSessionId()},
+         {QStringLiteral("layoutGeneration"), double(layouts.generation())},
+         {QStringLiteral("paneGeneration"), double(layouts.paneGeneration())},
+         {QStringLiteral("hostStampsWrites"), true}});
+    QVERIFY(m_region);
+    QVERIFY(QMetaObject::invokeMethod(m_shell.get(), "bindViewerLayouts",
+                                      Q_ARG(QVariant, QVariant::fromValue<QObject *>(&layouts))));
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const editor = collect(m_region, isEditorPane).constFirst();
+    QObject *const pane = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QVERIFY(pane);
+    auto *const controller =
+        qobject_cast<ch::EditorController *>(asObject(editor->property("controller")));
+    QVERIFY(controller);
+    const QString capture = QStringLiteral(
+        "typeof window.captureEditorContent === 'function'"
+        " ? window.captureEditorContent() : null");
+    QVERIFY(waitForJs(editor, capture, QStringLiteral("RECONNECT_SERVER_BASELINE"),
+                      kPageLoadTimeoutMs));
+    const QString text = evalJs(editor, QStringLiteral(
+        "(function(){var e=window.monaco.editor.getEditors()[0];"
+        "var m=e.getModel(); var last=m.getLineCount();"
+        "e.setPosition({lineNumber:last,column:m.getLineMaxColumn(last)});"
+        "e.trigger('keyboard','type',{text:'DIRTY_RECONNECT_RAM'});"
+        "window.__reconnectSurvivor='CURRENT_DOCUMENT';"
+        "return window.captureEditorContent();})()"));
+    QVERIFY(text.contains(QStringLiteral("DIRTY_RECONNECT_RAM")));
+    QTRY_VERIFY(controller->dirty());
+    controller->setRecoveryDir(QStringLiteral("/owned-fixture/reconnect"));
+    QVERIFY(controller->recoveryEnabled());
+    controller->reportContent(text);
+    QTRY_VERIFY(!server.fileWrites().isEmpty());
+    const QJsonObject scopeRecord = QJsonDocument::fromJson(
+        server.fileWrites().constLast().value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(scopeRecord.value(QStringLiteral("serverId")).toString(), layouts.serverId());
+    QCOMPARE(scopeRecord.value(QStringLiteral("devSessionId")).toString(), layouts.devSessionId());
+    QCOMPARE(scopeRecord.value(QStringLiteral("paneId")).toString(), QStringLiteral("viewer-1"));
+    QCOMPARE(scopeRecord.value(QStringLiteral("path")).toString(), path);
+    // Losing current wire authority retires recovery scope, not the live
+    // document. Reaccepting this server must likewise preserve its dirty RAM.
+    m_region->setProperty("acceptedServerId", QString());
+    QCOMPARE(editor->property("recoveryServerId").toString(), QString());
+    QVERIFY(!controller->recoveryEnabled());
+    QVERIFY(editor->property("recoveryUnavailable").toBool());
+    QCOMPARE(collect(m_region, isEditorPane).constFirst(), editor);
+    QCOMPARE(evalJs(editor, capture), text);
+    QVERIFY(controller->dirty());
+    m_region->setProperty("acceptedServerId", layouts.serverId());
+    QCOMPARE(editor->property("recoveryServerId").toString(), layouts.serverId());
+    QVERIFY(controller->recoveryEnabled());
+    QVERIFY(!editor->property("recoveryUnavailable").toBool());
+    QCOMPARE(collect(m_region, isEditorPane).constFirst(), editor);
+    QCOMPARE(evalJs(editor, capture), text);
+    QVERIFY(controller->dirty());
+    const QString revision = controller->revision();
+    const int fileReads = server.readCount(path);
+    const int layoutReads = server.layoutReadCount();
+    const quint64 oldGeneration = layouts.generation();
+    const quint64 documentGeneration = layouts.paneGeneration();
+    QPointer<QObject> preservedEditor(editor);
+    QPointer<QObject> preservedPane(pane);
+    const QList<QObject *> handles = collect(m_region, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("keyStep") >= 0;
+    });
+    QCOMPARE(handles.size(), 1);
+    QObject *const handle = handles.constFirst();
+    QSignalSpy ratios(m_region,
+                      SIGNAL(splitRatiosAdjustedForSession(QString,double,QVariant,QVariant)));
+    QVERIFY(ratios.isValid());
+    pane->setProperty("probePath", QStringLiteral("/repo/retired-probe"));
+    m_region->setProperty("pendingOpenTargets",
+        QVariantMap{{QStringLiteral("queued-pane"),
+                     QVariantMap{{QStringLiteral("url"), QStringLiteral("file:///retired.txt")},
+                                 {QStringLiteral("kind"), QStringLiteral("text")}}}});
+    QCOMPARE(asMap(m_region->property("pendingOpenTargets")).size(), 1);
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, 16)));
+    QVERIFY(QMetaObject::invokeMethod(editor, "reload")); // Async capture still belongs to old epoch.
+    layouts.refresh();
+    QCOMPARE(layouts.paneGeneration(), documentGeneration);
+    QVERIFY(layouts.generation() > oldGeneration);
+    QTRY_COMPARE(loaded.size(), 2);
+    QCOMPARE(server.layoutReadCount(), layoutReads + 2);
+    QTest::qWait(kSettleMs);
+    QCOMPARE(ratios.size(), 0);
+    QVERIFY(!handle->property("resizePending").toBool());
+    QCOMPARE(pane->property("probePath").toString(), QString());
+    QVERIFY(pane->property("url").toUrl() == QUrl(address));
+    QVERIFY(asMap(m_region->property("pendingOpenTargets")).isEmpty());
+    QCOMPARE(preservedEditor.data(), collect(m_region, isEditorPane).constFirst());
+    QCOMPARE(preservedPane.data(), paneWithId(m_region, QStringLiteral("viewer-1")));
+    QCOMPARE(asObject(editor->property("controller")), controller);
+    QCOMPARE(evalJs(editor, capture), text);
+    QCOMPARE(evalJs(editor, QStringLiteral("window.__reconnectSurvivor")),
+             QStringLiteral("CURRENT_DOCUMENT"));
+    QVERIFY(controller->dirty());
+    QCOMPARE(controller->revision(), revision);
+    QCOMPARE(server.readCount(path), fileReads);
+    QCOMPARE(server.layoutWriteCount(), 0);
+
+    // An old captured callback stays fenced, while current pane reports have
+    // advanced stamps and can persist against the accepted fresh layout.
+    layouts.setPaneUrlForSession(QStringLiteral("dev-reconnect"), oldGeneration,
+                                QStringLiteral("viewer"), QStringLiteral("viewer-1"),
+                                QStringLiteral("file:///retired.txt"));
+    QCOMPARE(server.layoutWriteCount(), 0);
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, -16)));
+    QTRY_COMPARE(ratios.size(), 1);
+    QCOMPARE(ratios.constFirst().at(1).toDouble(), double(layouts.generation()));
+    QTRY_COMPARE(server.layoutWriteCount(), 1);
+    QCOMPARE(evalJs(editor, capture), text);
+
+    // A deliberate same-session load is still a document reset, not refresh.
+    layouts.load(QStringLiteral("dev-reconnect"));
+    QTRY_COMPARE(loaded.size(), 3);
+    QTRY_VERIFY(preservedEditor.isNull());
+    QTRY_VERIFY(preservedPane.isNull());
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const replacement = collect(m_region, isEditorPane).constFirst();
+    QVERIFY(waitForJs(replacement, capture, QStringLiteral("RECONNECT_SERVER_BASELINE"),
+                      kPageLoadTimeoutMs));
+    auto *const replacementController =
+        qobject_cast<ch::EditorController *>(asObject(replacement->property("controller")));
+    QVERIFY(replacementController);
+    QVERIFY(!replacementController->dirty());
+    QVERIFY(server.readCount(path) > fileReads);
+}
+
+void TstPaneIdentity::editorRecoveryUsesScopedContextAndWarnsWhenUnavailable_data()
+{
+    QTest::addColumn<QByteArray>("missingProperty");
+    QTest::addColumn<QString>("restoredIdentity");
+    QTest::newRow("unaccepted-server") << QByteArray("recoveryServerId")
+                                      << QStringLiteral("accepted-server");
+    QTest::newRow("missing-session") << QByteArray("recoverySessionId")
+                                    << QStringLiteral("session-a");
+    QTest::newRow("missing-pane") << QByteArray("recoveryPaneId")
+                                 << QStringLiteral("viewer-1");
+}
+
+void TstPaneIdentity::editorRecoveryUsesScopedContextAndWarnsWhenUnavailable()
+{
+    QFETCH(QByteArray, missingProperty);
+    QFETCH(QString, restoredIdentity);
+    ReadFileServer server;
+    QVERIFY(server.bind(&m_client));
+    const auto retireShell = qScopeGuard([this] { cleanup(); });
+    server.setFile(QStringLiteral("/repo/scope-a.txt"), QStringLiteral("SAVED_A"));
+    server.setFile(QStringLiteral("/repo/scope-b.txt"), QStringLiteral("SAVED_B"));
+    QObject *const editor = openInShell(
+        QStringLiteral("EditorPaneView.qml"),
+        {{QStringLiteral("editorBundleUrl"), QString()},
+         {QStringLiteral("recoveryServerId"), QStringLiteral("accepted-server")},
+         {QStringLiteral("recoverySessionId"), QStringLiteral("session-a")},
+         {QStringLiteral("recoveryPaneId"), QStringLiteral("viewer-1")},
+         {QStringLiteral("fileUrl"), QUrl(QStringLiteral("file:///repo/scope-a.txt"))}});
+    QVERIFY(editor);
+    auto *const controller =
+        qobject_cast<ch::EditorController *>(asObject(editor->property("controller")));
+    QVERIFY(controller);
+    controller->setRecoveryDir(QStringLiteral("/owned-fixture/recovery"));
+    QTRY_COMPARE(controller->fileState(), QStringLiteral("clean"));
+    QVERIFY(controller->recoveryEnabled());
+    controller->reportContent(QStringLiteral("DIRTY_A"));
+    QTRY_VERIFY(!server.fileWrites().isEmpty());
+    const QJsonObject firstWrite = server.fileWrites().constLast();
+    const QString firstTarget = firstWrite.value(QStringLiteral("path")).toString();
+    QVERIFY(!firstTarget.isEmpty());
+    const QJsonObject firstRecord = QJsonDocument::fromJson(
+        firstWrite.value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(firstRecord.value(QStringLiteral("serverId")).toString(),
+             QStringLiteral("accepted-server"));
+    QCOMPARE(firstRecord.value(QStringLiteral("devSessionId")).toString(),
+             QStringLiteral("session-a"));
+    QCOMPARE(firstRecord.value(QStringLiteral("paneId")).toString(), QStringLiteral("viewer-1"));
+    QCOMPARE(firstRecord.value(QStringLiteral("path")).toString(), QStringLiteral("/repo/scope-a.txt"));
+    QCOMPARE(firstRecord.value(QStringLiteral("content")).toString(), QStringLiteral("DIRTY_A"));
+
+    QObject *const banner = childNamed(editor, QStringLiteral("editorStateBanner"));
+    QVERIFY(banner);
+    editor->setProperty(missingProperty.constData(), QString());
+    QTRY_VERIFY(!controller->recoveryEnabled());
+    QVERIFY(controller->dirty());
+    QTRY_VERIFY(editor->property("recoveryUnavailable").toBool());
+    QTRY_VERIFY(banner->property("visible").toBool());
+    QCOMPARE(asObject(editor->property("controller")), controller);
+    const qsizetype writesBeforeUnaccepted = server.fileWrites().size();
+    controller->reportContent(QStringLiteral("DIRTY_WITHOUT_AUTHORITY"));
+    QTest::qWait(80);
+    QCOMPARE(server.fileWrites().size(), writesBeforeUnaccepted);
+
+    editor->setProperty(missingProperty.constData(), restoredIdentity);
+    QTRY_VERIFY(controller->recoveryEnabled());
+    QVERIFY(controller->dirty());
+    QTRY_VERIFY(!editor->property("recoveryUnavailable").toBool());
+    QTRY_VERIFY(!banner->property("visible").toBool());
+    controller->reportContent(QStringLiteral("DIRTY_A_REACCEPTED"));
+    QTRY_VERIFY(server.fileWrites().size() > writesBeforeUnaccepted);
+    QCOMPARE(server.fileWrites().constLast().value(QStringLiteral("path")).toString(), firstTarget);
+    const QString preservedFirstRecord = server.fileContent(firstTarget);
+
+    // A different complete scope cannot adopt this still-loaded A buffer.
+    const qsizetype writesBeforeSession = server.fileWrites().size();
+    editor->setProperty("recoverySessionId", QStringLiteral("session-b"));
+    QVERIFY(!controller->recoveryEnabled());
+    QVERIFY(controller->dirty());
+    QVERIFY(editor->property("recoveryUnavailable").toBool());
+    controller->reportContent(QStringLiteral("STALE_SESSION_A_BUFFER"));
+    QTest::qWait(80);
+    QCOMPARE(server.fileWrites().size(), writesBeforeSession);
+    QCOMPARE(server.fileContent(firstTarget), preservedFirstRecord);
+
+    // Only an explicit new document open binds B's complete scope. It can use
+    // the same file/pane labels without touching the earlier A snapshot.
+    QVERIFY(QMetaObject::invokeMethod(editor, "start"));
+    QTRY_COMPARE(controller->fileState(), QStringLiteral("clean"));
+    QVERIFY(controller->recoveryEnabled());
+    controller->reportContent(QStringLiteral("DIRTY_SESSION_B"));
+    QTRY_VERIFY(server.fileWrites().size() > writesBeforeSession);
+    const QJsonObject sessionWrite = server.fileWrites().constLast();
+    const QString sessionTarget = sessionWrite.value(QStringLiteral("path")).toString();
+    QVERIFY(sessionTarget != firstTarget);
+    const QJsonObject sessionRecord = QJsonDocument::fromJson(
+        sessionWrite.value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(sessionRecord.value(QStringLiteral("devSessionId")).toString(),
+             QStringLiteral("session-b"));
+    QCOMPARE(server.fileContent(firstTarget), preservedFirstRecord);
+    const QString preservedSessionRecord = server.fileContent(sessionTarget);
+
+    // File identity comes from the actual opened path, not a host-supplied hash.
+    const qsizetype writesBeforeFile = server.fileWrites().size();
+    editor->setProperty("fileUrl", QUrl(QStringLiteral("file:///repo/scope-b.txt")));
+    QTRY_COMPARE(controller->fileState(), QStringLiteral("clean"));
+    controller->reportContent(QStringLiteral("DIRTY_FILE_B"));
+    QTRY_VERIFY(server.fileWrites().size() > writesBeforeFile);
+    const QJsonObject fileWrite = server.fileWrites().constLast();
+    const QString fileTarget = fileWrite.value(QStringLiteral("path")).toString();
+    QVERIFY(fileTarget != firstTarget && fileTarget != sessionTarget);
+    const QJsonObject fileRecord = QJsonDocument::fromJson(
+        fileWrite.value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(fileRecord.value(QStringLiteral("path")).toString(), QStringLiteral("/repo/scope-b.txt"));
+    QCOMPARE(server.fileContent(firstTarget), preservedFirstRecord);
+    QCOMPARE(server.fileContent(sessionTarget), preservedSessionRecord);
 }
 
 // ---------------------------------------------------------------------------
@@ -4270,6 +4984,405 @@ void TstPaneIdentity::narrowViewerKeepsItsAddressUsable()
     QTRY_COMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///tmp/next.bin")));
     QVERIFY(address->hasActiveFocus());
     QVERIFY2(warnings.isEmpty(), "responsive viewer emitted QML warnings");
+}
+
+void TstPaneIdentity::keyboardSplitRatiosPersistAfterLayout_data()
+{
+    QTest::addColumn<bool>("horizontal");
+    QTest::addColumn<bool>("terminal");
+    QTest::newRow("terminal-horizontal") << true << true;
+    QTest::newRow("terminal-vertical") << false << true;
+    QTest::newRow("viewer-horizontal") << true << false;
+    QTest::newRow("viewer-vertical") << false << false;
+}
+
+void TstPaneIdentity::keyboardSplitRatiosPersistAfterLayout()
+{
+    QFETCH(bool, horizontal);
+    QFETCH(bool, terminal);
+    const QString firstId = terminal ? QStringLiteral("terminal-1") : QStringLiteral("viewer-1");
+    const QString secondId = terminal ? QStringLiteral("terminal-2") : QStringLiteral("viewer-2");
+    QVariantMap tree = branchNode(
+        horizontal ? QStringLiteral("horizontal") : QStringLiteral("vertical"),
+        {leafNode(firstId), leafNode(secondId)});
+    QVERIFY(openRegion(terminal ? QStringLiteral("TerminalRegion.qml")
+                                : QStringLiteral("ViewerRegion.qml"), tree, terminal));
+    QTRY_VERIFY(paneWithId(m_region, secondId));
+    QTest::qWait(kSettleMs);
+    auto *const first = qobject_cast<QQuickItem *>(paneWithId(m_region, firstId));
+    auto *const second = qobject_cast<QQuickItem *>(paneWithId(m_region, secondId));
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY(first && second && window);
+    const auto extent = [horizontal](QQuickItem *item) {
+        return horizontal ? item->width() : item->height();
+    };
+    const QList<QObject *> handles = collect(m_region, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("keyStep") >= 0;
+    });
+    QCOMPARE(handles.size(), 1);
+    auto *const handle = qobject_cast<QQuickItem *>(handles.constFirst());
+    QVERIFY(handle);
+    const qreal before = extent(first);
+    QSignalSpy reported(m_region, SIGNAL(splitRatiosAdjusted(QVariant, QVariant)));
+    QVERIFY(reported.isValid());
+    handle->forceActiveFocus();
+    QTRY_VERIFY(handle->hasActiveFocus());
+    QTest::keyClick(window, horizontal ? Qt::Key_Right : Qt::Key_Down);
+    QTRY_COMPARE(reported.size(), 1);
+    QTRY_VERIFY(extent(first) > before + 10);
+    const qreal changed = extent(first);
+    const QVariantList ratios = asList(reported.constFirst().at(1));
+    QCOMPARE(ratios.size(), 2);
+    QVERIFY(qAbs(ratios.at(0).toDouble()
+                 - extent(first) / (extent(first) + extent(second))) < 0.001);
+
+    // Simulate the host restoring its previous tree, then the newly persisted
+    // ratio payload. A report of the pre-key geometry fails this round trip.
+    setNode(tree);
+    QTRY_VERIFY(qAbs(extent(first) - before) <= 6);
+    tree.insert(QStringLiteral("ratios"), ratios);
+    setNode(tree);
+    QTRY_VERIFY(qAbs(extent(first) - changed) <= 6);
+}
+
+void TstPaneIdentity::keyboardSplitLimitsLeaveTheThirdPaneAlone_data()
+{
+    QTest::addColumn<bool>("horizontal");
+    QTest::newRow("horizontal") << true;
+    QTest::newRow("vertical") << false;
+}
+
+void TstPaneIdentity::keyboardSplitLimitsLeaveTheThirdPaneAlone()
+{
+    QFETCH(bool, horizontal);
+    QQmlComponent component(m_engine.get());
+    component.setData(R"QML(
+import QtQuick
+import QtQuick.Window
+import QtQuick.Controls.Basic
+import CodeHarbor
+Window {
+    id: splitFixture
+    width: 712; height: 712; visible: true
+    property bool splitHorizontal: true
+    SplitView {
+        anchors.fill: parent
+        orientation: splitFixture.splitHorizontal ? Qt.Horizontal : Qt.Vertical
+        handle: AppSplitHandle {}
+        Item {
+            objectName: "unrelatedFill"
+            SplitView.fillWidth: true; SplitView.fillHeight: true
+        }
+        Item {
+            objectName: "before"
+            SplitView.preferredWidth: 150; SplitView.preferredHeight: 150
+        }
+        Item {
+            objectName: "after"
+            SplitView.preferredWidth: 250; SplitView.preferredHeight: 250
+            SplitView.minimumWidth: 200; SplitView.minimumHeight: 200
+        }
+    }
+}
+)QML", QUrl(QStringLiteral("qrc:/tst_paneidentity/split-limits.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    m_shell.reset(component.createWithInitialProperties({{QStringLiteral("splitHorizontal"), horizontal}}));
+    QVERIFY2(m_shell, qPrintable(component.errorString()));
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    auto *const fill = qobject_cast<QQuickItem *>(childNamed(window, QStringLiteral("unrelatedFill")));
+    auto *const before = qobject_cast<QQuickItem *>(childNamed(window, QStringLiteral("before")));
+    auto *const after = qobject_cast<QQuickItem *>(childNamed(window, QStringLiteral("after")));
+    QVERIFY(window && fill && before && after);
+    const auto extent = [horizontal](QQuickItem *item) {
+        return horizontal ? item->width() : item->height();
+    };
+    QTRY_COMPARE(qRound(extent(after)), 250);
+    QTRY_COMPARE(qRound(extent(before)), 150);
+    const qreal fillBefore = extent(fill);
+    const QList<QObject *> handles = collect(window, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("keyStep") >= 0;
+    });
+    QCOMPARE(handles.size(), 2);
+    QQuickItem *handle = nullptr;
+    for (QObject *candidate : handles) {
+        auto *const item = qobject_cast<QQuickItem *>(candidate);
+        QVERIFY(item);
+        if (!handle || (horizontal ? item->x() > handle->x() : item->y() > handle->y()))
+            handle = item;
+    }
+    QVERIFY(handle);
+    handle->forceActiveFocus();
+    QTRY_VERIFY(handle->hasActiveFocus());
+    QTest::keyClick(window, Qt::Key_PageDown);
+    QTRY_COMPARE(qRound(extent(after)), 200);
+    QCOMPARE(qRound(extent(before)), 200);
+    QCOMPARE(extent(fill), fillBefore);
+    QTest::keyClick(window, Qt::Key_PageDown);
+    QTest::qWait(50);
+    QCOMPARE(qRound(extent(before)), 200);
+    QCOMPARE(extent(fill), fillBefore);
+    QTest::keyClick(window, horizontal ? Qt::Key_Left : Qt::Key_Up);
+    QTRY_COMPARE(qRound(extent(after)), 216);
+    QCOMPARE(qRound(extent(before)), 184);
+    QCOMPARE(extent(fill), fillBefore);
+}
+
+void TstPaneIdentity::terminalRetargetDismissesStaleDialogs_data()
+{
+    QTest::addColumn<QString>("openMethod");
+    QTest::addColumn<QString>("dialogName");
+    QTest::newRow("rename") << QStringLiteral("beginRename")
+                            << QStringLiteral("terminalPaneRenameDialog");
+    QTest::newRow("harness") << QStringLiteral("beginSetHarness")
+                             << QStringLiteral("terminalPaneHarnessDialog");
+    QTest::newRow("kill") << QStringLiteral("beginClose")
+                          << QStringLiteral("terminalPaneKillDialog");
+}
+
+void TstPaneIdentity::terminalRetargetDismissesStaleDialogs()
+{
+    QFETCH(QString, openMethod);
+    QFETCH(QString, dialogName);
+    TerminalFactoryStub factory;
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("factory"), QVariant::fromValue<QObject *>(&factory)},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("devSessionId"), QStringLiteral("dev-a")},
+         {QStringLiteral("terminalPaneId"), QStringLiteral("row-a")}});
+    QVERIFY(pane);
+    QSignalSpy killed(pane, SIGNAL(killRequested(QString)));
+    QSignalSpy closed(pane, SIGNAL(closeRequested(QString)));
+    QSignalSpy renamed(pane, SIGNAL(titleChangedRequested(QString, QString)));
+    QVERIFY(killed.isValid() && closed.isValid() && renamed.isValid());
+    QVERIFY(QMetaObject::invokeMethod(pane, qPrintable(openMethod)));
+    QObject *const dialog = childNamed(pane, dialogName);
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(pane->setProperty("terminalPaneId", QStringLiteral("row-b")));
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QCOMPARE(killed.size(), 0);
+    QCOMPARE(closed.size(), 0);
+    QCOMPARE(renamed.size(), 0);
+    QVERIFY(m_app.harnessWrites().isEmpty());
+
+    // The replacement still has working controls, but requires fresh consent.
+    QVERIFY(QMetaObject::invokeMethod(pane, qPrintable(openMethod)));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    if (openMethod == QStringLiteral("beginRename")) {
+        QObject *const field = childNamed(dialog, QStringLiteral("terminalPaneRenameField"));
+        QVERIFY(field);
+        QVERIFY(field->setProperty("text", QStringLiteral("Replacement")));
+    }
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    if (openMethod == QStringLiteral("beginRename")) {
+        QCOMPARE(renamed.size(), 1);
+        QCOMPARE(renamed.constFirst().at(1).toString(), QStringLiteral("Replacement"));
+    } else if (openMethod == QStringLiteral("beginSetHarness")) {
+        QCOMPARE(m_app.harnessWrites().size(), 1);
+        QCOMPARE(m_app.harnessWrites().constFirst().terminalPaneId, QStringLiteral("row-b"));
+    } else {
+        QCOMPARE(killed.size(), 1);
+        QCOMPARE(closed.size(), 1);
+    }
+}
+
+void TstPaneIdentity::terminalHostStateWaitsForTheBrowserApis_data()
+{
+    QTest::addColumn<bool>("cancelFocus");
+    QTest::newRow("restore-focus") << false;
+    QTest::newRow("user-moved-focus") << true;
+}
+
+void TstPaneIdentity::terminalHostStateWaitsForTheBrowserApis()
+{
+    QFETCH(bool, cancelFocus);
+    QQmlComponent settingsComponent(m_engine.get());
+    settingsComponent.setData(
+        "import QtQml\nQtObject { property real terminalFontSize: 17;"
+        " property real terminalPixelRatio: 1.25 }",
+        QUrl(QStringLiteral("qrc:/tst_paneidentity/terminal-settings.qml")));
+    std::unique_ptr<QObject> settings(settingsComponent.create());
+    QVERIFY2(settings, qPrintable(settingsComponent.errorString()));
+    const QUrl page(QStringLiteral("data:text/html;base64,")
+                    + QString::fromLatin1(QByteArray("<!doctype html><title>Delayed APIs</title>")
+                                             .toBase64()));
+    QObject *const pane = openInShell(
+        QStringLiteral("TerminalPaneView.qml"),
+        {{QStringLiteral("terminalBundleUrl"), page},
+         {QStringLiteral("settingsObject"), QVariant::fromValue(settings.get())},
+         {QStringLiteral("paneId"), QStringLiteral("terminal-1")},
+         {QStringLiteral("paneActive"), true}});
+    QVERIFY(pane);
+    QTRY_VERIFY_WITH_TIMEOUT(pane->property("pageLoaded").toBool(), kPageLoadTimeoutMs);
+    QCOMPARE(evalJs(pane, QStringLiteral("document.title")), QStringLiteral("Delayed APIs"));
+    QVERIFY(QMetaObject::invokeMethod(pane, "acceptFocus"));
+    QTest::qWait(150);
+    QVERIFY(pane->property("focusPending").toBool());
+    QVERIFY(!pane->property("rendererReady").toBool());
+    QVERIFY(settings->setProperty("terminalFontSize", 21.0));
+    QVERIFY(settings->setProperty("terminalPixelRatio", 1.5));
+    if (cancelFocus)
+        QVERIFY(pane->setProperty("paneActive", false));
+    QCOMPARE(evalJs(pane, QStringLiteral(R"JS(
+window.__focusCalls = 0;
+window.applyTheme = roles => { window.__theme = roles; };
+window.codeharborSetTerminalPreferences = (font, ratio) => {
+    window.__preferences = [font, ratio];
+};
+window.codeharborFocusTerminal = () => { window.__focusCalls++; };
+'installed'
+)JS")), QStringLiteral("installed"));
+    QTRY_VERIFY(pane->property("rendererReady").toBool());
+    QVERIFY(waitForJs(pane, QStringLiteral("JSON.stringify(window.__preferences)"),
+                      QStringLiteral("[21,1.5]"), kProbeTimeoutMs));
+    QCOMPARE(evalJs(pane, QStringLiteral(
+                 "String(!!window.__theme && typeof window.__theme.accent === 'string'"
+                 " && typeof window.__theme.surfaceSunken === 'string')")),
+             QStringLiteral("true"));
+    QCOMPARE(evalJs(pane, QStringLiteral("String(window.__focusCalls)")),
+             cancelFocus ? QStringLiteral("0") : QStringLiteral("1"));
+    QVERIFY(!pane->property("focusPending").toBool());
+}
+
+void TstPaneIdentity::keyboardSplitPublicationCoalescesAndCancels_data()
+{
+    QTest::addColumn<bool>("terminal");
+    QTest::newRow("terminal") << true;
+    QTest::newRow("viewer") << false;
+}
+
+void TstPaneIdentity::keyboardSplitPublicationCoalescesAndCancels()
+{
+    QFETCH(bool, terminal);
+    const QString firstId = terminal ? QStringLiteral("terminal-1") : QStringLiteral("viewer-1");
+    const QString secondId = terminal ? QStringLiteral("terminal-2") : QStringLiteral("viewer-2");
+    QVariantMap tree = branchNode(QStringLiteral("horizontal"),
+                                 {leafNode(firstId), leafNode(secondId)});
+    QVERIFY(openRegion(terminal ? QStringLiteral("TerminalRegion.qml")
+                                : QStringLiteral("ViewerRegion.qml"), tree, terminal));
+    QVERIFY(m_region->setProperty(terminal ? "devSessionId" : "sessionId",
+                                  QStringLiteral("dev-identity")));
+    QVERIFY(m_region->setProperty("hostStampsWrites", true));
+    QTRY_VERIFY(paneWithId(m_region, secondId));
+    QTest::qWait(kSettleMs);
+    const QList<QObject *> handles = collect(m_region, [](QObject *object) {
+        return object->metaObject()->indexOfProperty("keyStep") >= 0;
+    });
+    QCOMPARE(handles.size(), 1);
+    QObject *const handle = handles.constFirst();
+    auto *const first = qobject_cast<QQuickItem *>(paneWithId(m_region, firstId));
+    auto *const second = qobject_cast<QQuickItem *>(paneWithId(m_region, secondId));
+    QVERIFY(first && second);
+    const qreal before = first->width();
+    QSignalSpy reported(m_region,
+                        SIGNAL(splitRatiosAdjustedForSession(QString,double,QVariant,QVariant)));
+    QVERIFY(reported.isValid());
+
+    // Deliberately deliver both steps before the event loop can polish.
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, 16)));
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, 16)));
+    QCOMPARE(reported.size(), 0);
+    QTRY_COMPARE(reported.size(), 1);
+    QTRY_VERIFY(qAbs(first->width() - before - 32) < 0.5);
+    QCOMPARE(reported.constFirst().at(0).toString(), QStringLiteral("dev-identity"));
+    QCOMPARE(reported.constFirst().at(1).toDouble(), 0.0);
+    QVERIFY(asList(reported.constFirst().at(2)).isEmpty());
+    const QVariantList ratios = asList(reported.constFirst().at(3));
+    QCOMPARE(ratios.size(), 2);
+    QVERIFY(qAbs(ratios.at(0).toDouble()
+                 - first->width() / (first->width() + second->width())) < 0.001);
+
+    // A republished tree cancels the pending key, rather than filing the new
+    // tree's geometry under the key's older stamp/path.
+    reported.clear();
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, 16)));
+    tree.insert(QStringLiteral("ratios"), QVariantList{0.4, 0.6});
+    setNode(tree);
+    QTest::qWait(kSettleMs);
+    QCOMPARE(reported.size(), 0);
+    QVERIFY(!handle->property("resizePending").toBool());
+    QVERIFY(QMetaObject::invokeMethod(handle, "moveBy", Q_ARG(QVariant, 16)));
+    QVERIFY(m_region->setProperty("layoutGeneration", 1.0));
+    QTest::qWait(kSettleMs);
+    QCOMPARE(reported.size(), 0);
+    QVERIFY(!handle->property("resizePending").toBool());
+}
+
+void TstPaneIdentity::emptyTerminalRegionDoesNotAllocateUntilSplit()
+{
+    TerminalFactoryStub factory;
+    m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"), &factory);
+    const auto restore = qScopeGuard([this] {
+        cleanup();
+        m_engine->rootContext()->setContextProperty(QStringLiteral("terminalFactory"),
+                                                    &m_terminalFactory);
+    });
+    QVERIFY(openRegion(QStringLiteral("TerminalRegion.qml"),
+                       {{QStringLiteral("type"), QStringLiteral("leaf")},
+                        {QStringLiteral("paneId"), QString()}}, true));
+    QTRY_COMPARE(collect(m_region, isLeafPane).size(), 1);
+    QObject *const empty = collect(m_region, isLeafPane).constFirst();
+    QVERIFY(empty->property("placeholder").toBool());
+    QCOMPARE(m_region->property("devSessionId").toString(), QStringLiteral("dev-identity"));
+    QCOMPARE(factory.controllersCreated(), 0);
+    QCOMPARE(factory.bridgeRequests(), 0);
+    QVERIFY(factory.resolutions().isEmpty());
+    QVERIFY(!asObject(empty->property("controller")));
+    QVERIFY(!asObject(empty->property("bridge")));
+    QVERIFY(!webViewIn(empty));
+    QVERIFY(!empty->property("comingUp").toBool());
+    const QList<QObject *> headers = collect(empty, isPaneHeader);
+    QCOMPARE(headers.size(), 1);
+    QVERIFY(!headers.constFirst()->property("busy").toBool());
+    QObject *const title = childNamed(empty, QStringLiteral("paneTitle"));
+    QObject *const reason = childNamed(empty, QStringLiteral("paneReason"));
+    QVERIFY(title && reason);
+    QCOMPARE(title->property("text").toString(), QStringLiteral("No terminals open"));
+    QVERIFY(reason->property("text").toString().contains(QStringLiteral("empty")));
+    const QList<QObject *> watchdogs = collect(empty, [](QObject *object) {
+        return object->property("interval").toInt() == 20000;
+    });
+    QCOMPARE(watchdogs.size(), 1);
+    QVERIFY(!watchdogs.constFirst()->property("running").toBool());
+    QObject *const connect = childNamed(empty, QStringLiteral("terminalConnectButton"));
+    QObject *const rename = childNamed(empty, QStringLiteral("terminalRenameButton"));
+    QObject *const close = childNamed(empty, QStringLiteral("terminalCloseButton"));
+    QObject *const split = childNamed(empty, QStringLiteral("terminalSplitHorizontalButton"));
+    QVERIFY(connect && rename && close && split);
+    QVERIFY(!connect->property("visible").toBool());
+    QVERIFY(!rename->property("enabled").toBool());
+    QVERIFY(!close->property("enabled").toBool());
+    QVERIFY(split->property("enabled").toBool());
+    QSignalSpy requested(m_region, SIGNAL(splitRequested(QString,QString)));
+    QVERIFY(requested.isValid());
+    QVERIFY(QMetaObject::invokeMethod(split, "clicked"));
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.constFirst().at(0).toString(), QString());
+    QCOMPARE(requested.constFirst().at(1).toString(), QStringLiteral("horizontal"));
+    QCOMPARE(factory.controllersCreated(), 0);
+    QVERIFY(factory.resolutions().isEmpty());
+
+    // The ordinary server leaf replaces the empty sentinel through the host's
+    // split path, restoring normal identity resolution and explicit retry.
+    setNode(terminalLeafNode(QStringLiteral("terminal-1"), QStringLiteral("row-a")));
+    QTRY_COMPARE(factory.controllersCreated(), 1);
+    QCOMPARE(factory.bridgeRequests(), 1);
+    QTRY_COMPARE(factory.resolutions().size(), 1);
+    QObject *const pane = paneWithId(m_region, QStringLiteral("terminal-1"));
+    QVERIFY(pane);
+    QVERIFY(!pane->property("placeholder").toBool());
+    QCOMPARE(factory.resolutions().constFirst().terminalPaneId, QStringLiteral("row-a"));
+    QVERIFY(factory.completeResolution(0, QStringLiteral("real-terminal")));
+    QTRY_VERIFY(pane->property("attached").toBool());
+    QCOMPARE(factory.attached(), QStringList{QStringLiteral("real-terminal")});
+    QVERIFY(QMetaObject::invokeMethod(pane, "detachNow"));
+    QObject *const realConnect = childNamed(pane, QStringLiteral("terminalConnectButton"));
+    QVERIFY(realConnect);
+    QTRY_VERIFY(realConnect->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(realConnect, "clicked"));
+    QTRY_COMPARE(factory.attached().size(), 2);
+    QCOMPARE(factory.attached().constLast(), QStringLiteral("real-terminal"));
 }
 
 // QTEST_MAIN cannot be used: registerUrlScheme() and QtWebEngineQuick::initialize()

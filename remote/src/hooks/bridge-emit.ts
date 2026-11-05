@@ -20,8 +20,9 @@
 
 import net from "node:net";
 import type { NativeEvent } from "../adapters/index.ts";
-import { BRIDGE_MESSAGE_VERSION, bridgeLineFits } from "../bridge.ts";
+import { BRIDGE_MESSAGE_VERSION, MAX_BRIDGE_LINE_BYTES } from "../bridge.ts";
 import { isEventIdentifier, resolveSocketPath } from "../events.ts";
+import { JsonSizeLimitError, stringifyJson } from "../json.ts";
 
 /** Normalized inputs gathered from a native Oh My Pi lifecycle event. */
 export interface HookInput {
@@ -105,6 +106,15 @@ export function toBridgeMessage(input: HookInput): BridgeMessage {
  */
 export const HOOK_TIMEOUT_MS = 2000;
 
+function encodeHookMessage(message: BridgeMessage): string | undefined {
+    try {
+        return stringifyJson(message, MAX_BRIDGE_LINE_BYTES);
+    } catch (error) {
+        if (error instanceof JsonSizeLimitError) return undefined;
+        throw error;
+    }
+}
+
 /**
  * Connect to the bridge socket, append the BridgeMessage as one JSONL line, and
  * close. Resolves with the message AS WRITTEN — which is not necessarily the
@@ -116,23 +126,27 @@ export const HOOK_TIMEOUT_MS = 2000;
  */
 export function emitHookEvent(
     input: HookInput,
-    socketPath: string = resolveSocketPath(),
+    socketPath?: string,
     timeoutMs: number = HOOK_TIMEOUT_MS,
 ): Promise<BridgeMessage> {
-    let message = toBridgeMessage(input);
+    let message: BridgeMessage;
     const { promise, resolve, reject } = Promise.withResolvers<BridgeMessage>();
     let line: string;
     let socket: net.Socket;
     try {
+        // Resolve inside the rejection guard: invalid explicit routes must not
+        // escape synchronously from a default argument in the agent process.
+        socketPath ??= resolveSocketPath();
+        message = toBridgeMessage(input);
         // Serialize BEFORE connecting, inside the guard. Doing it in the
-        // 'connect' handler instead puts JSON.stringify on an event-emitter
+        // 'connect' handler instead puts serialization on an event-emitter
         // callback stack, where a throw is an uncaught exception rather than a
         // rejection: it would escape this promise entirely and exit the hook
         // process non-zero, which a harness may read as a failed hook
         // (SPEC 6.4). The bag in `metadata` is producer-supplied, so a value
         // stringify refuses — a BigInt, a getter that throws — is its input,
         // not ours.
-        let payload = JSON.stringify(message);
+        let payload = encodeHookMessage(message);
         // The relay bounds one line and DROPS THE WHOLE PRODUCER CONNECTION
         // when a message overruns it — the hook writes its entire line in one
         // go, so an oversized message trips the relay's unterminated-line guard
@@ -142,10 +156,10 @@ export function emitHookEvent(
         // The two fields that can plausibly get that big are the two OPTIONAL
         // ones, and both are decoration: a human-readable summary and a
         // free-form bag. Sacrificing them keeps the STATE TRANSITION — the
-        // thing the sidebar actually runs on — deliverable. bridgeLineFits is
-        // asked rather than re-deriving the bound here, so the two ends cannot
-        // drift; it measures the payload alone, because the framing newline is
-        // deliberately outside the bound.
+        // thing the sidebar actually runs on — deliverable. The shared
+        // iterative encoder bounds UTF-8 bytes while writing, without a
+        // recursion-depth limit or a full oversized temporary payload.
+        // The framing newline is deliberately outside the payload bound.
         //
         // Given up ONE AT A TIME, least useful first. The metadata bag is
         // machine-readable auxiliary data the client merely carries; the summary
@@ -155,28 +169,28 @@ export function emitHookEvent(
         // main() — which names OMP_SUMMARY and OMP_METADATA separately, and
         // conjugates its verb for one field or two — unable to ever print its
         // single-field form.
-        if (!bridgeLineFits(payload)) {
+        if (payload === undefined) {
             if (message.metadata !== undefined) {
                 const withoutMetadata: BridgeMessage = { ...message };
                 delete withoutMetadata.metadata;
                 message = withoutMetadata;
-                payload = JSON.stringify(message);
+                payload = encodeHookMessage(message);
             }
-            if (!bridgeLineFits(payload) && message.summary !== undefined) {
+            if (payload === undefined && message.summary !== undefined) {
                 const withoutSummary: BridgeMessage = { ...message };
                 delete withoutSummary.summary;
                 message = withoutSummary;
-                payload = JSON.stringify(message);
+                payload = encodeHookMessage(message);
             }
             // Still too long with nothing optional left: the event name, the
             // tool name or an identifier is itself megabyte-sized, so there is
             // nothing further to give up. Say so — a rejection reaches the
             // caller, which prints one actionable line and carries on — rather
             // than write a line the relay is guaranteed to refuse.
-            if (!bridgeLineFits(payload)) {
+            if (payload === undefined) {
                 throw new Error(
                     `event ${input.event} is too large for the bridge even without its `
-                        + `summary and metadata (${Buffer.byteLength(payload)} bytes)`,
+                        + `summary and metadata (more than ${MAX_BRIDGE_LINE_BYTES} bytes)`,
                 );
             }
         }

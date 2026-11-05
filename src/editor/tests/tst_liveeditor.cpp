@@ -69,6 +69,7 @@
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QQmlEngine>
+#include <QScopeGuard>
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QString>
@@ -163,6 +164,7 @@ constexpr auto kShellQml = R"QML(
 import QtQuick
 import QtQuick.Window
 import QtWebEngine
+import QtWebChannel
 
 Window {
     id: win
@@ -173,6 +175,68 @@ Window {
 
     property string jsResult: ""
     property bool jsFinished: false
+    property int jsSerial: 0
+    property var documentViews: ({})
+    property var documentChannels: ({})
+
+    Component { id: documentChannelComponent; WebChannel {} }
+    Component {
+        id: documentViewComponent
+        WebEngineView {
+            anchors.fill: parent
+            profile: viewers.internalProfile()
+            settings.javascriptEnabled: true
+            settings.localContentCanAccessFileUrls: false
+            settings.localContentCanAccessRemoteUrls: false
+        }
+    }
+
+    function openDocumentTest(key, bridge, path) {
+        const channel = documentChannelComponent.createObject(win)
+        channel.registerObject(String(bridge.objectName), bridge)
+        let view = documentViews[key]
+        if (view) {
+            const oldChannel = documentChannels[key]
+            view.webChannel = channel
+            if (oldChannel)
+                oldChannel.destroy()
+        } else {
+            view = documentViewComponent.createObject(win.contentItem, { webChannel: channel })
+            documentViews[key] = view
+        }
+        documentChannels[key] = channel
+        view.url = "qrc:/codeharbor/web/editor/index.html?path=" + encodeURIComponent(path)
+                   + "&bridge=" + encodeURIComponent(String(bridge.objectName))
+        return !!view
+    }
+
+    function closeDocumentTests() {
+        ++win.jsSerial
+        for (const key in documentViews)
+            documentViews[key].destroy()
+        for (const key in documentChannels)
+            documentChannels[key].destroy()
+        documentViews = ({})
+        documentChannels = ({})
+    }
+
+    function evalDocumentTest(key, script) {
+        const serial = ++win.jsSerial
+        win.jsFinished = false
+        win.jsResult = ""
+        const view = documentViews[key]
+        if (!view) {
+            win.jsResult = "NO_VIEW"
+            win.jsFinished = true
+            return
+        }
+        view.runJavaScript(script, function(result) {
+            if (serial !== win.jsSerial)
+                return
+            win.jsResult = (result === undefined || result === null) ? "" : String(result)
+            win.jsFinished = true
+        })
+    }
 
     Loader {
         id: paneLoader
@@ -190,7 +254,17 @@ Window {
         var profile = viewers.internalProfile();
         profile.userScripts.collection = [{
             name: "chLiveEditorGlobalApi",
-            sourceCode: "globalThis.MonacoEnvironment = { globalAPI: true };",
+            sourceCode: "globalThis.MonacoEnvironment = { globalAPI: true };"
+                        + "document.addEventListener('load', function(event) {"
+                        + " if (!(event.target instanceof HTMLScriptElement)"
+                        + "     || !event.target.src.endsWith('/qwebchannel.js')) return;"
+                        + " const NativeChannel = globalThis.QWebChannel;"
+                        + " globalThis.QWebChannel = function(transport, callback, converters) {"
+                        + "  return new NativeChannel(transport, function(channel) {"
+                        + "   globalThis.__liveEditorChannel = channel; callback(channel);"
+                        + "  }, converters);"
+                        + " };"
+                        + "}, true);",
             injectionPoint: WebEngineScript.DocumentCreation,
             worldId: WebEngineScript.MainWorld,
             runsOnSubFrames: false
@@ -200,7 +274,9 @@ Window {
 
     function openPane(remoteUrl) {
         paneLoader.setSource("qrc:/qt/qml/CodeHarbor/EditorPaneView.qml",
-                             { fileUrl: remoteUrl, recoveryPaneId: liveRecoveryPaneId });
+                             { fileUrl: remoteUrl, recoveryServerId: liveRecoveryServerId,
+                               recoverySessionId: liveRecoverySessionId,
+                               recoveryPaneId: liveRecoveryPaneId });
         return paneLoader.status === Loader.Ready
             ? "ready" : ("loader-status=" + paneLoader.status);
     }
@@ -228,6 +304,7 @@ Window {
     }
 
     function evalJs(script) {
+        const serial = ++win.jsSerial;
         win.jsFinished = false;
         win.jsResult = "";
         var view = webView();
@@ -237,6 +314,8 @@ Window {
             return;
         }
         view.runJavaScript(script, function(result) {
+            if (serial !== win.jsSerial)
+                return;
             win.jsResult = (result === undefined || result === null)
                 ? "" : String(result);
             win.jsFinished = true;
@@ -387,6 +466,8 @@ private slots:
     // A rejected WebChannel handshake must render an error, not an empty pane.
     void rejectedEditorHandshakeShowsAnActionableError();
     void repeatedSaveAfterAnEditAndRevertReconcilesDirtyState();
+    void retiredWebChannelProxyCannotChangeAReplacementDocument();
+    void recoveryScopesIsolateSessionsFilesAndLegacyRecords();
     // (3) An edit made inside the page, saved with Ctrl+S, lands on the server.
     void pageEditSavesToRemoteDisk();
     // (4) SPEC 8.6 live: stale revision refused, page's Reload recovers.
@@ -403,6 +484,8 @@ private:
     // Exact bytes of the remote file, read back on the out-of-band shell
     // channel — never through the RPC path under test.
     QString remoteBytes();
+    QString recoveryFileFor(const QString& filePath, const QString& sessionId,
+                            const QString& paneId);
     QString runJs(const QString &script, int timeoutMs = kJsTimeoutMs);
     // Monaco's model value, or a QVERIFY-friendly failure marker.
     QString monacoValue();
@@ -426,11 +509,12 @@ private:
     ViewerProfiles m_profiles{&m_client};
     ViewerModel m_viewers{&m_client};
     EditorFactory m_editorFactory{&m_client};
-    // The server-reported recovery directory (server.info.recoveryDir),
-    // captured in initTestCase and forwarded to the factory exactly as
-    // AppController::adoptServerIdentity does in production (SPEC 11.3).
+    // All recovery artifacts remain under this test's unique remote directory,
+    // even if a caller's XDG fixture environment is misconfigured.
     QString m_recoveryDir;
-    QString m_recoveryId;
+    QString m_recoveryPaneId;
+    QString m_recoverySessionId;
+    QString m_serverId;
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     std::unique_ptr<QQmlEngine> m_engine;
     // The host Window (kShellQml). Named for what it is, so it is never confused
@@ -498,13 +582,10 @@ void TstLiveEditor::initTestCase()
              QStringLiteral("codeharbord"));
     QVERIFY(info.toObject().value(QStringLiteral("schemaVersion")).toInt(-1) >= 2);
 
-    // Mirror AppController::adoptServerIdentity: forward the server-reported
-    // recovery directory (SPEC 11.3) to the editor factory, since this harness
-    // bypasses AppController. Per-pane snapshots land at <recoveryDir>/<paneId>.
-    m_recoveryDir = info.toObject().value(QStringLiteral("recoveryDir")).toString();
-    QVERIFY2(!m_recoveryDir.isEmpty(),
-             "server.info reported no recoveryDir; the SPEC 11.3 snapshot path is unknown");
-    m_editorFactory.setRecoveryDir(m_recoveryDir);
+    m_serverId = info.toObject().value(QStringLiteral("serverId")).toString();
+    QVERIFY2(!m_serverId.isEmpty(), "server.info reported no accepted server identity");
+    QVERIFY2(!info.toObject().value(QStringLiteral("recoveryDir")).toString().isEmpty(),
+             "server.info reported no recovery directory");
 
     // ---- (2a) REMOTE FIXTURE ---------------------------------------------
     // Created over an ssh Exec channel rather than with file.writeFile: the
@@ -519,7 +600,10 @@ void TstLiveEditor::initTestCase()
                             .arg(m_execErr)));
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
     m_remoteDir = QStringLiteral("/tmp/ch-live-editor-%1").arg(token);
-    m_recoveryId = QStringLiteral("live-editor-%1").arg(token);
+    m_recoveryPaneId = QStringLiteral("live-editor-%1").arg(token);
+    m_recoverySessionId = QStringLiteral("live-editor-session-%1").arg(token);
+    m_recoveryDir = m_remoteDir + QStringLiteral("/recovery");
+    m_editorFactory.setRecoveryDir(m_recoveryDir);
     m_filePath = m_remoteDir + QStringLiteral("/note.txt");
     m_marker = QStringLiteral("CH_LIVE_EDITOR_%1").arg(token.toUpper());
     m_initialContent = m_marker + QStringLiteral("\n")
@@ -555,7 +639,11 @@ void TstLiveEditor::initTestCase()
     m_engine->rootContext()->setContextProperty(QStringLiteral("editorFactory"),
                                                 &m_editorFactory);
     m_engine->rootContext()->setContextProperty(QStringLiteral("liveRecoveryPaneId"),
-                                                m_recoveryId);
+                                                m_recoveryPaneId);
+    m_engine->rootContext()->setContextProperty(QStringLiteral("liveRecoveryServerId"),
+                                                m_serverId);
+    m_engine->rootContext()->setContextProperty(QStringLiteral("liveRecoverySessionId"),
+                                                m_recoverySessionId);
 
     QQmlComponent component(m_engine.get());
     component.setData(QByteArray(kShellQml), QUrl(QStringLiteral("qrc:/tst_liveeditor/shell.qml")));
@@ -591,11 +679,6 @@ void TstLiveEditor::cleanupTestCase()
         QByteArray out;
         QString err;
         QString cleanup = QStringLiteral("rm -rf -- ") + sq(m_remoteDir);
-        // The slot is unique to this test run. Never remove the recovery base
-        // or any other pane's snapshot, which may hold the user's unsaved work.
-        if (!m_recoveryDir.isEmpty() && !m_recoveryId.isEmpty())
-            cleanup += QStringLiteral(" && rm -f -- ")
-                + sq(m_recoveryDir + QLatin1Char('/') + m_recoveryId);
         const bool ok = remoteExec(cleanup + QStringLiteral(" && echo CLEANUP_OK"),
                                    &out, &err);
         if (!ok || !out.contains("CLEANUP_OK")) {
@@ -697,6 +780,48 @@ QString TstLiveEditor::remoteBytes()
     return QString::fromUtf8(out);
 }
 
+QString TstLiveEditor::recoveryFileFor(const QString& filePath, const QString& sessionId,
+                                      const QString& paneId)
+{
+    // Enumerate ONLY this fixture's private recovery root. Match persisted
+    // ownership metadata, never an incidental hash spelling or a global slot.
+    const QString script = QStringLiteral(R"JS(
+import { readdir, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const [dir, serverId, devSessionId, paneId, path] = process.argv.slice(1);
+let entries;
+try { entries = await readdir(dir, {withFileTypes: true}); }
+catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    entries = [];
+}
+let file = '';
+for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const candidate = join(dir, entry.name);
+    let record;
+    try { record = JSON.parse(await readFile(candidate, 'utf8')); }
+    catch { continue; }
+    if (record.version === 1 && record.serverId === serverId
+        && record.devSessionId === devSessionId && record.paneId === paneId
+        && record.path === path) {
+        file = candidate;
+        break;
+    }
+}
+process.stdout.write(JSON.stringify({file}));
+)JS");
+    QByteArray result;
+    const QString command = sq(qEnvironmentVariable("CH_LIVE_NODE"))
+        + QStringLiteral(" --input-type=module -e ") + sq(script)
+        + QLatin1Char(' ') + sq(m_recoveryDir) + QLatin1Char(' ') + sq(m_serverId)
+        + QLatin1Char(' ') + sq(sessionId) + QLatin1Char(' ') + sq(paneId)
+        + QLatin1Char(' ') + sq(filePath);
+    if (!remoteExec(command, &result))
+        return {};
+    return QJsonDocument::fromJson(result).object().value(QStringLiteral("file")).toString();
+}
+
 QString TstLiveEditor::runJs(const QString &script, int timeoutMs)
 {
     if (!m_window)
@@ -776,9 +901,8 @@ void TstLiveEditor::remoteFileLoadsIntoRealMonaco()
 {
     QVERIFY(m_window != nullptr);
 
-    // The production pane: it creates its controller through the `editorFactory`
-    // context property, registers it on a QWebChannel under the object name
-    // "editor", calls open() and navigates to the packaged bundle.
+    // The production pane creates a controller and registers its fresh
+    // document-scoped adapter under a unique id before open/navigation.
     QVariant opened;
     QVERIFY(QMetaObject::invokeMethod(
         m_window.get(), "openPane", Q_RETURN_ARG(QVariant, opened),
@@ -795,7 +919,7 @@ void TstLiveEditor::remoteFileLoadsIntoRealMonaco()
     QVERIFY2(m_controller != nullptr,
              "EditorPaneView did not expose a ch::EditorController");
     QCOMPARE(m_controller->path(), m_filePath);
-    QCOMPARE(m_controller->recoveryId(), m_recoveryId);
+    QVERIFY(m_controller->recoveryEnabled());
 
     QSignalSpy contentSpy(m_controller, &EditorController::contentLoaded);
 
@@ -853,7 +977,7 @@ void TstLiveEditor::rejectedEditorHandshakeShowsAnActionableError()
             throw new Error("transport rejected initialization");
         };
         try {
-            CodeHarborEditor.connectEditor(root);
+            CodeHarborEditor.connectEditor(root, { bridgeId: "rejected-document" });
         } catch (error) {
             escaped = String(error);
         }
@@ -898,13 +1022,15 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
     }
     var saves = [];
     var observations = [];
+    var reports = [];
     var bridge = {
         contentLoaded: signal(), fileStateChanged: signal(),
         readOnlyChanged: signal(), saved: signal(),
         saveConflict: signal(), saveError: signal(),
+        bufferRestored: signal(),
         save: function (content, revision) { saves.push([content, revision]); },
         reportDirty: function (dirty, revision) { observations.push([dirty, revision]); },
-        reportContent: function () {},
+        reportContent: function (content) { reports.push(content); },
         requestReload: function () {}
     };
     var siblingSaves = [];
@@ -912,6 +1038,7 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
         contentLoaded: signal(), fileStateChanged: signal(),
         readOnlyChanged: signal(), saved: signal(),
         saveConflict: signal(), saveError: signal(),
+        bufferRestored: signal(),
         save: function (content, revision) { siblingSaves.push([content, revision]); },
         reportDirty: function () {}
     });
@@ -961,6 +1088,16 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
             status: root.querySelector(".ch-editor-state").textContent,
             content: editor.getValue()
         };
+        // A recreated document can inherit a save whose submitted bytes are
+        // older than its restored RAM. The later success must not baseline
+        // against the newer visible model.
+        bridge.bufferRestored.emit("newer RAM", "old baseline", "r10", "on wire", true);
+        bridge.saved.emit("r11");
+        bridge.fileStateChanged.emit("modified");
+        outcome.restoredContent = editor.getValue();
+        outcome.restoredStatus = root.querySelector(".ch-editor-state").textContent;
+        outcome.restoredObservation = observations[observations.length - 1];
+        outcome.restoredReports = reports;
         host.dispose();
         host = undefined;
         // The disposed mount must neither retain a global Ctrl+S binding nor
@@ -995,7 +1132,287 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
     QCOMPARE(outcome.value(QStringLiteral("siblingSaves")).toArray(),
              (QJsonArray{QJsonArray{QStringLiteral("sibling bytes"), QStringLiteral("s1")}}));
     QCOMPARE(outcome.value(QStringLiteral("savesAfterDisposal")).toInt(), 2);
+    QCOMPARE(outcome.value(QStringLiteral("restoredContent")).toString(),
+             QStringLiteral("newer RAM"));
+    QCOMPARE(outcome.value(QStringLiteral("restoredStatus")).toString(),
+             QStringLiteral("modified \u2022"));
+    QCOMPARE(outcome.value(QStringLiteral("restoredObservation")).toArray(),
+             (QJsonArray{true, QStringLiteral("r10")}));
+    QCOMPARE(outcome.value(QStringLiteral("restoredReports")).toArray(),
+             (QJsonArray{QStringLiteral("newer RAM")}));
     QCOMPARE(monacoValue(), before);
+}
+
+void TstLiveEditor::retiredWebChannelProxyCannotChangeAReplacementDocument()
+{
+    const QString replacementPath = m_remoteDir + QStringLiteral("/document-b.txt");
+    const QString baseline = QStringLiteral("document B baseline\n");
+    QVERIFY(remoteExec(QStringLiteral("printf %1 > %2")
+                           .arg(sq(baseline), sq(replacementPath))));
+
+    EditorController controller(
+        &m_client, m_serverId, m_recoverySessionId, QStringLiteral("document-lifecycle"));
+    const auto cleanup = qScopeGuard([this] {
+        QMetaObject::invokeMethod(m_window.get(), "closeDocumentTests");
+        // Dispose the dedicated views before the borrowed controller leaves
+        // scope. The production pane and its transport were never replaced.
+        QTest::qWait(50);
+    });
+    const auto eval = [this](const QString& key, const QString& script) {
+        if (!QMetaObject::invokeMethod(m_window.get(), "evalDocumentTest",
+                                      Q_ARG(QVariant, QVariant(key)),
+                                      Q_ARG(QVariant, QVariant(script))))
+            return QStringLiteral("INVOKE_FAILED");
+        if (!waitFor([this] { return m_window->property("jsFinished").toBool(); },
+                     kJsTimeoutMs))
+            return QStringLiteral("JS_TIMEOUT");
+        return m_window->property("jsResult").toString();
+    };
+    const auto capture = [&eval](const QString& key) -> std::optional<QString> {
+        // WebEngine converts raw result strings via QString::fromUtf8, which
+        // strips an initial BOM. JSON framing preserves all content characters.
+        const QString payload = eval(key, QStringLiteral(
+            "JSON.stringify({content: typeof window.captureEditorContent === 'function'"
+            " ? window.captureEditorContent() : null})"));
+        const QJsonDocument json = QJsonDocument::fromJson(payload.toUtf8());
+        if (!json.isObject())
+            return std::nullopt;
+        const QJsonValue content = json.object().value(QStringLiteral("content"));
+        return content.isString() ? std::optional<QString>(content.toString()) : std::nullopt;
+    };
+    const auto attach = [this](const QString& key, QObject* bridge, const QString& path) {
+        QVariant opened;
+        return QMetaObject::invokeMethod(m_window.get(), "openDocumentTest",
+                                         Q_RETURN_ARG(QVariant, opened),
+                                         Q_ARG(QVariant, QVariant(key)),
+                                         Q_ARG(QVariant, QVariant::fromValue(bridge)),
+                                         Q_ARG(QVariant, QVariant(path)))
+            && opened.toBool();
+    };
+
+    // Every real page has one channel/client/transport. Keep A's independent
+    // WebEngine view alive to send delayed old-proxy actions after B loads;
+    // never construct competing QWebChannels on the production transport.
+    QSignalSpy loaded(&controller, &EditorController::contentLoaded);
+    QSignalSpy saved(&controller, &EditorController::saved);
+    auto* pageA = qobject_cast<ch::EditorPageBridge*>(controller.createPageBridge());
+    QVERIFY(pageA);
+    controller.open(m_filePath);
+    QVERIFY(attach(QStringLiteral("a"), pageA, m_filePath));
+    QVERIFY(waitFor([&] {
+        return loaded.count() == 1
+            && capture(QStringLiteral("a")) == loaded.at(0).at(0).toString();
+    }, kPageTimeoutMs));
+    const QString contentA = *capture(QStringLiteral("a"));
+    loaded.clear();
+    QSignalSpy retiredContent(pageA, &ch::EditorPageBridge::contentLoaded);
+
+    auto* pageB = qobject_cast<ch::EditorPageBridge*>(controller.createPageBridge());
+    QVERIFY(pageB);
+    controller.open(replacementPath);
+    QVERIFY(waitFor([&] {
+        return controller.fileState() == QLatin1String("clean")
+            && m_client.pendingCount() == 0;
+    }, kSignalTimeoutMs));
+    const QString revisionB = controller.revision();
+    QVERIFY(!revisionB.isEmpty());
+    QCOMPARE(loaded.count(), 0);
+
+    QCOMPARE(eval(QStringLiteral("a"), QStringLiteral(R"JS(
+(function () {
+    var old = window.__liveEditorChannel.objects[%1];
+    window.__staleDocumentAck = false;
+    old.ready();
+    old.reportContent("late A pagehide");
+    old.reportDirty(true, %2);
+    old.save("late A save", %2);
+    old.reportDirty(false, %2, function () { window.__staleDocumentAck = true; });
+    return "sent";
+})()
+)JS").arg(jsLiteral(pageA->objectName()), jsLiteral(revisionB))), QStringLiteral("sent"));
+    QVERIFY(waitFor([&] {
+        return eval(QStringLiteral("a"), QStringLiteral("String(!!window.__staleDocumentAck)"))
+            == QLatin1String("true");
+    }, kSignalTimeoutMs));
+    QVERIFY(waitFor([&] { return m_client.pendingCount() == 0; }, kSignalTimeoutMs));
+    QCOMPARE(saved.count(), 0);
+    QVERIFY(!controller.dirty());
+    QCOMPARE(controller.revision(), revisionB);
+    QCOMPARE(retiredContent.count(), 0);
+    const auto oldContent = capture(QStringLiteral("a"));
+    QVERIFY(oldContent.has_value());
+    QCOMPARE(*oldContent, contentA);
+
+    QVERIFY(attach(QStringLiteral("b"), pageB, replacementPath));
+    QVERIFY(waitFor([&] { return capture(QStringLiteral("b")) == baseline; }, kPageTimeoutMs));
+    QCOMPARE(loaded.count(), 1);
+
+    // The BOM must exist in the real Monaco model AND survive the Qt result
+    // boundary, RAM restoration, and an actual guarded remote save.
+    const QString unsaved = QChar(0xfeff) + QStringLiteral("unsaved B\r\n");
+    const QJsonDocument edited = QJsonDocument::fromJson(
+        eval(QStringLiteral("b"), QStringLiteral(R"JS(
+(function () {
+    var editor = window.monaco.editor.getEditors()[0];
+    editor.setValue(%1);
+    var content = window.captureEditorContent();
+    return JSON.stringify({content: content, firstCodepoint: content.charCodeAt(0)});
+})()
+)JS").arg(jsLiteral(unsaved))).toUtf8());
+    QVERIFY(edited.isObject());
+    QCOMPARE(edited.object().value(QStringLiteral("firstCodepoint")).toInt(), 0xfeff);
+    const QString captured = edited.object().value(QStringLiteral("content")).toString();
+    QCOMPARE(captured, unsaved);
+    QVERIFY(controller.preparePageReload(captured, controller.recoveryContextRevision()));
+    auto* reloadedPage = qobject_cast<ch::EditorPageBridge*>(controller.createPageBridge());
+    QVERIFY(reloadedPage);
+    QSignalSpy restored(reloadedPage, &ch::EditorPageBridge::bufferRestored);
+    QVERIFY(attach(QStringLiteral("b"), reloadedPage, replacementPath));
+    QVERIFY(waitFor([&] {
+        return restored.count() == 1 && capture(QStringLiteral("b")) == unsaved;
+    }, kPageTimeoutMs));
+    QCOMPARE(restored.at(0).at(1).toString(), baseline);
+    QCOMPARE(restored.at(0).at(2).toString(), revisionB);
+    QVERIFY(controller.dirty());
+    QCOMPARE(loaded.count(), 1);
+    QCOMPARE(controller.revision(), revisionB);
+    QCOMPARE(eval(QStringLiteral("b"), QStringLiteral(
+        "String(window.captureEditorContent().charCodeAt(0))")), QStringLiteral("65279"));
+    QVERIFY(eval(QStringLiteral("b"), QStringLiteral(
+        "document.querySelector('.ch-editor-state').textContent")).contains(QChar(0x2022)));
+
+    eval(QStringLiteral("b"), QStringLiteral(
+        "window.monaco.editor.getEditors()[0].getAction('codeharbor.save').run(); 'sent'"));
+    QVERIFY(waitFor([&] { return saved.count() == 1 && !controller.dirty(); },
+                    kSignalTimeoutMs));
+    QByteArray remote;
+    QVERIFY(remoteExec(QStringLiteral("cat %1").arg(sq(replacementPath)), &remote));
+    QCOMPARE(remote, unsaved.toUtf8());
+    QCOMPARE(controller.fileState(), QStringLiteral("clean"));
+
+    const QString external = QStringLiteral("external replacement\n");
+    QVERIFY(remoteExec(QStringLiteral("printf %1 > %2")
+                           .arg(sq(external), sq(replacementPath))));
+    QVERIFY(waitFor([&] { return capture(QStringLiteral("b")) == external; }, kSignalTimeoutMs));
+    QVERIFY(!controller.dirty());
+    QCOMPARE(retiredContent.count(), 0);
+}
+
+void TstLiveEditor::recoveryScopesIsolateSessionsFilesAndLegacyRecords()
+{
+    const QString paneId = QStringLiteral("viewer-1");
+    const QString sessionA = m_recoverySessionId + QStringLiteral("-scope-a");
+    const QString sessionB = m_recoverySessionId + QStringLiteral("-scope-b");
+    const QString pathA = m_remoteDir + QStringLiteral("/scope-a.txt");
+    const QString pathB = m_remoteDir + QStringLiteral("/scope-b.txt");
+    const QString diskA = QStringLiteral("on disk A\n");
+    const QString diskB = QStringLiteral("on disk B\n");
+    const QString unsavedA = QStringLiteral("unsaved A\n");
+    const QString unsavedB = QStringLiteral("unsaved B\n");
+    const QString legacyPath = m_recoveryDir + QLatin1Char('/') + paneId;
+    const QByteArray legacy = QJsonDocument(QJsonObject{
+        {QStringLiteral("path"), pathA},
+        {QStringLiteral("content"), QStringLiteral("ambiguous legacy must survive")}})
+        .toJson(QJsonDocument::Compact);
+    QVERIFY(remoteExec(QStringLiteral("mkdir -p -- ") + sq(m_recoveryDir)
+        + QStringLiteral(" && printf '%s' ") + sq(diskA) + QStringLiteral(" > ") + sq(pathA)
+        + QStringLiteral(" && printf '%s' ") + sq(diskB) + QStringLiteral(" > ") + sq(pathB)
+        + QStringLiteral(" && printf '%s' ") + sq(QString::fromUtf8(legacy))
+        + QStringLiteral(" > ") + sq(legacyPath)));
+
+    EditorController second(&m_client, m_serverId, sessionB, paneId);
+    second.setRecoveryDir(m_recoveryDir);
+    second.ready();
+    QString slotA;
+    QString slotB;
+    QByteArray recordB;
+    {
+        EditorController first(&m_client, m_serverId, sessionA, paneId);
+        first.setRecoveryDir(m_recoveryDir);
+        first.ready();
+        QSignalSpy offeredA(&first, &EditorController::recoveryAvailable);
+        QSignalSpy offeredB(&second, &EditorController::recoveryAvailable);
+        first.open(pathA);
+        second.open(pathB);
+        QVERIFY(waitFor([&] {
+            return first.fileState() == QLatin1String("clean")
+                && second.fileState() == QLatin1String("clean")
+                && m_client.pendingCount() == 0;
+        }, kSignalTimeoutMs));
+        QCOMPARE(offeredA.count(), 0);
+        QCOMPARE(offeredB.count(), 0);
+        first.reportContent(unsavedA);
+        second.reportContent(unsavedB);
+        QVERIFY(waitFor([&] {
+            slotA = recoveryFileFor(pathA, sessionA, paneId);
+            slotB = recoveryFileFor(pathB, sessionB, paneId);
+            return !slotA.isEmpty() && !slotB.isEmpty();
+        }, kSignalTimeoutMs));
+        QVERIFY(slotA != slotB);
+        QVERIFY(slotA != legacyPath);
+        QVERIFY(slotB != legacyPath);
+        QByteArray recordA;
+        QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotA), &recordA));
+        QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotB), &recordB));
+        QCOMPARE(QJsonDocument::fromJson(recordA).object()
+                     .value(QStringLiteral("content")).toString(), unsavedA);
+        QCOMPARE(QJsonDocument::fromJson(recordB).object()
+                     .value(QStringLiteral("content")).toString(), unsavedB);
+    }
+
+    // A fresh controller for exactly the same logical pane/document recovers
+    // that one snapshot; it cannot consume the other session or legacy slot.
+    EditorController restored(&m_client, m_serverId, sessionA, paneId);
+    restored.setRecoveryDir(m_recoveryDir);
+    restored.ready();
+    QSignalSpy recovered(&restored, &EditorController::recoveryAvailable);
+    restored.open(pathA);
+    QVERIFY(waitFor([&] { return recovered.count() == 1; }, kSignalTimeoutMs));
+    QCOMPARE(recovered.at(0).at(0).toString(), unsavedA);
+    restored.reportContent(unsavedA);
+    QSignalSpy saved(&restored, &EditorController::saved);
+    restored.save(unsavedA, restored.revision());
+    QVERIFY(waitFor([&] {
+        return saved.count() == 1 && !restored.dirty() && m_client.pendingCount() == 0;
+    }, kSignalTimeoutMs));
+    QByteArray bytes;
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(pathA), &bytes));
+    QCOMPARE(bytes, unsavedA.toUtf8());
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotA), &bytes));
+    QVERIFY(bytes.isEmpty());
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotB), &bytes));
+    QCOMPARE(bytes, recordB);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(legacyPath), &bytes));
+    QCOMPARE(bytes, legacy);
+
+    // Same pane/session retargeting to B creates another logical document,
+    // without offering or clearing the other session's unsaved B record.
+    restored.open(pathB);
+    QVERIFY(waitFor([&] {
+        return restored.fileState() == QLatin1String("clean")
+            && m_client.pendingCount() == 0;
+    }, kSignalTimeoutMs));
+    QCOMPARE(recovered.count(), 1);
+    const QString retargetedText = QStringLiteral("session A editing B\n");
+    restored.reportContent(retargetedText);
+    QString retargetedSlot;
+    QVERIFY(waitFor([&] {
+        retargetedSlot = recoveryFileFor(pathB, sessionA, paneId);
+        return !retargetedSlot.isEmpty();
+    }, kSignalTimeoutMs));
+    QVERIFY(retargetedSlot != slotA);
+    QVERIFY(retargetedSlot != slotB);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(retargetedSlot), &bytes));
+    QCOMPARE(QJsonDocument::fromJson(bytes).object()
+                 .value(QStringLiteral("content")).toString(), retargetedText);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotA), &bytes));
+    QVERIFY(bytes.isEmpty());
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(slotB), &bytes));
+    QCOMPARE(bytes, recordB);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(legacyPath), &bytes));
+    QCOMPARE(bytes, legacy);
+    QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(pathB), &bytes));
+    QCOMPARE(bytes, diskB.toUtf8());
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1643,6 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
     const QString lockedPath = m_remoteDir + QStringLiteral("/locked.txt");
     const QString lockedContent =
         QStringLiteral("read-only fixture %1\n").arg(m_marker);
-    const QString recoveryPath = m_recoveryDir + QLatin1Char('/') + m_recoveryId;
 
     QVERIFY2(remoteExec(QStringLiteral("printf '%s\\n' ")
                             + sq(QStringLiteral("read-only fixture ") + m_marker)
@@ -1304,12 +1720,13 @@ void TstLiveEditor::unwritableRemoteFileIsReadOnlyInMonaco()
     QVERIFY(remoteExec(QStringLiteral("cat -- ") + sq(lockedPath), &out, &err));
     QCOMPARE(QString::fromUtf8(out), lockedContent);
     QVERIFY2(waitFor([&] {
-                 if (!remoteExec(QStringLiteral("cat -- ") + sq(recoveryPath),
-                                 &out, &err))
+                 const QString recoveryPath =
+                     recoveryFileFor(lockedPath, m_recoverySessionId, m_recoveryPaneId);
+                 if (recoveryPath.isEmpty()
+                     || !remoteExec(QStringLiteral("cat -- ") + sq(recoveryPath), &out, &err))
                      return false;
-                 const QJsonObject snapshot = QJsonDocument::fromJson(out).object();
-                 return snapshot.value(QStringLiteral("path")).toString() == lockedPath
-                     && snapshot.value(QStringLiteral("content")).toString() == lateEdits;
+                 return QJsonDocument::fromJson(out).object()
+                     .value(QStringLiteral("content")).toString() == lateEdits;
              }, kSignalTimeoutMs),
              "permission-only read-only dropped the final unsaved recovery text");
 

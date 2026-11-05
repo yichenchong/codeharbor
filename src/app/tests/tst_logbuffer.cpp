@@ -55,6 +55,7 @@ private slots:
     void zeroCapacityBufferKeepsNothing();
     void destructionRacesWithLogging();
     void qtLogNotificationMayDestroyTheBuffer();
+    void remoteLogNotificationMayDestroyTheBuffer();
     void qtLogBurstKeepsOnePendingNotification();
     void overlappingBufferLifetimesPreserveThePreviousHandler();
 };
@@ -276,6 +277,23 @@ void TstLogBuffer::qtLogNotificationMayDestroyTheBuffer()
     QVERIFY(deferred);
     QVERIFY(notified);
     QVERIFY(deleted);
+}
+
+void TstLogBuffer::remoteLogNotificationMayDestroyTheBuffer()
+{
+    QPointer<LogBuffer> buffer = new LogBuffer(8, 4096);
+    int notifications = 0;
+    connect(buffer, &LogBuffer::entriesChanged, this, [&] {
+        ++notifications;
+        delete buffer.data();
+    });
+
+    buffer->appendRemote(QStringLiteral("server"), QStringLiteral("daemon"),
+                         QStringLiteral("stderr"),
+                         QStringLiteral("first line\nsecond line\nthird line"));
+
+    QVERIFY(buffer.isNull());
+    QCOMPARE(notifications, 1);
 }
 
 void TstLogBuffer::qtLogBurstKeepsOnePendingNotification()

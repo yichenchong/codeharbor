@@ -88,6 +88,19 @@ Dialog {
                              : null
             root.open()
         }
+
+        function onConnectionStateChanged() {
+            if (!root.controller || root.controller.connectionState === "connecting")
+                return
+            // An attempt can end outside the sheet (timeout, disconnect or a
+            // replacement connection). Its old decision must not remain live.
+            root.answered = true
+            root.close()
+            root.promptHost = ""
+            root.promptFingerprint = ""
+            root.promptKeyType = ""
+            root.trustInfo = null
+        }
     }
 
     // The decision is reported EXACTLY once. Both buttons, the key handlers and

@@ -25,9 +25,9 @@ import "RemotePath.js" as RemotePath
 // WIRING (for main.cpp / the QML host):
 //   * `editorFactory`     — context property: the ch::EditorFactory that mints
 //     THIS pane's own ch::EditorController (one per pane, so two panes never
-//     share a path and revision). That controller is what is exposed to JS over
-//     the WebChannel under the object name "editor". There is deliberately no
-//     single shared controller context property.
+//     share a path and revision). Each document gets a fresh, revocable adapter
+//     for that controller over WebChannel. There is deliberately no shared
+//     controller context property or reusable raw-controller bridge alias.
 //   * `viewers`           — context property (ViewerModel): supplies the
 //     privileged WebEngine profile that permits a WebChannel bridge.
 //
@@ -37,8 +37,8 @@ import "RemotePath.js" as RemotePath
 // by `npm run build --workspace src/web/editor`). qrc: resolves identically in
 // the build tree, in a relocated install and inside a macOS bundle, so no
 // filesystem path is ever plumbed through QML. The page loads Qt's own
-// qrc:///qtwebchannel/qwebchannel.js plus the bundle, then calls
-// mountEditor(el, channel.objects.editor).
+// qrc:///qtwebchannel/qwebchannel.js plus the bundle, then mounts the explicit
+// document adapter named by its `bridge` query parameter.
 //
 // The pane's remote path rides along as a `path` query parameter (NOT the file
 // content — that only ever arrives over the bridge). The bundle uses it solely
@@ -68,14 +68,16 @@ Item {
     // that permits the WebChannel bridge.
     property var viewerModel: (typeof viewers !== "undefined") ? viewers : null
 
-    // This pane's stable layout id, set by ViewerPane. Passed to the factory so
-    // the controller keys its crash-recovery snapshot per pane (SPEC 11.3), and
-    // two panes editing one path never share a snapshot.
+    // Accepted workspace and stable pane identity supplied by the owning
+    // viewer. The controller also includes its actual opened path in the
+    // recovery scope; incomplete context deliberately disables recovery.
     //
     // Deliberately NOT named `paneId`: that name identifies a leaf-pane WRAPPER
     // (ViewerPane/TerminalPaneView carry `paneId` and no `node`), and a content
     // view that also exposed `paneId` would be miscounted as a second leaf by
     // anything walking the region tree by that convention.
+    property string recoveryServerId: ""
+    property string recoverySessionId: ""
     property string recoveryPaneId: ""
 
     // The ch::EditorController for this pane, minted ONCE in Component.onCompleted
@@ -85,6 +87,11 @@ Item {
     // opened the file and holds its revision guard. Owned by this pane (destroyed
     // with it); a test may pre-assign a stub before Component.onCompleted runs.
     property var controller: null
+    property var pageBridge: null
+    property var pageBridgeOwner: null
+    property var pageChannel: null
+    property string pageBridgeId: ""
+    property int reloadSerial: 0
 
     // Entry page of the trusted editor bundle. Embedded into this QML module's
     // resources by src/qml/CMakeLists.txt; overridable by a host or test that
@@ -143,15 +150,63 @@ Item {
         view.runJavaScript("if (typeof window.applyTheme === 'function')"
                            + " window.applyTheme(" + roles + ");")
     }
+    // Retire an old workspace epoch's capture without replacing its live buffer.
+    function retireLayoutRequests() {
+        root.reloadSerial += 1
+    }
+
     // ViewerPane keeps handler objects alive when they provide reload(). The
     // editor is a live WebEngine document with unsaved text, so falling back to
     // Loader churn would destroy Monaco and could discard that buffer.
+    readonly property bool reloadPreservesDirtyContent: true
     function reload() {
-        view.reload()
+        const bridge = root.pageBridge
+        const controller = root.controller
+        const path = root.currentRemotePath()
+        const recoveryContext = controller ? controller.recoveryContextRevision : 0
+        const serial = ++root.reloadSerial
+        const finish = function(content) {
+            if (!root || root.pageBridge !== bridge || root.controller !== controller
+                    || root.currentRemotePath() !== path || root.reloadSerial !== serial)
+                return
+            if (controller && controller.recoveryContextRevision !== recoveryContext)
+                return
+            if (controller && typeof content === "string") {
+                if (!controller.preparePageReload(content, recoveryContext))
+                    return
+            } else if (root.dirty) {
+                if (!controller || !controller.hasPageReloadContent(bridge))
+                    return // No live capture or controller-owned current buffer.
+            }
+            // The native controller preserves its captured buffer/revision for
+            // the fresh adapter. Reopening here would reset that dirty state.
+            root.replacePageBridge()
+            root.pageReady = false
+            root.navigate()
+        }
+        if (!root.pageReady) {
+            finish(null)
+            return
+        }
+        view.runJavaScript(
+            "JSON.stringify(typeof window.captureEditorContent === 'function'"
+            + " ? window.captureEditorContent() : null)",
+            function(payload) {
+                if (typeof payload !== "string")
+                    return
+                let content
+                try {
+                    content = JSON.parse(payload)
+                } catch (error) {
+                    return
+                }
+                finish(content)
+            })
     }
 
-    WebChannel {
-        id: editorChannel
+    Component {
+        id: pageChannelComponent
+        WebChannel {}
     }
 
     WebEngineView {
@@ -167,7 +222,7 @@ Item {
         settings.localContentCanAccessFileUrls: false
         settings.localContentCanAccessRemoteUrls: false
 
-        webChannel: editorChannel
+        webChannel: root.pageChannel
         // SECURITY: window.open() is the one navigation primitive that does not
         // pass through onNavigationRequested below. Nothing in the editor bundle
         // has any reason to open a window, and Monaco's built-in link opener
@@ -196,8 +251,8 @@ Item {
 
         // SECURITY (SPEC 7.2): this view carries the WebChannel, and Qt injects
         // qt.webChannelTransport into EVERY document it loads — so a document
-        // loaded here gets ch::EditorController, i.e. open()/save() against any
-        // path on the remote host. The document rendered here is our own bundle,
+        // loaded here gets this document's editor adapter, including save()
+        // against its current remote path. The document is our own bundle,
         // but the CONTENT it displays is attacker-controlled remote bytes, so
         // the view is pinned to the bundle document. Anything else — remote,
         // file:, data:, another qrc page — is refused outright rather than
@@ -221,7 +276,7 @@ Item {
         }
 
         // NOT bound to editorBundleUrl: navigation is driven by navigate()
-        // below so it can never start before registerObject("editor").
+        // below so it cannot start before the document adapter is registered.
     }
 
     Connections {
@@ -235,6 +290,8 @@ Item {
     // is independent of fileState: an outage, failed save or permission change
     // must not make unsaved work appear safe to discard.
     readonly property bool dirty: root.controller ? root.controller.dirty : false
+    readonly property bool recoveryUnavailable:
+        root.dirty && root.controller && !root.controller.recoveryEnabled
     readonly property string fileState: root.controller ? root.controller.fileState : ""
     readonly property bool loading: (!root.pageReady && root.pageError.length === 0)
                                     || root.fileState === "loading"
@@ -292,7 +349,7 @@ Item {
         // every open. The header's busy indicator reports loading instead
         // (ViewerPane reads `root.loading` for exactly that).
         color: root.conflicted || root.failed ? Theme.errorSurface() : Theme.warningSurface()
-        visible: root.dropped || root.conflicted || root.failed
+        visible: root.dropped || root.conflicted || root.failed || root.recoveryUnavailable
         z: 1
         // These are dim fills behind danger/warning text and have no direct
         // Theme role; the palette's errorSurface() and warningSurface()
@@ -315,7 +372,9 @@ Item {
                   ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
                   : root.failed
                     ? qsTr("The editor could not load this file.")
-                    : qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
+                    : root.dropped
+                      ? qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
+                      : qsTr("Crash recovery is unavailable. Keep this editor open until you can save.")
             color: root.conflicted || root.failed ? Theme.danger : Theme.warning
             font.pixelSize: Theme.fontSizeSmall
         }
@@ -362,6 +421,16 @@ Item {
         }
     }
 
+    Connections {
+        target: root.pageBridge
+        function onBufferRestored(content, baselineContent, revision,
+                                  pendingSaveContent, savePending) {
+            root.loadedRevision = revision
+            root.contentReadyForRecovery = true
+            root.showRecoveryOffer()
+        }
+    }
+
     // Offer the recovered buffer, but never before the page can be GIVEN it.
     // ch::EditorController holds contentLoaded until the page reports ready(),
     // so the content-loaded flag means the page has taken the file even when
@@ -381,7 +450,7 @@ Item {
     // the buffer dirty — so reportContent() states what is now true: the bytes
     // on screen are not the bytes on the server. That is what stops an external
     // change from silently reloading over the restored work (SPEC 8.7), and
-    // what keeps the snapshot alive until the user actually saves.
+    // what makes the restored work recoverable while it is unsaved.
     function restoreRecovered() {
         if (!root.controller || !root.recoveryPending || !root.contentReadyForRecovery)
             return
@@ -392,9 +461,8 @@ Item {
         root.controller.reportContent(recovered)
     }
 
-    // Keep what the server has. The snapshot itself is deliberately left where
-    // it is: this answers "what should this pane show", and ch::EditorController
-    // is what discards the snapshot, on the next successful save.
+    // Keep the saved file on screen without deleting the recovery copy.
+    // Later edits can replace the copy; saving or clean reconciliation can clear it.
     function discardRecovered() {
         root.recoveredContent = ""
         root.recoveryPending = false
@@ -417,14 +485,15 @@ Item {
         closePolicy: Popup.NoAutoClose
         standardButtons: Dialog.Discard | Dialog.Ok
 
-        // "OK" beside a recovered buffer does not say which button keeps the
-        // work, and the standard set has no Restore. The button is renamed
-        // rather than replaced so it keeps the dialog's own styling and its
-        // place in the platform's button order.
+        // Keep the standard roles' signals and platform order, but name the
+        // actions explicitly: dismissing the offer does not discard its copy.
         onOpened: {
             const restore = recoveryDialog.standardButton(Dialog.Ok)
             if (restore)
                 restore.text = qsTr("Restore")
+            const notNow = recoveryDialog.standardButton(Dialog.Discard)
+            if (notNow)
+                notNow.text = qsTr("Not now")
         }
 
         onAccepted: root.restoreRecovered()
@@ -453,13 +522,36 @@ Item {
             Label {
                 Layout.preferredWidth: 380
                 wrapMode: Text.WordWrap
-                text: qsTr("Restore puts them back in this editor, unsaved, so you can look "
-                           + "them over and save. Discard keeps the file exactly as it is on "
-                           + "the server.")
+                text: qsTr("Restore puts this copy back in the editor, unsaved. "
+                           + "Not now keeps the saved file on screen. The recovery copy "
+                           + "may be offered again. New edits can replace it; saving can clear it.")
                 color: Theme.textDim
                 font.pixelSize: Theme.fontSizeSmall
             }
         }
+    }
+
+    // Revoke first, then replace the channel registration. Already queued old
+    // document calls see an inert adapter until its deferred deletion.
+    function replacePageBridge() {
+        const oldBridge = root.pageBridge
+        const oldOwner = root.pageBridgeOwner
+        const oldChannel = root.pageChannel
+        const nextBridge = root.controller ? root.controller.createPageBridge() : null
+        const nextChannel = nextBridge ? pageChannelComponent.createObject(root) : null
+        const nextId = nextBridge ? String(nextBridge.objectName) : ""
+        if (nextChannel)
+            nextChannel.registerObject(nextId, nextBridge)
+        root.pageBridge = nextBridge
+        root.pageBridgeOwner = nextBridge ? root.controller : null
+        root.pageBridgeId = nextId
+        root.pageChannel = nextChannel
+        // Register only before this channel has a client. Mutating a channel
+        // initialized by the retiring document is unsupported by WebChannel.
+        if (oldChannel)
+            oldChannel.destroy()
+        if (oldBridge && oldOwner)
+            oldOwner.releasePageBridge(oldBridge)
     }
 
     // Navigate the view at the bundle entry, passing the pane's remote path as
@@ -473,9 +565,12 @@ Item {
             return
         }
         const path = root.currentRemotePath()
-        view.url = path.length > 0
-            ? base + "?path=" + encodeURIComponent(path)
-            : base
+        const query = []
+        if (path.length > 0)
+            query.push("path=" + encodeURIComponent(path))
+        if (root.pageBridgeId.length > 0)
+            query.push("bridge=" + encodeURIComponent(root.pageBridgeId))
+        view.url = base + (query.length > 0 ? "?" + query.join("&") : "")
     }
 
     function start() {
@@ -488,6 +583,9 @@ Item {
         root.recoveredContent = ""
         root.recoveryPending = false
         recoveryDialog.close()
+        root.pageReady = false
+        // Revoke the old page before a fast new-file response can reach it.
+        root.replacePageBridge()
         const path = root.currentRemotePath()
         if (root.controller && path.length > 0)
             root.controller.open(path)
@@ -497,25 +595,31 @@ Item {
     // A pane reused for another file reopens the controller and reloads the
     // page so the language hint follows the new path.
     onFileUrlChanged: if (root.started) root.start()
-    onEditorBundleUrlChanged: if (root.started) root.navigate()
+    onEditorBundleUrlChanged: if (root.started) root.reload()
 
-    // The pane's layout id can settle (""->"viewer-1") AFTER the controller is
-    // minted, so push every change through to the controller's recovery key
-    // rather than capturing it once at create() time — otherwise two panes on
-    // one file would key their crash-recovery snapshots by the same empty id
-    // and share one (SPEC 11.3, ED15).
-    onRecoveryPaneIdChanged: if (root.controller) root.controller.setRecoveryId(root.recoveryPaneId)
+    function updateRecoveryScope() {
+        root.reloadSerial += 1
+        if (root.controller)
+            root.controller.setRecoveryScope(root.recoveryServerId,
+                                             root.recoverySessionId,
+                                             root.recoveryPaneId)
+    }
 
-    // Register the controller under the EXACT object name "editor" required by
-    // the frozen C3 contract (channel.objects.editor on the JS side) BEFORE the
-    // first navigation, so the page's WebChannel handshake always finds it.
+    onRecoveryServerIdChanged: root.updateRecoveryScope()
+    onRecoverySessionIdChanged: root.updateRecoveryScope()
+    onRecoveryPaneIdChanged: root.updateRecoveryScope()
+
+    // Mint the native controller once. start() registers a fresh document
+    // adapter before opening the file or navigating the first page.
     Component.onCompleted: {
         // Mint the controller once, here, so create() is not in a reactive
         // binding (see `controller` above). A pre-assigned stub is kept.
         if (!root.controller && root.factory)
-            root.controller = root.factory.create(root, root.recoveryPaneId)
-        if (root.controller)
-            editorChannel.registerObject("editor", root.controller)
+            root.controller = root.factory.create(root, root.recoveryServerId,
+                                                  root.recoverySessionId,
+                                                  root.recoveryPaneId)
+        else if (root.controller)
+            root.updateRecoveryScope()
         root.started = true
         root.start()
     }

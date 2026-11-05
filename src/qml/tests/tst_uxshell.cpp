@@ -267,7 +267,7 @@ public:
     int deleteGroupCalls() const { return m_deleteGroupCalls; }
     QString lastDeleteSessionId() const { return m_lastDeleteSessionId; }
     int deleteSessionCalls() const { return m_deleteSessionCalls; }
-    Q_INVOKABLE void archiveSession(QString id)
+    Q_SLOT void archiveSession(QString id)
     {
         m_lastArchiveId = id;
         m_archiveCalls++;
@@ -1178,6 +1178,7 @@ private slots:
     // window's server pane now, and like Connect it has to be wired to the
     // profile on screen rather than to whatever happens to be active.
     void settingsServerUpdateButtonNamesItsProfile();
+    void settingsInvalidDraftCannotConnectOrUpgrade();
 
     // The three full-window sheets sit ON TOP of the workspace. A Rectangle
     // accepts no input of its own, so without a shield every click that missed
@@ -1482,6 +1483,8 @@ void TstUxShell::settingsServerUpdateButtonNamesItsProfile()
     Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(900, 560), &app);
     QVERIFY(surface.expose());
     QVERIFY2(showServerPane(surface), "the Settings sheet never showed its server pane");
+    QSignalSpy requested(surface.root(), SIGNAL(upgradeRequested(QString)));
+    QVERIFY(requested.isValid());
 
     auto *upgrade =
             qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverUpgradeButton")));
@@ -1493,15 +1496,65 @@ void TstUxShell::settingsServerUpdateButtonNamesItsProfile()
 
     app.store()->seed(twoProfiles());
     settle(80);
-    surface.root()->setProperty("selectedProfileId", QStringLiteral("id-b"));
+    QObject *profile = surface.child(QStringLiteral("serverProfile:id-b"));
+    QVERIFY(profile);
+    QVERIFY(QMetaObject::invokeMethod(profile, "clicked"));
     settle(80);
     QCOMPARE(surface.root()->property("selectedProfileId").toString(), QStringLiteral("id-b"));
     QVERIFY(upgrade->isEnabled());
 
     QMetaObject::invokeMethod(upgrade, "clicked");
     settle(40);
-    QCOMPARE(app.upgradeRequests(), QStringList{QStringLiteral("id-b")});
+    QCOMPARE(requested.size(), 1);
+    QCOMPARE(requested.constFirst().at(0).toString(), QStringLiteral("id-b"));
+    // The settings component publishes intent; only Main may leave a workspace.
+    QVERIFY(app.upgradeRequests().isEmpty());
 
+    QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
+}
+
+void TstUxShell::settingsInvalidDraftCannotConnectOrUpgrade()
+{
+    StubProfilesApp app;
+    app.store()->seed(twoProfiles());
+    Surface surface(moduleUrl(QStringLiteral("SettingsWindow.qml")), QSize(1000, 900), &app);
+    QVERIFY(surface.expose());
+    QVERIFY(showServerPane(surface));
+    auto *connect = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverConnectButton")));
+    auto *upgrade = qobject_cast<QQuickItem *>(surface.child(QStringLiteral("serverUpgradeButton")));
+    QVERIFY(connect && upgrade);
+    QSignalSpy connects(surface.root(), SIGNAL(connectRequested(QString)));
+    QSignalSpy upgrades(surface.root(), SIGNAL(upgradeRequested(QString)));
+    QVERIFY(connects.isValid() && upgrades.isValid());
+    const QVariantList stored = app.store()->profiles();
+    const QStringList properties{QStringLiteral("profileHost"), QStringLiteral("profileUser"),
+                                 QStringLiteral("profilePort")};
+    const QStringList invalid{QString(), QStringLiteral("two users"), QStringLiteral("22abc")};
+    for (qsizetype i = 0; i < properties.size(); ++i) {
+        const QByteArray property = properties.at(i).toUtf8();
+        const QVariant original = surface.root()->property(property.constData());
+        surface.root()->setProperty(property.constData(), invalid.at(i));
+        settle(20);
+        QVERIFY(!connect->isEnabled());
+        QVERIFY(!upgrade->isEnabled());
+        for (QQuickItem *button : {connect, upgrade}) {
+            const QPoint position = button->mapToScene(
+                    QPointF(button->width() / 2, button->height() / 2)).toPoint();
+            QTest::mouseClick(&surface.view, Qt::LeftButton, Qt::NoModifier, position);
+        }
+        QCOMPARE(connects.size(), 0);
+        QCOMPARE(upgrades.size(), 0);
+        QCOMPARE(app.store()->profiles(), stored);
+        surface.root()->setProperty(property.constData(), original);
+    }
+    surface.root()->setProperty("profileHost", QStringLiteral("replacement.example"));
+    QVERIFY(connect->isEnabled());
+    QVERIFY(upgrade->isEnabled());
+    QVERIFY(QMetaObject::invokeMethod(connect, "clicked"));
+    QCOMPARE(connects.size(), 1);
+    QCOMPARE(connects.constFirst().at(0).toString(), QStringLiteral("id-a"));
+    QCOMPARE(app.store()->profiles().constFirst().toMap().value(QStringLiteral("host")).toString(),
+             QStringLiteral("replacement.example"));
     QVERIFY2(surface.warnings.isEmpty(), qPrintable(surface.warningReport()));
 }
 
@@ -1562,6 +1615,8 @@ void TstUxShell::sidebarArchiveButtonCallsArchiveAndUnarchive()
         Surface surface(moduleUrl(QStringLiteral("SessionsSidebar.qml")),
                         QSize(320, 620), &app);
         QVERIFY(surface.expose());
+        QVERIFY(QObject::connect(surface.root(), SIGNAL(archiveSessionRequested(QString)),
+                                 &app, SLOT(archiveSession(QString))));
         settle(40);
 
         QObject *archive = surface.child(QStringLiteral("archiveButton:s"));
@@ -2978,10 +3033,15 @@ void TstUxShell::shellErrorBannerIsDismissedFromTheKeyboard()
                                       Q_ARG(QVariant, QStringLiteral("held open"))));
     settle(200);
     dismiss->forceActiveFocus();
+    QVERIFY(QMetaObject::invokeMethod(surface.root(), "notifyUser",
+                                     Q_ARG(QVariant, QStringLiteral("replacement while focused"))));
+    QVERIFY(dismiss->hasActiveFocus());
     settle(6500);
     QVERIFY2(banner->opacity() > 0.9,
              "the toast auto-hid while its dismiss button had the keyboard, which drops the focus "
              "onto nothing mid-press");
+    QCOMPARE(textOf(surface.child(QStringLiteral("shellErrorLabel"))),
+             QStringLiteral("replacement while focused"));
 
     QTest::keyClick(&surface.view, Qt::Key_Space);
     settle(300);

@@ -18,12 +18,13 @@
 
 namespace ch {
 
-// C++ half of the frozen C3 editor bridge (src/web/editor/src/index.ts,
-// EditorBridge) plus the SPEC 8.2 remote-file state machine. A single instance
-// is exposed to the trusted Monaco editor page over Qt WebChannel under the
-// object name "editor" (see src/qml/EditorPaneView.qml). The editor never
-// touches a filesystem directly: all reads/writes/watches flow through the
-// injected CodeharbordClient to the remote `codeharbord` service.
+class EditorPageBridge;
+
+// C++ file lifecycle (SPEC 8.2) behind the C3 editor bridge. Native callers use
+// this controller directly; each trusted Monaco document gets a separate
+// EditorPageBridge with the same C3 signals/slots and a unique WebChannel id.
+// No document proxy is reused across navigation. Reads/writes/watches always
+// flow through the injected CodeharbordClient to the remote service.
 //
 // WebChannel is asynchronous — C++ can NEVER return a value synchronously to
 // JS — so every result is delivered as a SIGNAL. The SLOTS below are
@@ -48,8 +49,12 @@ class EditorController : public QObject {
     // Unsaved work survives Error/Disconnected states; lifecycle labels alone
     // cannot decide whether closing or navigating away would discard edits.
     Q_PROPERTY(bool dirty READ dirty NOTIFY dirtyChanged)
+    Q_PROPERTY(bool recoveryEnabled READ recoveryEnabled NOTIFY recoveryEnabledChanged)
+    Q_PROPERTY(quint64 recoveryContextRevision READ recoveryContextRevision
+               NOTIFY recoveryContextRevisionChanged)
 public:
-    explicit EditorController(CodeharbordClient* client, QString recoveryId,
+    explicit EditorController(CodeharbordClient* client, QString serverId,
+                              QString devSessionId, QString paneId,
                               QObject* parent = nullptr);
     // Releases the active file.watch subscription (SPEC 8.7) so closing the
     // viewer pane this controller serves never leaks a server-side watcher.
@@ -58,6 +63,23 @@ public:
     QString fileState() const { return toString(m_fileState); }
     bool readOnly() const { return m_readOnly; }
     bool dirty() const { return m_dirty; }
+    bool recoveryEnabled() const { return !m_recoveryPath.isEmpty(); }
+    quint64 recoveryContextRevision() const { return m_recoveryGeneration; }
+
+    // Retire the previous document BEFORE open/navigation, then register this
+    // adapter under its unique objectName and pass that id in the bundle URL.
+    // The host deregisters/deletes the old adapter; this controller parents all
+    // adapters as a teardown safety net. Native callers need no page adapter.
+    Q_INVOKABLE QObject* createPageBridge();
+    // QML cannot call QObject::deleteLater directly. Explicit host disposal is
+    // accepted only for adapters parented to this controller.
+    Q_INVOKABLE void releasePageBridge(QObject* pageBridge);
+    // Host-initiated reload: capture before retiring the old page, retaining
+    // its RAM text while the controller's baseline/save chain stays authoritative.
+    // The context revision must be captured before the asynchronous DOM read.
+    Q_INVOKABLE bool preparePageReload(QString content, quint64 expectedRecoveryContext);
+    // Retry a failed replacement only from the current document's retained RAM.
+    Q_INVOKABLE bool hasPageReloadContent(QObject* pageBridge) const;
 
     // Currently open remote path and the revision the buffer is guarded at.
     // Exposed for host/tests; not part of the JS bridge surface.
@@ -70,15 +92,14 @@ public:
     // disabled), so an older server that reports none degrades cleanly.
     void setRecoveryDir(const QString& dir);
 
-    // This pane's stable per-pane recovery key (the layout paneId), the other
-    // half of recoveryPath(). Writable, not a fixed constructor value, because
-    // the QML pane's paneId is assigned by the region's layout logic and can
-    // settle AFTER this controller exists; EditorPaneView pushes it here whenever
-    // it changes so the per-pane snapshot is never keyed by an empty id (which
-    // would make two panes on one file share a snapshot). recoveryId() is for
-    // hosts/tests; not part of the JS bridge surface.
-    Q_INVOKABLE void setRecoveryId(const QString& id);
-    QString recoveryId() const { return m_recoveryId; }
+    // All three host identities are required. A missing identity deliberately
+    // disables recovery; the host must make that unavailable state visible.
+    // The opened file path is the fourth component, supplied only by open().
+    // Initial incomplete identity may settle once. A different complete scope
+    // leaves this document unavailable until open(); temporary gaps retain RAM.
+    Q_INVOKABLE void setRecoveryScope(const QString& serverId,
+                                     const QString& devSessionId,
+                                     const QString& paneId);
 
     // Byte ceiling on main-file reads (SPEC 8.3).
     //
@@ -157,6 +178,8 @@ signals:
     // of the frozen EditorBridge JS interface — an additive host->UI signal.
     void recoveryAvailable(QString recoveredContent);
     void dirtyChanged();
+    void recoveryEnabledChanged();
+    void recoveryContextRevisionChanged();
 
 private slots:
     void onNotification(const QString& method, const QJsonValue& params);
@@ -217,7 +240,7 @@ private:
     // so the reply can re-enter it for a save that was queued behind this one
     // (see save(), and m_saveInFlight below). Callers guarantee m_client,
     // a non-empty m_path and a writable buffer.
-    void issueSave(QString content, QString expectedRevision);
+    void issueSave(QString content, QString expectedRevision, quint64 editSerial);
     // Emit contentLoaded, or hold it until the page reports ready() (see the
     // ready() slot). The held buffer is overwritten by a newer load, so a
     // reconnecting page always sees the LATEST content exactly once.
@@ -231,11 +254,9 @@ private:
     // Look for a crash-recovery snapshot for the file `generation` loaded. The
     // generation is carried through every round trip so a snapshot belonging
     // to a superseded load can never be offered against the file now open, and
-    // the snapshot's own recovery-key generation is carried too so a late
-    // server.info/pane-id update cannot install an old slot's revision into
-    // the new slot. The snapshot's recorded path is also matched against the
-    // open file, so a reused per-pane slot from a previous file is never
-    // offered as the current one.
+    // the snapshot's own recovery-context generation is carried too so a late
+    // server/session/pane or directory update cannot install another slot's
+    // revision. Versioned envelope ownership must match the complete context.
     void checkRecovery(const QString& loadedContent, quint64 generation);
     // Assemble bounded raw-byte ranges before UTF-8 decoding, preserving a
     // codepoint split across ranges. Every range and the final stat must agree
@@ -271,30 +292,31 @@ private:
     // released first so the same path can never end up with two watchers
     // double-delivering every change.
     void subscribeWatch();
-    // Close the hole a reconnect leaves: changes made while the transport was
-    // down produced no watchEvent anywhere (the old codeharbord was dead, and
-    // the replacement's fresh subscription baselines at whatever is on disk
-    // when it is created). One file.stat decides whether the buffer is stale;
-    // a clean buffer is reloaded, a dirty one is only FLAGGED, exactly as
-    // onNotification() treats a live watch event.
-    void reconcileAfterReconnect();
-    // Absolute REMOTE path of THIS pane's single recovery snapshot: a file named
-    // by the pane's stable id (m_recoveryId) inside the recovery directory the
-    // SERVER reports (m_recoveryDir, from server.info.recoveryDir), NOT a sibling
-    // of the edited file (SPEC 11.3). One file per pane, so two panes editing the
-    // same path keep independent snapshots; the snapshot records the path it
-    // belongs to so a pane that has switched files never offers the wrong one.
-    // Empty when there is no stable id or the server reported no recovery dir,
-    // which disables recovery rather than sharing one unkeyed file between panes.
-    QString recoveryPath() const;
+    // Reconcile after an outage or watch event deferred by a save. A stat
+    // distinguishes our own save echo from a later external write, refreshing
+    // permissions too; reload a clean buffer, only flag a dirty one.
+    void reconcileCurrentFile();
+    // Cached server-directory path for the length-framed hash of the accepted
+    // server, Dev Session, logical pane and opened file. Legacy raw pane-id
+    // records are ambiguous and are never probed, migrated or removed.
+    QString recoveryPath() const { return m_recoveryPath; }
+    void updateRecoveryPath();
 
     // QPointer: see the lifetime note at the top of this file — the client may
     // be destroyed before this controller, and the destructor still touches it.
     QPointer<CodeharbordClient> m_client = nullptr;
-    // Stable per-pane id (the persisted layout paneId) this pane's recovery
-    // snapshot is keyed by; see recoveryPath() and setRecoveryId(). Writable: the
-    // pane's paneId can be assigned after this controller is constructed.
-    QString m_recoveryId;
+    QString m_recoveryServerId;
+    QString m_recoverySessionId;
+    QString m_recoveryPaneId;
+    QString m_recoveryPath;
+    struct RecoveryScope {
+        QString serverId;
+        QString sessionId;
+        QString paneId;
+    };
+    // Incomplete initial identity may settle once. A genuinely different
+    // complete scope cannot claim this buffer until an explicit open().
+    std::optional<RecoveryScope> m_documentRecoveryScope;
     // The server-reported recovery base directory, set via setRecoveryDir().
     // Mutable: it can be pushed in after this controller exists (server.info is
     // asynchronous). Empty => recovery disabled.
@@ -323,6 +345,9 @@ private:
     //                      which for a prefix is simply false.
     bool m_pathReadOnly = false;
     bool m_bufferReadOnly = false;
+    // Permission refreshes can overlap for dirty watch changes. Only the newest
+    // stat may update the verdict, even if older replies arrive last.
+    quint64 m_permissionGeneration = 0;
     // True once reportDirty/reportContent observes unsaved text, or once a save
     // has been issued and not yet confirmed: the buffer holds bytes that are not
     // on the server, so external changes must NOT auto-reload (SPEC 8.7).
@@ -352,8 +377,8 @@ private:
     // second refused for a change this very client made — a "file changed on
     // disk" conflict over nobody else's edit. So at most one write is on the
     // wire; a save() arriving during it either recognises its own bytes and
-    // rides the outcome of the write already sent, or parks its bytes in
-    // m_queuedSaveContent to be issued by that write's reply, guarded by the
+    // rides the outcome of the write already sent, or parks its bytes and edit
+    // observation in m_queuedSave to be issued by that write's reply, guarded by the
     // revision it produced. Latest buffer wins: an intermediate one the user
     // has already typed past does not deserve a round trip.
     //
@@ -375,10 +400,17 @@ private:
     // would only move the file's mtime and wake every other watcher). QString is
     // implicitly shared, so this holds a reference, not a copy.
     QString m_inFlightSaveContent;
-    // Bytes a save() handed over while a write was on the wire. Dropped when
-    // that write FAILS: the pane reports the failure, stays dirty, and the
-    // page's Retry / Overwrite re-sends the buffer as it is at the click.
-    std::optional<QString> m_queuedSaveContent;
+    // Keep the edit observation paired with the queued bytes: edits made while
+    // they wait are not covered by that save, even before it reaches the wire.
+    struct QueuedSave {
+        QString content;
+        quint64 editSerial;
+    };
+    // Dropped on failure; Retry / Overwrite re-sends the page's current buffer.
+    std::optional<QueuedSave> m_queuedSave;
+    // A watch event can arrive after the server wrote our bytes but before its
+    // reply. Reconcile after the save chain instead of losing that notification.
+    bool m_externalChangeDuringSave = false;
 
     // Where to go when a transport is bound again after a drop (see
     // onTransportClosed). Conflict / ExternallyModified / ReadOnly survive an
@@ -409,13 +441,13 @@ private:
     // line is unsaved work like any other, and the snapshot must be offered on
     // reopen and cleared by the next successful save. Only the zero-length
     // tombstone clearRecovery() writes means "nothing held".
-    // The snapshot is a small JSON envelope carrying the remote
-    // path alongside the buffer, so checkRecovery() can refuse to offer a
-    // snapshot this pane wrote for a different file.
+    // The versioned envelope carries complete logical ownership alongside the
+    // buffer. A misplaced foreign or legacy record is never adopted or cleared.
     QString m_recoveryRevision;
     bool m_recoveryHasContent = false;
+    bool m_recoverySlotBlocked = false;
     // Bumped every time a reply INSTALLS a revision for this pane's slot (a
-    // snapshot write, its stale-guard retry's stat, a truncate). checkRecovery()
+    // snapshot write, its validated stale-guard retry, a truncate). checkRecovery()
     // captures it before probing and refuses to write either field above if it
     // has moved: those round trips describe the slot as it was
     // before that write, so the older revision would guard the next write
@@ -458,7 +490,7 @@ private:
     // to replace, resurrecting the snapshot after the save.
     int m_recoveryWritesInFlight = 0;
     // Which file and recovery key's slot the bookkeeping above describes,
-    // bumped by every open(), setRecoveryDir(), and setRecoveryId(). Every
+    // bumped by every open(), setRecoveryDir(), and setRecoveryScope(). Every
     // snapshot-write callback captures it and returns before touching anything
     // if it has moved: a reply belonging to the previous file or key must not
     // decrement the new file's count (which would fire its deferred truncate
@@ -474,12 +506,54 @@ private:
     // Ready handshake (see the ready() slot). m_pendingContent holds a load that
     // completed before the page connected; std::nullopt means nothing is held.
     bool m_ready = false;
+    bool m_hasReadyPage = false;
+    QPointer<EditorPageBridge> m_pageBridge;
     std::optional<QString> m_pendingContent;
     QString m_pendingRevision;
+    // One latest full RAM report, retained across failed replacement loads and
+    // ready delivery until exact clean acknowledgment or an explicit reload.
+    std::optional<QString> m_pageReloadContent;
     // A page reloaded (a second ready()) while there was no transport to fetch
     // its buffer over, so the fetch is owed and onTransportBound() performs it.
     // Cleared by open(): a host-driven load serves the page on its own.
     bool m_pageNeedsContent = false;
+};
+
+// One WebChannel document's capability to the controller. Retirement severs
+// signals and actions immediately; delayed pagehide/ready/save messages can
+// never operate on the file a replacement document is opening.
+class EditorPageBridge : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
+    Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
+public:
+    QString fileState() const;
+    bool readOnly() const;
+
+public slots:
+    void save(QString content, QString expectedRevision);
+    void reportContent(QString content);
+    void reportDirty(bool dirty, QString baselineRevision);
+    void requestReload();
+    void ready();
+
+signals:
+    void contentLoaded(QString content, QString revision);
+    void fileStateChanged(QString state);
+    void readOnlyChanged(bool readOnly);
+    void saved(QString revision);
+    void saveConflict(QString currentRevision);
+    void saveError(QString message);
+    // Additive document rehydration; includes the pending save's real bytes so
+    // a save finishing after ready cannot baseline against newer unsaved text.
+    void bufferRestored(QString content, QString baselineContent, QString revision,
+                        QString pendingSaveContent, bool savePending);
+
+private:
+    friend class EditorController;
+    explicit EditorPageBridge(EditorController* controller);
+    void retire();
+    QPointer<EditorController> m_controller;
 };
 
 } // namespace ch

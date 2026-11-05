@@ -41,6 +41,7 @@ private slots:
     void anAcceptedKeyThatCannotBeStoredSaysSo();
 #if CH_HAVE_LIBSSH
     void aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns();
+    void aDisconnectFromTheFailureStateIsHonoured();
     void aNestedConnectDuringHandshakeIsRefusedWithAReason();
     void aNestedConnectDuringTheInitialTeardownIsRefused();
     void destroyingAnUnconnectedPoolChangesNoProperty();
@@ -292,6 +293,32 @@ void TstSshConnectionPool::
     QVERIFY(!pool.connectToHost(QStringLiteral("127.0.0.1"), 1,
                                 QStringLiteral("nobody")));
     QVERIFY(sawConnecting);
+    QCOMPARE(pool.state(), SshConnectionPool::State::Disconnected);
+}
+
+void TstSshConnectionPool::aDisconnectFromTheFailureStateIsHonoured()
+{
+    QTemporaryDir emptyHome;
+    QVERIFY(emptyHome.isValid());
+    const QByteArray realHome = qgetenv("HOME");
+    QVERIFY(qputenv("HOME", QFile::encodeName(emptyHome.path())));
+    const auto restoreHome = qScopeGuard([&realHome] {
+        qputenv("HOME", realHome);
+    });
+
+    SshConnectionPool pool;
+    bool sawError = false;
+    connect(&pool, &SshConnectionPool::stateChanged, &pool,
+            [&pool, &sawError](SshConnectionPool::State state) {
+                if (state == SshConnectionPool::State::Error) {
+                    sawError = true;
+                    pool.disconnectFromHost();
+                }
+            });
+
+    // An empty host fails locally, without reaching a real SSH endpoint.
+    QVERIFY(!pool.connectToHost(QString(), 22, QStringLiteral("nobody")));
+    QVERIFY(sawError);
     QCOMPARE(pool.state(), SshConnectionPool::State::Disconnected);
 }
 

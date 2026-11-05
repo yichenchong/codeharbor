@@ -29,6 +29,9 @@ Rectangle {
     // appearance, viewer defaults and shortcuts are managed — the sidebar
     // itself edits none of them.
     signal appSettingsRequested()
+    // Archiving the active session retires its editors. Main asks about any
+    // unsaved changes before issuing the mutation.
+    signal archiveSessionRequested(string devSessionId)
 
 
     // Keyboard/selection cursor. Groups and sessions have independent id
@@ -479,8 +482,7 @@ Rectangle {
         if (!app)
             return
         if (archived) {
-            if (typeof app.archiveSession === "function")
-                app.archiveSession(sessionId)
+            sidebar.archiveSessionRequested(sessionId)
         } else if (typeof app.unarchiveSession === "function") {
             app.unarchiveSession(sessionId)
         }

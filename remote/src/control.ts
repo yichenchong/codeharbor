@@ -33,6 +33,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 
 import { isEventIdentifier, isPlainObject } from "./events.ts";
+import { JsonSizeLimitError, stringifyJson } from "./json.ts";
 
 /**
  * Format revision of the PRODUCER-to-daemon message, i.e. the line an agent's
@@ -297,13 +298,20 @@ export interface ControlListener {
 }
 
 function responseLine(response: ControlResponse): string {
-    const payload = JSON.stringify(response);
-    if (Buffer.byteLength(payload) <= MAX_CONTROL_LINE_BYTES) return `${payload}\n`;
-    return `${JSON.stringify(refusal(
+    try {
+        const payload = stringifyJson(response, MAX_CONTROL_LINE_BYTES);
+        if (payload === undefined) throw new TypeError("Control response is not JSON-serializable");
+        return `${payload}\n`;
+    } catch (err) {
+        if (!(err instanceof JsonSizeLimitError)) throw err;
+    }
+    const fallback = stringifyJson(refusal(
         "failed",
         `the viewer command's answer exceeded the ${MAX_CONTROL_LINE_BYTES}-byte control limit; ` +
         "the operation may already have completed, so inspect the current viewer state before retrying",
-    ))}\n`;
+    ), MAX_CONTROL_LINE_BYTES);
+    if (fallback === undefined) throw new TypeError("Control refusal is not JSON-serializable");
+    return `${fallback}\n`;
 }
 
 function refusal(code: ControlErrorCode, message: string): ControlResponse {
@@ -573,9 +581,12 @@ export async function startControlListener(
             server.on("error", () => {});
             try {
                 fs.chmodSync(socketPath, 0o600);
-            } catch {
-                // A platform without socket permissions is not a reason to
-                // refuse service; the 0700 directory above still gates it.
+            } catch (err) {
+                // The runtime/cache directory may already exist with broader
+                // permissions, so mkdir's mode does not protect this endpoint.
+                // Refuse pane control rather than expose it without 0600.
+                server.close(() => reject(err));
+                return;
             }
             resolve({
                 socketPath,
@@ -592,17 +603,15 @@ export async function startControlListener(
                         }
                     }
                     for (const socket of connections) {
-                        // Pending producers were answered above. Their queued
-                        // replies flush via destroySoon(); partial requests have
-                        // no reply to preserve and must not keep the server alive.
+                        // Pending producers were answered above. Partial
+                        // requests have no reply to preserve and must not keep
+                        // the server alive.
                         if (!socket.writableEnded) socket.destroy();
                     }
+                    // Node unlinks the bound Unix socket when closing it.
+                    // A second unlink here could remove a replacement that
+                    // acquired the pathname after the native close.
                     server.close();
-                    try {
-                        fs.unlinkSync(socketPath);
-                    } catch {
-                        // Already gone.
-                    }
                 },
                 settle(outcome) {
                     const entry = forget(outcome.commandId);

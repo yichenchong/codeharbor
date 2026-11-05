@@ -369,7 +369,7 @@ ItemDelegate {
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
                 text: header.sessionCount > 0
-                      ? qsTr("Delete group \"%1\"? This permanently destroys the group and all %2 %3 inside it, and kills the remote tmux sessions of their terminal panes. This cannot be undone.")
+                      ? qsTr("Delete group \"%1\"? This permanently destroys the group and all %2 %3 inside it, discards their unsaved editor changes, and kills the remote tmux sessions of their terminal panes. This cannot be undone.")
                             .arg(header.name)
                             .arg(header.sessionCount)
                             .arg(header.sessionCount === 1 ? qsTr("session") : qsTr("sessions"))

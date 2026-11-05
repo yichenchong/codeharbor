@@ -182,6 +182,21 @@ inline constexpr auto kMethodViewerCommandResult = "viewer.commandResult";
 // Mirrors the `server.info` handler in remote/src/codeharbord.ts.
 inline constexpr auto kMethodServerInfo = "server.info";
 
+// RPC schema 10 requires the actual backend agent-event endpoint, not a path
+// inferred from another socket or the local host. Remote paths are POSIX even
+// when this native client runs on Windows. Missing/malformed metadata must
+// prevent server acceptance; never fall back to another event destination.
+inline std::optional<QString> decodeAgentSocket(const QJsonObject& serverInfo)
+{
+    const QJsonValue value = serverInfo.value(QStringLiteral("agentSocket"));
+    if (!value.isString())
+        return std::nullopt;
+    const QString path = value.toString();
+    if (!path.startsWith(QLatin1Char('/')) || path.contains(QChar::Null))
+        return std::nullopt;
+    return path;
+}
+
 // --- transport liveness ------------------------------------------------------
 //
 // Mirrors RPC_PING_METHOD in remote/src/rpc-types.ts, which keys the `ping`
@@ -267,5 +282,9 @@ inline constexpr auto kMethodWorkspaceDeleteTerminalPane =
     "workspace.deleteTerminalPane";
 inline constexpr auto kMethodWorkspaceGetLayout = "workspace.getLayout";
 inline constexpr auto kMethodWorkspaceSetLayout = "workspace.setLayout";
+// Create the initial layout only if no region row exists; the server returns
+// the winning stored row and mints initial terminal identities transactionally.
+inline constexpr auto kMethodWorkspaceEnsureInitialLayout =
+    "workspace.ensureInitialLayout";
 
 } // namespace ch::rpc

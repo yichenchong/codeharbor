@@ -11,7 +11,8 @@ EditorFactory::EditorFactory(CodeharbordClient* client, QObject* parent)
 {
 }
 
-EditorController* EditorFactory::create(QObject* owner, const QString& paneId)
+EditorController* EditorFactory::create(QObject* owner, const QString& serverId,
+                                        const QString& devSessionId, const QString& paneId)
 {
     // Parented to the pane: destroyed with it, releasing its file.watch. With no
     // pane to parent to, the factory itself takes ownership rather than returning
@@ -20,7 +21,8 @@ EditorController* EditorFactory::create(QObject* owner, const QString& paneId)
     // nothing here controls — while a live pane is still driving it — and a C++
     // caller that ignored the default would simply leak it. Same rule and same
     // shape as TerminalFactory::create().
-    auto* controller = new EditorController(m_client, paneId, owner ? owner : this);
+    auto* controller = new EditorController(
+        m_client, serverId, devSessionId, paneId, owner ? owner : this);
     controller->setRecoveryDir(m_recoveryDir);
     // Track it so a recoveryDir arriving later (server.info is asynchronous and
     // may answer after panes exist) still reaches controllers already created.

@@ -447,6 +447,11 @@ public:
     // KEY"). A PUBLIC key — the .pub file, or "BEGIN PUBLIC KEY" — is the
     // mistake a user actually makes, so it is diagnosed by name instead of
     // falling through to a generic "not a private key".
+    // Clear keys must also pass libssh's private-key parser without prompting;
+    // a build without libssh refuses them rather than claiming validation.
+    // Encrypted keys must have consistent public cipher/KDF/IV and container
+    // framing (including PKCS#8 DER). Their opaque private contents can only be
+    // verified during authentication with a passphrase.
     static KeyDescription describeKeyText(const QString& text);
 
     // A name that reads back to a human and can index the maps here: 1..64
@@ -455,10 +460,9 @@ public:
     // name they see.
     static bool isUsableKeyName(const QString& name);
 
-    // Hard bound on an imported or referenced file, so a picker cannot be used to
-    // read a gigabyte into memory. A 4096-bit RSA key in OpenSSH format is under
-    // 4 KiB; 64 KiB leaves room for a certificate-bearing oddity and is still
-    // nothing.
+    // Hard bound on an imported/referenced file or pasted text, so a picker or
+    // paste cannot drive unbounded parsing. A 4096-bit RSA key in OpenSSH format
+    // is under 4 KiB; 64 KiB leaves room for a certificate-bearing oddity.
     static constexpr qint64 kMaxKeyBytes = 64 * 1024;
 
 signals:

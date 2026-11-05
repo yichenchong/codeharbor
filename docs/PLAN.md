@@ -70,7 +70,7 @@ is a coordinated break.
   (SPEC 3.5). Bump `WorkspaceDb::kSchemaVersion`. Owner: P.
 - [x] **C3 — WebChannel bridge interfaces.** Freeze the JS↔C++ object shapes:
   `TerminalBridge`/`TerminalHost` (`src/web/terminal`) and
-  `RemoteEditorBridge`/`EditorHost` (`src/web/editor`). Owners: T, E.
+  `EditorBridge`/`EditorHost` (`src/web/editor`), with a document-scoped editor adapter. Owners: T, E.
 
 **Status: LANDED** — delegated to three parallel subagents,
 adversarially reviewed, and verified (remote typecheck and tests; cmake
@@ -174,6 +174,8 @@ graph TD
   - [x] `TerminalController`: buffering (SPEC 5.5), state machine (SPEC 5.6),
     reconnect backoff, hidden-drain.
   - [x] tmux target naming with stable IDs (SPEC 5.2) + shell-safe command.
+  - [x] Required RPC schema 10 `server.info.agentSocket` propagates as `CODEHARBOR_AGENT_SOCKET` to new tmux children; session updates do not rewrite existing shells or agents (§5.2/§6.3).
+  - [x] All four managed pane/routing variables are explicit `new-session -e` values (empty when unavailable); future-child session state uses exact values or `set-environment -r`, never global fallback. Incomplete identity pairs suppress both IDs and both routes (§5.2).
   - [x] xterm.js renderer in `src/web/terminal` + WebChannel bridge (C3).
   - [x] Recursive terminal-region split tree in QML.
 - **Stop gate:** ✅ MET — `tst_liveterminal` attaches to a real tmux session over a
@@ -210,7 +212,7 @@ graph TD
 ### E — Remote editor — ✅ LANDED (Wave 4); live gate MET (Wave 5)
 - **Start gate:** [x] R file methods (stat/read/write/watch) · [x] V pane host · [x] C3.
 - **TODO:**
-  - [x] Monaco bundle + WebChannel-native `EditorBridge` (C3, object "editor") in `src/web/editor`.
+  - [x] Monaco bundle + WebChannel-native `EditorBridge` in `src/web/editor`; each page registers a fresh uniquely named adapter passed through the bundle URL's `bridge` parameter, with no shared `"editor"` alias.
   - [x] File-state machine (SPEC 8.2), revision-guarded save + conflict (SPEC 8.6 — never silent overwrite), external-change reload for clean buffers / no-clobber when dirty.
   - [x] Unsaved recovery snapshots on the server (SPEC 11.3) via revision-guarded writeFile; per-pane EditorController (EditorFactory) with watch released on close.
 - **Stop gate:** ✅ MET — `tst_liveeditor` drives the real packaged Monaco page in
@@ -231,7 +233,7 @@ graph TD
 - **Start gate:** [x] bridge+adapters DONE · [x] S agent channel (dedicated exec channel for AgentEvent JSONL) · [x] U sidebar.
 - **TODO:**
   - [x] `AgentStatusMonitor` (C++) consuming AgentEvent JSONL over the agent channel.
-  - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen (OS notification display-deferred).
+  - [x] Map `AgentState` → sidebar row precedence + unseen-completion; markSeen clears the badge; notify() hook on waiting_input/idle_unseen, with an optional freedesktop session-bus backend through `Notifier`.
   - [x] `oh-my-pi` installable hook emitting BridgeMessage through the bridge (single mapping point); `pi`/`claude-code` adapters already registered server-side.
   - [x] Fallback coarse activity detection (SPEC 6.6) for the adapterless `generic`
     harness, plus the SPEC 6.7 silence timeout. Done CLIENT-side, which is where
@@ -290,8 +292,10 @@ graph TD
   `starting → running → waiting_input → running → idle_unseen`, with the summary
   surviving the whole chain, `markSeen` clearing the badge idempotently, and the
   sidebar row going FinishedUnseen → Idle. Remote bridge pids are asserted reaped
-  (an SSH exec channel sends no SIGHUP). OS desktop notifications remain
-  display-deferred: `notify()` fires and is asserted, but nothing renders headless.
+  (an SSH exec channel sends no SIGHUP). This SSH gate asserts the `notify()`
+  signal, not OS delivery. The separate `tst_notifierlive` desktop gate checks
+  daemon acknowledgement when the optional QtDBus/freedesktop backend is available;
+  it does not prove that a compositor displayed a bubble.
   The same target also gates the DETACHED case end to end: a real pane row, a real
   tmux session with no client attached, real output proven present on the server
   with `capture-pane` and never delivered to this client, then a real
@@ -309,7 +313,7 @@ graph TD
     32-command in-flight bound and the 5 s answer timeout. Started from
     `runStdio()`; a bind failure is a stderr line, never a failed connection.
   - [x] ONE SOCKET PER DAEMON, `codeharbor-control-<token>.sock` under
-    `$XDG_RUNTIME_DIR` (or `~/.cache/codeharbor`), 0600 inside a 0700 directory,
+    `$XDG_RUNTIME_DIR` (or `~/.cache/codeharbor`), enforced socket mode 0600,
     reported through `server.info.controlSocket` and exported by the client into
     every pane it attaches as `$CODEHARBOR_CONTROL_SOCKET`. A producer uses that
     variable and refuses without it.
@@ -329,7 +333,8 @@ graph TD
 
     STILL AMBIGUOUS, by nature and documented in SPEC 6.8: a tmux target may be
     attached by two windows at once (the same pane shown twice), tmux environment
-    is per session, so the window that attached LAST owns agents started after it.
+    is per session, so last attach selects the endpoint for future tmux-created
+    children. Existing shells, including new agents forked from them, keep their old route.
     A deterministic answer needs per-client tmux targets, which would give up the
     shared-session behaviour SPEC 5.2 exists for.
   - [x] `viewer.command` (server → client notification) + `viewer.commandResult`
@@ -446,7 +451,8 @@ graph TD
   refusal + reload (`tst_liveeditor`).
 - **M5 — Agent awareness (SPEC Phase 4).** ✅ REACHED (live, Wave 5) — the real hook
   on the remote side driving ordered sidebar transitions and badge clearing
-  (`tst_liveagent`). OS desktop notifications remain display-deferred.
+  (`tst_liveagent`). The optional QtDBus/freedesktop notification backend is implemented;
+  daemon acknowledgement has a separate desktop gate, not a headless SSH proof.
 
 ## Delivery progress
 
@@ -574,7 +580,7 @@ unwritable pane focus, dead read-only derivation, and the workspace.* contract
 drift hole. The final slice was initially killed at ~4 minutes, but follow-up
 work completed and tested its two features: group deletion now has a reachable
 confirmation that states the authoritative session count, and crash recovery now
-offers Restore or Discard when a recovered file is reopened. Pane URL persistence
+offers a recovery choice when a recovered file is reopened. Pane URL persistence
 was also completed and tested.
 
 One more finding closed at the end, and it is the sharpest example of the pattern
@@ -594,8 +600,10 @@ fixed.
 >   and Dev Sessions is wired ("+ New group", "+ Session"); group deletion asks
 >   for confirmation and states how many sessions will be destroyed.
 > - **Crash recovery is implemented and tested.** `EditorController::recoveryAvailable`
->   is consumed by `EditorPaneView.qml`, which offers Restore or Discard when a
->   recovered file is reopened. This is no longer a remaining gap.
+>   is consumed by `EditorPaneView.qml`. The current choices are **Restore** and
+>   **Not now**: deferral keeps the saved file unchanged and does not delete the
+>   scoped recovery copy, which may be offered again while unchanged. This is no
+>   longer a remaining gap; the copy is not a permanent history.
 > - **The sidebar row shows a status dot, not the counters SPEC 4.2 asks for.** SPEC 4.2
 >   wants the number of active terminals, the number of terminals requiring attention,
 >   an unsaved-file indicator and an error indicator on each Dev Session row. Only the
@@ -625,31 +633,34 @@ fixed.
 > - **A reconnect that meets a NEW unknown host key cannot prompt** — `hostKeyPrompt`
 >   is only raised from an interactive connect, so the ladder dead-ends on an opaque
 >   failure. Needs a design call about prompting outside a user-initiated attempt.
-> - **Connect blocks the GUI thread** — a bounded, timed-out libssh handshake, but the
->   real fix is moving the session to a worker thread.
+> - **Synchronous SSH operations can block the GUI thread.** The libssh handshake
+>   and channel-exec calls run there. The configured libssh timeout is not an
+>   absolute deadline for the complete connection/authentication sequence.
+>   Endpoint probing and remote provisioning scripts use event-driven waits;
+>   moving the blocking SSH operations to a worker remains the missing step.
 > - **Pane focus is click-based**; focus moved purely by keyboard does not report, so a
 >   future "focus next pane" command must tell the region directly.
 > - **Tmux discovery has client consumers.** `TerminalFactory` checks
 >   `tmux.listSessions` after an attach to detect a lost remote session.
 >   `TmuxActivityPoller` asks `tmux.paneActivity` for detached panes so their
 >   sidebar status can follow remote output. This is no longer a remaining gap.
-> - **The DEFAULT trust-store path is never exercised by a test.** In production the
->   known-hosts file lives at `QStandardPaths::AppConfigLocation + "/known_hosts"`,
->   which on Linux is `<config>/CodeHarbor/CodeHarbor/known_hosts` — org AND app, a
->   nested directory beside `CodeHarbor.conf`, not next to it. Every live test
->   overrides it with `CH_LIVE_KNOWN_HOSTS`, so the path a real user actually gets is
->   the one path no gate covers. This cost real debugging time: a launch smoke seeded
->   `known_hosts` one level up, the app correctly saw an empty trust store, treated
->   the key as unknown, and parked awaiting a prompt nobody could answer headlessly —
->   which reads exactly like a broken auto-reconnect. The product was right; the
->   coverage is not.
-> - **Two live gates hardcode the dev layout.**
->   `TstLiveSsh::rpcServerInfoOverSshChannel()` and
->   `TstLiveAgent::bridgeChannelWiresMonitor()` build their remote command from
->   `<CH_LIVE_REPO>/remote/src/*.ts` instead of going through
->   `SessionBootstrap::entryCandidates()`, so they only pass against a git
->   checkout and fail against an unpacked release tarball. Not a product defect —
->   `tst_coldstart` drives the real path and passes against the tarball — but it
->   means the live suite is not a check on the layout a normal user installs.
->   Found by installing the published v0.1.0 artifacts and running the suite
->   against them, which is the only reason it is known at all.
+> - **The default trust-store path has a Linux cold-start gate.** The known-hosts
+>   file lives at `QStandardPaths::AppConfigLocation + "/known_hosts"`; on Linux this
+>   is `<config>/CodeHarbor/CodeHarbor/known_hosts` — org AND app, a nested directory
+>   beside `CodeHarbor.conf`, not next to it. On Linux, `tst_coldstart` clears
+>   `CH_LIVE_KNOWN_HOSTS`, checks the bootstrap's default path under a temporary
+>   configuration root, and verifies that accepting the fixture key writes that
+>   store and survives a restart. On macOS/Windows it instead injects temporary
+>   INI settings and a temporary known-hosts path, so it does not prove those native
+>   default-store paths. The old blanket coverage warning is no longer accurate:
+>   a historical launch smoke seeded the key one level too high and waited for an
+>   unknown-host prompt; the Linux gate explicitly checks that path construction.
+> - **The SSH RPC smoke gate still requires the source layout.**
+>   `TstLiveSsh::rpcServerInfoOverSshChannel()` invokes
+>   `<CH_LIVE_REPO>/remote/src/codeharbord.ts` directly, so that case does not
+>   accept an unpacked release tarball as `CH_LIVE_REPO`.
+>   `TstLiveAgent::bridgeChannelWiresMonitor()` now uses the bootstrap entry-point
+>   ladder, and `tst_coldstart` exercises the production launch path. The full
+>   SSH live suite therefore still documents a checkout prerequisite, rather
+>   than claiming every gate accepts the installed release layout. The original
+>   limitation was found by installing the published v0.1.0 artifacts.

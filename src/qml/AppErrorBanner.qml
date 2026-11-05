@@ -30,7 +30,12 @@ Rectangle {
     function show(message) {
         errorLabel.text = message;
         banner.opacity = 0.97;
-        hideTimer.restart();
+        // Replacing a message does not change focus, so the focus-change
+        // handler below will not get another chance to pause this countdown.
+        if (dismissButton.activeFocus)
+            hideTimer.stop();
+        else
+            hideTimer.restart();
     }
 
     // Take it back down. Both the timer and the dismiss button come through

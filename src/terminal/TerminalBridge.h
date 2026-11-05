@@ -45,9 +45,9 @@ class TerminalController;
 // exactly once.
 //
 // The renderer only exists once the page has mounted, so the controller is put
-// in the SPEC 5.4 hidden state at construction: everything the pane emits
-// meanwhile accumulates in the controller's rolling buffer and is replayed as a
-// single batch by ready(), the page's mount handshake.
+// in the SPEC 5.4 hidden state at construction. ready(visible) explicitly adopts
+// the incoming renderer's visibility; output stays retained until it is visible,
+// then replays in order under the controller's credit window.
 //
 // SECURITY (the bridge is the page's ONLY reach into C++): WebChannel publishes
 // every SLOT *and* every Q_INVOKABLE, so both the slots below AND
@@ -72,6 +72,7 @@ class TerminalBridge : public QObject {
     // at the real size instead of the 80x24 fallback (0 until it reports).
     Q_PROPERTY(int columns READ columns NOTIFY geometryChanged)
     Q_PROPERTY(int rows READ rows NOTIFY geometryChanged)
+    Q_PROPERTY(quint64 inputGeneration READ inputGeneration NOTIFY inputGenerationChanged)
 public:
     // Upper bound on a renderer-reported dimension. The value crosses the wire
     // as an SSH window-change and sizes a grid on the remote host, so it may
@@ -89,6 +90,7 @@ public:
     bool rendererReady() const;
     int columns() const;
     int rows() const;
+    quint64 inputGeneration() const;
 
     // App side (menu/command palette): drop the renderer's visible screen
     // buffer. Purely a view operation — the remote pane is untouched, so it
@@ -98,7 +100,9 @@ public:
 
 public slots:
     // ---- the TerminalBridge contract (called by the page) ----
-    void sendInput(const QString& data);
+    // Every chunk carries the generation observed when its input was queued.
+    // False stops the remaining paste: a prefix may already have been sent.
+    bool sendInput(const QString& data, quint64 generation);
     // Input the RENDERER produced as raw bytes rather than as text, carried as
     // base64 in the QString a WebChannel slot can take.
     //
@@ -120,7 +124,7 @@ public slots:
     // both slots are fed from the single input queue in
     // src/web/terminal/src/input.ts, so a report cannot overtake the keystrokes
     // queued ahead of it.
-    void sendBinaryInput(const QString& base64);
+    bool sendBinaryInput(const QString& base64, quint64 generation);
     // Bounded: see kMaxDimension. Anything at or below it is passed through
     // untouched, including the non-positive values an unmounted renderer
     // reports (the controller rejects those).
@@ -140,8 +144,9 @@ public slots:
     // nothing else; the memory bound that survives either way is the
     // controller's rolling buffer.
     void notifyOutputConsumed(int bytes);
-    // Mount handshake; optional on the JS side (`ready?()`).
-    void ready();
+    // Mount handshake with the new renderer's current visibility. A page whose
+    // first intersection is not known yet passes false, including on reload.
+    void ready(bool visible);
 
 signals:
     // ---- the TerminalHost callbacks (consumed by the page) ----
@@ -149,6 +154,10 @@ signals:
     // through notifyOutputConsumed() once the renderer has consumed it.
     void write(const QString& data, int bytes);
     void connectionStateChanged(const QString& state);
+    void inputGenerationChanged();
+    // Unlike a property update (batched by WebChannel), this signal precedes
+    // output from the replacement PTY, including its terminal-query replies.
+    void inputTransportChanged(quint64 generation);
     void clearRequested();
 
     // The RENDERER reported a new cols x rows. Not part of the page contract;
@@ -196,11 +205,7 @@ private:
     // truncated glyph at a time.
     int m_undeliveredBytes = 0;
     bool m_rendererReady = false;
-    // QML and the page can report visibility before the renderer handshake.
-    // Remember whether that happened so ready() preserves a real hidden
-    // report, while still defaulting a unit/older host with no report to
-    // visible on its first mount.
-    bool m_visibilityReported = false;
+    quint64 m_inputGeneration = 0;
     // Last visibility reported by the page or the QML pane. True by default:
     // a pane is shown unless something says otherwise, and QML only reports on
     // a CHANGE, so the initial "visible" report never arrives.

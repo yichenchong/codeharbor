@@ -1,6 +1,7 @@
 #include "MarkdownModel.h"
 #include "MobileImageProvider.h"
 #include "MobileViewerService.h"
+#include "MobileWebViewPolicy.h"
 #include "RpcTypes.h"
 
 #include <QBuffer>
@@ -15,6 +16,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QQuickWindow>
+#include <QScopeGuard>
 #include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -162,6 +165,14 @@ private slots:
     void thePdfSpoolIsAppPrivateDigestNamedAndEmptied();
     void aReplyThatOutlivesTheServiceIsDropped();
     void aReleasedRequestStillInFlightLeavesNothingBehind();
+    void aSupersededRequestCannotCompleteItsReplacement();
+    void decodedImagesHaveIndependentPixelAndDimensionBounds();
+    void aTransportChangeRetiresRequestsAndCachedResources();
+    void webPoliciesUseUniqueSafeBootstrapMarkers();
+    void aMissingNativeWebGuardNeverPublishesReady();
+    void twoViewerServicesOwnIndependentPdfSpools();
+    void aPdfSpoolWriteFailurePublishesNothing();
+    void aPdfSpoolPermissionFailurePublishesNothing();
 
 private:
     // The one request the client has written since the last call. Fails the test
@@ -177,9 +188,7 @@ private:
 
 void TstMobileViewers::initTestCase()
 {
-    // Keeps ch::MobileViewerService's PDF spool — and the purge it runs at
-    // construction — inside a throwaway location instead of the developer's real
-    // cache directory.
+    // Keep the service's private rendering directories in the test cache.
     QStandardPaths::setTestModeEnabled(true);
 }
 
@@ -936,6 +945,13 @@ void TstMobileViewers::thePdfSpoolIsAppPrivateDigestNamedAndEmptied()
     const QString spooled = ready.at(0).at(1).toUrl().toLocalFile();
     QVERIFY(QFile::exists(spooled));
     QCOMPARE(QFile(spooled).size(), qint64(13));
+#if defined(Q_OS_UNIX)
+    const auto publicAccess = QFileDevice::ReadGroup | QFileDevice::WriteGroup
+                              | QFileDevice::ExeGroup | QFileDevice::ReadOther
+                              | QFileDevice::WriteOther | QFileDevice::ExeOther;
+    QVERIFY(!(QFileInfo(spooled).permissions() & publicAccess));
+    QVERIFY(!(QFileInfo(QFileInfo(spooled).absolutePath()).permissions() & publicAccess));
+#endif
 
     // Under the app's own cache location, which on Android is inside the app's
     // cache dir and on iOS inside the app container. Nothing else on the device
@@ -943,7 +959,7 @@ void TstMobileViewers::thePdfSpoolIsAppPrivateDigestNamedAndEmptied()
     const QString cache =
         QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     QVERIFY(!cache.isEmpty());
-    QVERIFY(spooled.startsWith(cache + QLatin1String("/pdf-spool/")));
+    QVERIFY(QFileInfo(spooled).absolutePath().startsWith(cache + QLatin1String("/pdf-spool-")));
 
     // Named by DIGEST, so a server-controlled name cannot choose a filename on
     // this device: no "..", no spaces, no "secret report" to read off a file
@@ -1003,6 +1019,9 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     const QString pdf = QStringLiteral("/repo/a.pdf");
     QSignalSpy pdfReady(m_service, &MobileViewerService::pdfReady);
     QSignalSpy pdfErrors(m_service, &MobileViewerService::pdfError);
+    const QDir cache(QStandardPaths::writableLocation(QStandardPaths::CacheLocation));
+    const QStringList before = cache.entryList({QStringLiteral("pdf-spool-*")},
+        QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
 
     m_service->requestPdf(pdf);
     const qint64 abandoned = takeRequest().value(QStringLiteral("id")).toInteger();
@@ -1014,10 +1033,8 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     // Nothing announced, nothing failed, and — the point — nothing written.
     QCOMPARE(pdfReady.size(), 0);
     QCOMPARE(pdfErrors.size(), 0);
-    const QString spoolDir =
-        QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
-        + QLatin1String("/pdf-spool");
-    QCOMPARE(QDir(spoolDir).entryList(QDir::Files).size(), 0);
+    QCOMPARE(cache.entryList({QStringLiteral("pdf-spool-*")},
+        QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name), before);
 
     // The awkward ordering: released, requested AGAIN, and only THEN does the
     // first reply land. The stale reply must not delete the file the live
@@ -1164,6 +1181,264 @@ void TstMobileViewers::svgImagesNeverReadLocalResourcesOrNestedSvgPayloads()
     // Charge each reference, even when QtSvg later ignores zero-size elements.
     QVERIFY(decode(repeatedSvg(megapixel, 17)).isNull());
     QVERIFY(decode(repeatedSvg(png, 129)).isNull());
+}
+
+void TstMobileViewers::aSupersededRequestCannotCompleteItsReplacement()
+{
+    const QString path = QStringLiteral("/repo/a.txt");
+    QSignalSpy reads(m_service, &MobileViewerService::fileRead);
+    QSignalSpy errors(m_service, &MobileViewerService::fileError);
+    m_service->readFile(path);
+    const qint64 oldRead = takeRequest().value(QStringLiteral("id")).toInteger();
+    m_service->readFile(path);
+    const qint64 newRead = takeRequest().value(QStringLiteral("id")).toInteger();
+    respondResult(oldRead, {{"encoding", "utf-8"}, {"content", "old"}, {"revision", "r1"}});
+    QVERIFY(reads.isEmpty());
+    respondResult(newRead, {{"encoding", "utf-8"}, {"content", "new"}, {"revision", "r2"}});
+    QCOMPARE(reads.size(), 1);
+    QCOMPARE(reads.first().at(1).toString(), QStringLiteral("new"));
+    QCOMPARE(reads.first().at(3).toString(), QStringLiteral("r2"));
+
+    QSignalSpy listed(m_service, &MobileViewerService::directoryListed);
+    QSignalSpy directoryErrors(m_service, &MobileViewerService::directoryError);
+    m_service->listDirectory(QStringLiteral("/repo"));
+    const qint64 oldListing = takeRequest().value(QStringLiteral("id")).toInteger();
+    m_service->listDirectory(QStringLiteral("/repo"));
+    const qint64 newListing = takeRequest().value(QStringLiteral("id")).toInteger();
+    respondError(oldListing, -32000, QStringLiteral("old failure"));
+    QVERIFY(directoryErrors.isEmpty());
+    respondResult(newListing, {{"entries", QJsonArray{QJsonObject{{"name", "new"}, {"kind", "file"}}}}});
+    QCOMPARE(listed.size(), 1);
+    QCOMPARE(listed.first().at(1).toList().first().toMap().value(QStringLiteral("name")).toString(),
+             QStringLiteral("new"));
+
+    QSignalSpy resolved(m_service, &MobileViewerService::pathResolved);
+    QSignalSpy resolveErrors(m_service, &MobileViewerService::pathResolveError);
+    m_service->resolvePath(path, QStringLiteral("/repo"));
+    const qint64 oldResolve = takeRequest().value(QStringLiteral("id")).toInteger();
+    m_service->resolvePath(path, QStringLiteral("/repo"));
+    const qint64 newResolve = takeRequest().value(QStringLiteral("id")).toInteger();
+    respondResult(oldResolve, {{"path", path}, {"insideRepositoryRoot", true}});
+    QVERIFY(resolved.isEmpty());
+    respondResult(newResolve, {{"path", "/outside/a.txt"}, {"insideRepositoryRoot", false}});
+    QCOMPARE(resolved.size(), 1);
+    QVERIFY(!resolved.first().at(3).toBool());
+    QVERIFY(resolveErrors.isEmpty());
+
+    QSignalSpy stated(m_service, &MobileViewerService::stated);
+    m_service->stat(path);
+    const qint64 oldStat = takeRequest().value(QStringLiteral("id")).toInteger();
+    m_service->stat(path);
+    const qint64 newStat = takeRequest().value(QStringLiteral("id")).toInteger();
+    respondError(oldStat, -32000, QStringLiteral("old failure"));
+    QVERIFY(errors.isEmpty());
+    respondResult(newStat, {{"size", 42}});
+    QCOMPARE(stated.size(), 1);
+    QCOMPARE(stated.first().at(1).toMap().value(QStringLiteral("size")).toInt(), 42);
+}
+
+void TstMobileViewers::decodedImagesHaveIndependentPixelAndDimensionBounds()
+{
+    auto cache = std::make_shared<MobileImageCache>();
+    MobileImageProvider provider(cache);
+    const QString path = QStringLiteral("/remote/image.png");
+    const QString id = QString::fromLatin1(QUrl::toPercentEncoding(path));
+    const auto png = [](int width, int height) {
+        QImage image(width, height, QImage::Format_Mono);
+        image.fill(0);
+        QBuffer buffer;
+        buffer.open(QIODevice::WriteOnly);
+        image.save(&buffer, "PNG");
+        return buffer.data();
+    };
+    // A highly compressed, real raster can exceed the source-pixel ceiling
+    // while its encoded bytes are far below the remote-file byte limit.
+    cache->insert(path, png(8193, 8193));
+    QVERIFY(provider.requestImage(id, nullptr, QSize(16, 16)).isNull());
+
+    cache->insert(path, png(9000, 1));
+    QSize original;
+    const QImage wide = provider.requestImage(id, &original, QSize());
+    QVERIFY(!wide.isNull());
+    QCOMPARE(original, QSize(9000, 1));
+    QVERIFY(wide.width() <= MobileImageProvider::kMaxDecodedDimension);
+    QVERIFY(wide.height() <= MobileImageProvider::kMaxDecodedDimension);
+
+    cache->insert(path, rotatedJpegBytes());
+    const QImage oneAxis = provider.requestImage(id, &original, QSize(40, -1));
+    QCOMPARE(oneAxis.size(), QSize(40, 80));
+    QCOMPARE(original, QSize(200, 400));
+}
+
+void TstMobileViewers::aTransportChangeRetiresRequestsAndCachedResources()
+{
+    const QString image = QStringLiteral("/repo/shared.png");
+    m_service->requestImage(image);
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "base64"}, {"content", QString::fromLatin1(pngBytes().toBase64())}});
+    QVERIFY(!m_service->cachedImageBytes(image).isEmpty());
+
+    const QString pdf = QStringLiteral("/repo/shared.pdf");
+    QSignalSpy ready(m_service, &MobileViewerService::pdfReady);
+    m_service->requestPdf(pdf);
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF-1.7\n"}});
+    QCOMPARE(ready.size(), 1);
+    const QString spool = ready.first().at(1).toUrl().toLocalFile();
+    QVERIFY(QFile::exists(spool));
+
+    m_service->readFile(QStringLiteral("/repo/shared.txt"));
+    takeRequest();
+    m_service->listDirectory(QStringLiteral("/repo"));
+    takeRequest();
+    m_service->resolvePath(image, QStringLiteral("/repo"));
+    takeRequest();
+    m_service->writeFile(QStringLiteral("/repo/shared.txt"), QStringLiteral("new"), QStringLiteral("r1"));
+    takeRequest();
+    QSignalSpy fileErrors(m_service, &MobileViewerService::fileError);
+    QSignalSpy directoryErrors(m_service, &MobileViewerService::directoryError);
+    QSignalSpy resolveErrors(m_service, &MobileViewerService::pathResolveError);
+    ScriptedDevice replacement;
+    m_client->setTransport(&replacement);
+    QVERIFY(fileErrors.isEmpty());
+    QVERIFY(directoryErrors.isEmpty());
+    QVERIFY(resolveErrors.isEmpty());
+    QVERIFY(m_service->cachedImageBytes(image).isEmpty());
+    QVERIFY(!QFile::exists(spool));
+
+    QSignalSpy imageReady(m_service, &MobileViewerService::imageReady);
+    m_service->requestImage(image);
+    QVERIFY(imageReady.isEmpty());
+    QVERIFY(!replacement.takeWritten().isEmpty());
+    m_client->setTransport(m_device);
+}
+
+void TstMobileViewers::webPoliciesUseUniqueSafeBootstrapMarkers()
+{
+    ch::MobileWebViewPolicy first;
+    ch::MobileWebViewPolicy second;
+    QVERIFY(first.marker() != second.marker());
+    QCOMPARE(first.marker().adjusted(QUrl::RemoveFragment), QUrl(QStringLiteral("about:blank")));
+    QCOMPARE(second.marker().adjusted(QUrl::RemoveFragment), QUrl(QStringLiteral("about:blank")));
+    QVERIFY(!first.ready());
+    QVERIFY(!second.ready());
+}
+
+void TstMobileViewers::aMissingNativeWebGuardNeverPublishesReady()
+{
+#if CH_HAVE_QTWEBVIEW && (defined(Q_OS_ANDROID) || defined(Q_OS_DARWIN))
+    QSKIP("native adapter behavior requires a real platform WebView");
+#else
+    QQuickWindow window;
+    QQuickItem view(window.contentItem());
+    ch::MobileWebViewPolicy policy;
+    bool everReady = false;
+    connect(&policy, &ch::MobileWebViewPolicy::statusChanged, &policy, [&] {
+        everReady = everReady || policy.ready();
+    });
+    policy.attach(&view);
+    QTRY_VERIFY(!policy.errorText().isEmpty());
+    QVERIFY(!policy.installing());
+    QVERIFY(!everReady);
+    QVERIFY(!policy.ready());
+#endif
+}
+
+void TstMobileViewers::twoViewerServicesOwnIndependentPdfSpools()
+{
+    const QString remote = QStringLiteral("/repo/shared.pdf");
+    QSignalSpy firstReady(m_service, &MobileViewerService::pdfReady);
+    m_service->requestPdf(remote);
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF first service"}});
+    QCOMPARE(firstReady.size(), 1);
+    const QString firstPath = firstReady.first().at(1).toUrl().toLocalFile();
+    const QString firstDirectory = QFileInfo(firstPath).absolutePath();
+    QString secondDirectory;
+    {
+        MobileViewerService second(m_client);
+        QVERIFY(QFile::exists(firstPath));
+        QSignalSpy secondReady(&second, &MobileViewerService::pdfReady);
+        second.requestPdf(remote);
+        respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                      {{"encoding", "utf-8"}, {"content", "%PDF second service"}});
+        QCOMPARE(secondReady.size(), 1);
+        const QString secondPath = secondReady.first().at(1).toUrl().toLocalFile();
+        secondDirectory = QFileInfo(secondPath).absolutePath();
+        QVERIFY(firstDirectory != secondDirectory);
+        QFile first(firstPath);
+        QVERIFY(first.open(QIODevice::ReadOnly));
+        QCOMPARE(first.readAll(), QByteArrayLiteral("%PDF first service"));
+        QFile other(secondPath);
+        QVERIFY(other.open(QIODevice::ReadOnly));
+        QCOMPARE(other.readAll(), QByteArrayLiteral("%PDF second service"));
+    }
+    QVERIFY(!QDir(secondDirectory).exists());
+    QVERIFY(QFile::exists(firstPath));
+    delete m_service;
+    m_service = nullptr;
+    QVERIFY(!QDir(firstDirectory).exists());
+}
+
+void TstMobileViewers::aPdfSpoolWriteFailurePublishesNothing()
+{
+    QSignalSpy ready(m_service, &MobileViewerService::pdfReady);
+    QSignalSpy errors(m_service, &MobileViewerService::pdfError);
+    m_service->requestPdf(QStringLiteral("/repo/first.pdf"));
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF original"}});
+    QCOMPARE(ready.size(), 1);
+    const QString firstPath = ready.first().at(1).toUrl().toLocalFile();
+    const QString directory = QFileInfo(firstPath).absolutePath();
+    const QString remote = QStringLiteral("/repo/blocked.pdf");
+    const QString target = directory + QLatin1Char('/')
+        + QString::fromLatin1(QCryptographicHash::hash(remote.toUtf8(), QCryptographicHash::Sha256).toHex())
+        + QStringLiteral(".pdf");
+    QVERIFY(QDir().mkdir(target)); // A real publication failure, with no mock I/O.
+    const QStringList before = QDir(directory).entryList(QDir::AllEntries | QDir::NoDotAndDotDot);
+    m_service->requestPdf(remote);
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF must not be published"}});
+    QCOMPARE(ready.size(), 1);
+    QCOMPARE(errors.size(), 1);
+    QCOMPARE(QDir(directory).entryList(QDir::AllEntries | QDir::NoDotAndDotDot), before);
+    QFile first(firstPath);
+    QVERIFY(first.open(QIODevice::ReadOnly));
+    QCOMPARE(first.readAll(), QByteArrayLiteral("%PDF original"));
+}
+
+void TstMobileViewers::aPdfSpoolPermissionFailurePublishesNothing()
+{
+#if !defined(Q_OS_UNIX)
+    QSKIP("owner permission enforcement is platform-specific");
+#else
+    QSignalSpy ready(m_service, &MobileViewerService::pdfReady);
+    QSignalSpy errors(m_service, &MobileViewerService::pdfError);
+    m_service->requestPdf(QStringLiteral("/repo/first.pdf"));
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF original"}});
+    QCOMPARE(ready.size(), 1);
+    const QString firstPath = ready.first().at(1).toUrl().toLocalFile();
+    const QString directory = QFileInfo(firstPath).absolutePath();
+    const auto permissions = QFileInfo(directory).permissions();
+    const auto restore = qScopeGuard([directory, permissions] {
+        QFile::setPermissions(directory, permissions);
+    });
+    QVERIFY(QFile::setPermissions(directory, QFileDevice::ReadOwner | QFileDevice::ExeOwner));
+    QFile probe(directory + QStringLiteral("/permission-probe"));
+    if (probe.open(QIODevice::WriteOnly)) {
+        probe.close();
+        probe.remove();
+        QSKIP("this user/filesystem bypasses directory write permissions");
+    }
+    m_service->requestPdf(QStringLiteral("/repo/denied.pdf"));
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"encoding", "utf-8"}, {"content", "%PDF denied"}});
+    QCOMPARE(ready.size(), 1);
+    QCOMPARE(errors.size(), 1);
+    QCOMPARE(QDir(directory).entryList(QDir::Files).size(), 1);
+    QVERIFY(QFile::exists(firstPath));
+#endif
 }
 
 // QGuiApplication, not QCoreApplication: MobileImageProvider decodes into a

@@ -222,6 +222,35 @@ test("URL-escaped destinations resolve once against raw POSIX document paths", (
     assert.equal(resolveRemotePath("/docs/README.md", "bad%ZZ.png"), "/docs/bad%ZZ.png");
 });
 
+test("directory links retain the remote viewer's directory marker", () => {
+    const dom = new JSDOM("");
+    const { window } = dom;
+    const root = parse(window, rewriteRelativeUrls(
+        renderMarkdown(
+            "[child](sub/)\n\n[parent](..)\n\n[current](.)\n\n"
+            + "[query](../?sort=name#files)\n\n[escaped](sub%2F)\n\n"
+            + "[dot](sub/%2e%2e)\n\n[file](sub/file.md)\n\n[root](/)",
+            sanitizerFor(window),
+        ),
+        "/repo/docs/readme.md",
+        window.document,
+    ));
+    assert.deepEqual(
+        Array.from(root.querySelectorAll("a"), (link) => link.getAttribute("href")),
+        [
+            "file:///repo/docs/sub/",
+            "file:///repo/",
+            "file:///repo/docs/",
+            "file:///repo/?sort=name#files",
+            "file:///repo/docs/sub/",
+            "file:///repo/docs/",
+            "file:///repo/docs/sub/file.md",
+            "file:///",
+        ],
+    );
+    dom.window.close();
+});
+
 test("no image can carry a source the host did not mint", () => {
     const dom = new JSDOM("");
     const { window } = dom;

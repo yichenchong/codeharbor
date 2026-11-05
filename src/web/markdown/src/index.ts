@@ -69,6 +69,7 @@ let mountedPath = "";
 let currentSource = "";
 let renderSerial = 0;
 let mountedToken = 0;
+let mountedFetch: AbortController | null = null;
 
 function isThemeColor(value: unknown): value is string {
     return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
@@ -191,15 +192,17 @@ declare global {
 
 window.showMarkdownError = showError;
 
-async function fetchMarkdown(sourceUrl: string): Promise<string> {
+async function fetchMarkdown(sourceUrl: string, signal: AbortSignal): Promise<string> {
     if (!/^codeharbor-internal:\/\/file\//i.test(sourceUrl)) {
         throw new Error("the Markdown source address is not internal");
     }
     const response = await fetch(sourceUrl, {
         credentials: "omit",
         redirect: "error",
+        signal,
     });
     if (!response.ok) {
+        await response.body?.cancel();
         throw new Error(`the remote file request failed (${response.status})`);
     }
     const contentLength = response.headers.get("content-length");
@@ -207,6 +210,7 @@ async function fetchMarkdown(sourceUrl: string): Promise<string> {
         const declaredLength = Number(contentLength);
         if (Number.isFinite(declaredLength)
             && declaredLength > MAX_MARKDOWN_BYTES) {
+            await response.body?.cancel();
             throw new Error("the Markdown file is too large to display");
         }
     }
@@ -258,6 +262,11 @@ export async function mountMarkdown(
     options: MarkdownMountOptions,
 ): Promise<MarkdownHost> {
     const token = ++mountedToken;
+    // Token invalidation comes first: abort can reject the previous mount's
+    // fetch, but that stale catch must not clear the new document or its status.
+    mountedFetch?.abort();
+    const controller = new AbortController();
+    mountedFetch = controller;
     mountedRoot = element;
     mountedBridge = bridge;
     mountedPath = options.documentPath;
@@ -267,7 +276,7 @@ export async function mountMarkdown(
     element.replaceChildren();
 
     try {
-        const source = await fetchMarkdown(options.sourceUrl);
+        const source = await fetchMarkdown(options.sourceUrl, controller.signal);
         // A second mount can begin before this fetch finishes. Only the
         // current mount may publish its source or trigger a render; an older
         // response must not overwrite the newer document.
@@ -282,6 +291,10 @@ export async function mountMarkdown(
             currentSource = "";
             element.replaceChildren();
             showError(`Unable to render Markdown: ${error instanceof Error ? error.message : "remote read failed"}`);
+        }
+    } finally {
+        if (mountedFetch === controller) {
+            mountedFetch = null;
         }
     }
 

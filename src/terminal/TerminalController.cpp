@@ -7,16 +7,16 @@
 #include <utility>
 
 namespace {
-// POSIX single-quote a value for safe interpolation into a shell command: wrap
-// it in single quotes and rewrite every embedded quote as the '\'' sequence, so
-// no quote, space, or metacharacter in a working directory or id can break out
-// of the quoting (SPEC 5.2). Without this a workingDir like /a'; rm -rf ~; ' or
-// an id carrying a quote would inject shell.
-QString shellSingleQuote(const QString &value)
+// tmux parses argv after the shell: a final ';' is a command separator, and
+// a preceding backslash is consumed as its escape. Insert ONE escape before
+// the final semicolon, preserving any original backslash, then POSIX-quote the
+// complete argument. Intentional standalone command separators never use this.
+QString tmuxShellQuote(QString value)
 {
-    QString escaped = value;
-    escaped.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
-    return QLatin1Char('\'') + escaped + QLatin1Char('\'');
+    if (value.endsWith(QLatin1Char(';')))
+        value.insert(value.size() - 1, QLatin1Char('\\'));
+    value.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+    return QLatin1Char('\'') + value + QLatin1Char('\'');
 }
 enum class EscapeState {
     Normal,
@@ -214,11 +214,14 @@ void TerminalController::ingestOutput(const QByteArray &bytes)
 {
     if (bytes.isEmpty())
         return; // empty output: nothing to buffer or flush
-    // Before the coalescing below, and unconditionally: this is the liveness
-    // signal, and a pane whose output is being buffered or held back is still
-    // producing (see the doc comment on outputReceived).
-    emit outputReceived();
+    // Store bytes before notifying observers: an observer can replace the
+    // transport and synchronously ingest its first redraw. That newer output
+    // must follow this batch, never overtake it in the pending buffer.
     m_pending.append(bytes);
+    const QPointer<TerminalController> self(this);
+    emit outputReceived();
+    if (!self || m_pending.isEmpty())
+        return;
     if (m_pending.size() >= kFlushSizeBytes) {
         flush(); // size threshold reached first
     } else if (!m_flushTimer.isActive()) {
@@ -235,6 +238,12 @@ void TerminalController::setTransport(QIODevice *transport)
         m_transport->disconnect(this);
 
     m_transport = transport;
+    const quint64 generation = ++m_transportGeneration;
+    const QPointer<TerminalController> self(this);
+    const QPointer<QIODevice> attachedTransport = m_transport;
+    emit transportChanged();
+    if (!self || m_transportGeneration != generation || m_transport != attachedTransport)
+        return;
     // m_pending/m_hidden survive on purpose: a reconnect swaps the channel
     // underneath the same pane and must not drop buffered scrollback.
 
@@ -250,6 +259,9 @@ void TerminalController::setTransport(QIODevice *transport)
     // geometry the renderer last reported so the pane does not snap back.
     if (m_columns > 0 && m_rows > 0)
         applyPtySize(m_columns, m_rows);
+    if (!self || !attachedTransport || m_transportGeneration != generation
+        || m_transport != attachedTransport)
+        return;
 
     // Drain whatever the transport buffered before we subscribed.
     if (m_transport->bytesAvailable() > 0)
@@ -275,7 +287,14 @@ void TerminalController::onTransportFinished()
 {
     // The final payload precedes readChannelFinished(); claim it before
     // reporting the drop so the last remote bytes still reach the pane.
+    const QPointer<TerminalController> self(this);
+    const QPointer<QIODevice> finishedTransport = m_transport;
+    const quint64 generation = m_transportGeneration;
     onTransportReadyRead();
+    // The final output notification can synchronously reconnect this pane.
+    // This EOF belongs only to the channel whose final bytes we just drained.
+    if (!self || m_transportGeneration != generation || m_transport != finishedTransport)
+        return;
 
     // A channel that ends under a live pane is a dropped connection (SPEC 5.6).
     // Only live states transition: an already Disconnected/Error pane must not
@@ -298,11 +317,13 @@ bool TerminalController::sendInput(const QByteArray &bytes)
     // tail of a multi-byte keystroke, typed into the user's shell.
     const QPointer<TerminalController> self(this);
     const QPointer<QIODevice> inputTransport = m_transport;
+    const quint64 generation = m_transportGeneration;
     qint64 sent = 0;
     while (sent < bytes.size()) {
         // A write can emit channelError synchronously. Its handler may detach
         // or replace the PTY; never send an old input suffix to that new shell.
-        if (!self || !inputTransport || m_transport != inputTransport)
+        if (!self || !inputTransport || m_transportGeneration != generation
+            || m_transport != inputTransport)
             return false;
         const qint64 written =
             inputTransport->write(bytes.constData() + sent, bytes.size() - sent);
@@ -681,8 +702,14 @@ void TerminalController::onAttachTimeout()
     // retried, which is what the pane's Retry action does. setState() emits the
     // transition and stops the timer; the signal only carries the reason out to
     // whoever writes the pane's message (TerminalFactory).
+    const QPointer<TerminalController> self(this);
+    const QPointer<QIODevice> timedOutTransport = m_transport;
+    const quint64 generation = m_transportGeneration;
     setState(TerminalState::Error);
-    emit attachTimedOut();
+    if (self && m_state == TerminalState::Error && m_transportGeneration == generation
+        && m_transport == timedOutTransport) {
+        emit attachTimedOut();
+    }
 }
 
 bool TerminalController::isLiveState(TerminalState state)
@@ -744,7 +771,8 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
                                                   const QString &workingDir,
                                                   const QString &devSessionId,
                                                   const QString &terminalId,
-                                                  const QString &controlSocket)
+                                                  const QString &controlSocket,
+                                                  const QString &agentSocket)
 {
     // SEVERAL tmux commands in ONE invocation, separated by escaped semicolons:
     // the shell unescapes `\;` into a literal `;` argument, which is tmux's own
@@ -792,39 +820,37 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
     // untouched). set-environment is issued as well so the attach case at least
     // corrects the SESSION environment — but that too only reaches processes
     // started AFTER it runs: the shell tmux is already running in keeps the
-    // environment it was forked with (also verified on 3.6). So a pane that is
-    // already live, and any agent already running in it, is NOT repaired by
-    // this; it takes a new session, a new window, or a newly started agent
-    // process. There is no tmux mechanism that would fix the others.
+    // environment it was forked with. Already-running shells/agents and new
+    // programs forked by those old shells are NOT repaired. Corrected values
+    // require a new shell/window/session created by tmux.
     //
     // `-e` on new-session and set-environment's value are both plain argv, so
     // the whole `NAME=value` (and the bare value) goes through the same shell
     // quoting as everything else here — an id is never interpolated bare.
     const bool identified = !devSessionId.isEmpty() && !terminalId.isEmpty();
-    const QString sessionTarget = shellSingleQuote(QLatin1Char('=') + target
+    const QString sessionTarget = tmuxShellQuote(QLatin1Char('=') + target
                                                    + QLatin1Char(':'));
+    // A tmux master can retain another window's routing/provenance variables.
+    // Empty -e values suppress inheritance BEFORE the first shell is forked;
+    // later set-environment commands cannot repair that shell's environment.
+    const QString empty;
+    struct ManagedVariable {
+        QString name;
+        const QString* value;
+    };
+    const ManagedVariable variables[]{
+        {QStringLiteral("OMP_DEV_SESSION_ID"), identified ? &devSessionId : &empty},
+        {QStringLiteral("OMP_TERMINAL_ID"), identified ? &terminalId : &empty},
+        {QStringLiteral("CODEHARBOR_CONTROL_SOCKET"), identified ? &controlSocket : &empty},
+        {QStringLiteral("CODEHARBOR_AGENT_SOCKET"), identified ? &agentSocket : &empty},
+    };
     QString command =
         QStringLiteral("tmux new-session -A -s %1 -c %2")
-            .arg(shellSingleQuote(target), shellSingleQuote(workingDir));
-    // The control socket rides with them when the server reported one. It is a
-    // THIRD, separate variable rather than part of the identity pair because it
-    // answers a different question: the pair says WHICH pane this is, and this
-    // says WHICH WINDOW's daemon owns it. A pane may legitimately have the pair
-    // and no socket — an older server, or one whose bind failed — and an agent
-    // there must be told that, not routed to a guessed path where it would drive
-    // somebody else's window.
-    const bool controllable = !controlSocket.isEmpty();
-    if (identified) {
-        command += QStringLiteral(" -e %1 -e %2")
-                       .arg(shellSingleQuote(QStringLiteral("OMP_DEV_SESSION_ID=")
-                                             + devSessionId),
-                            shellSingleQuote(QStringLiteral("OMP_TERMINAL_ID=")
-                                             + terminalId));
-        if (controllable) {
-            command += QStringLiteral(" -e %1")
-                           .arg(shellSingleQuote(QStringLiteral("CODEHARBOR_CONTROL_SOCKET=")
-                                                 + controlSocket));
-        }
+            .arg(tmuxShellQuote(target), tmuxShellQuote(workingDir));
+    for (const ManagedVariable& variable : variables) {
+        command += QStringLiteral(" -e %1")
+                       .arg(tmuxShellQuote(variable.name + QLatin1Char('=')
+                                             + *variable.value));
     }
     command += QStringLiteral(" \\; set-option -t %1 mouse on").arg(sessionTarget);
     // SPEC 2.2's promise, defended against the user's own tmux configuration.
@@ -861,28 +887,18 @@ QString TerminalController::tmuxNewSessionCommand(const QString &target,
     // one-time transition, so it is deliberately not done.
     command += QStringLiteral(" \\; set-option -t %1 destroy-unattached off")
                    .arg(sessionTarget);
-    if (identified) {
-        command += QStringLiteral(" \\; set-environment -t %1 OMP_DEV_SESSION_ID %2")
-                       .arg(sessionTarget, shellSingleQuote(devSessionId));
-        command += QStringLiteral(" \\; set-environment -t %1 OMP_TERMINAL_ID %2")
-                       .arg(sessionTarget, shellSingleQuote(terminalId));
-        // The socket is REFRESHED on every attach, and it has to be: the path
-        // belongs to one daemon, and a reconnect (or a relaunch) is a NEW daemon
-        // with a new one. `-e` above is ignored for a session that already exists,
-        // so this is the only thing that corrects it — for agents started after
-        // the attach. One already running keeps the old path, which now resolves
-        // to nothing and is reported as an unreachable server rather than being
-        // silently routed to whatever bound it since; that is why the path carries
-        // a random token rather than a reusable pid.
-        //
-        // UNSET rather than left stale when the server reported no socket, so a
-        // pane cannot keep pointing at a dead daemon's path across a downgrade.
-        if (controllable) {
-            command += QStringLiteral(" \\; set-environment -t %1 CODEHARBOR_CONTROL_SOCKET %2")
-                           .arg(sessionTarget, shellSingleQuote(controlSocket));
+    // Session-local updates reach future tmux-created children only. They
+    // cannot rewrite an existing shell or a program forked by that old shell.
+    // -r deliberately suppresses a missing value from BOTH session and master
+    // environment; -u alone would expose a stale master's value again.
+    for (const ManagedVariable& variable : variables) {
+        if (variable.value->isEmpty()) {
+            command += QStringLiteral(" \\; set-environment -r -t %1 %2")
+                           .arg(sessionTarget, variable.name);
         } else {
-            command += QStringLiteral(" \\; set-environment -u -t %1 CODEHARBOR_CONTROL_SOCKET")
-                           .arg(sessionTarget);
+            command += QStringLiteral(" \\; set-environment -t %1 %2 %3")
+                           .arg(sessionTarget, variable.name,
+                                tmuxShellQuote(*variable.value));
         }
     }
     return command;

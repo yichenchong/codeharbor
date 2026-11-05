@@ -299,11 +299,9 @@ public:
     ServerProfiles* serverProfiles() const { return m_profiles; }
     QObject* settings() const { return nullptr; }
 
-    Q_INVOKABLE void connectToProfile(const QString& id) { connectRequests.append(id); }
     Q_INVOKABLE void disconnectServer() { ++disconnectRequests; }
     Q_INVOKABLE void upgradeRemoteService(const QString& id) { upgradeRequests.append(id); }
 
-    QStringList connectRequests;
     QStringList upgradeRequests;
     int disconnectRequests = 0;
 
@@ -331,6 +329,7 @@ private slots:
     void handEditedStoreIsRepairedOnLoad();
     void outOfRangeStoredPortsAreRepairedNotTruncated();
     void fractionalAndBooleanPortsAreRejected();
+    void wideIntegerPortsCannotWrapIntoTheValidRange();
     void secretsInTheCallersMapNeverReachTheStore();
     void aSecondWritersProfileSurvivesEveryMutation();
     void aDeletionIsNeverResurrectedByTheMerge();
@@ -341,6 +340,8 @@ private slots:
     void aSaveThatCannotTakeTheLockStillSavesAndSaysSo();
     void aStaleLockFromADeadHolderDoesNotWedgeTheStore();
     void aFirstRunWithNoConfigDirectoryLocksSilently();
+    void failedWritesAreReportedAndCanBeRetried();
+    void aFailedUnlockedWriteDoesNotClaimItWasSaved();
     void blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad();
     void hostAndUserWithEmbeddedWhitespaceAreNotProfiles();
     void aSaveDegradedHandlerMayMutateTheStore();
@@ -962,6 +963,43 @@ void TstServerProfiles::fractionalAndBooleanPortsAreRejected()
                 .isEmpty());
 }
 
+void TstServerProfiles::wideIntegerPortsCannotWrapIntoTheValidRange()
+{
+    const QString path = iniPath(QStringLiteral("wide-ports.ini"));
+    const QList<QVariant> invalidPorts = {
+        QVariant::fromValue((qlonglong{1} << 32) + 2222),
+        QVariant::fromValue(-(qlonglong{1} << 32) + 2222),
+        QVariant::fromValue((qulonglong{1} << 63) + 2222),
+    };
+    ServerProfiles store(path);
+    const QString id = store.addProfile(profileFields(
+        QStringLiteral("valid"), QStringLiteral("host"), 2022,
+        QStringLiteral("user")));
+    QVERIFY(!id.isEmpty());
+    QSignalSpy changed(&store, &ServerProfiles::profilesChanged);
+
+    for (const QVariant& port : invalidPorts) {
+        QVERIFY(store.addProfile(profileFields(
+            QStringLiteral("invalid"), QStringLiteral("host"), port,
+            QStringLiteral("user"))).isEmpty());
+        store.updateProfile(id, QVariantMap{{QStringLiteral("port"), port}});
+        QCOMPARE(store.profile(id).value(QStringLiteral("port")).toInt(), 2022);
+    }
+    QCOMPARE(changed.count(), 0);
+    QCOMPARE(store.profiles().size(), 1);
+
+    // QSettings may retain native integer types in its shared store, including
+    // values supplied by a different writer. Repair those on the read side too.
+    QSettings raw(path, QSettings::IniFormat);
+    for (qsizetype i = 0; i < invalidPorts.size(); ++i) {
+        raw.setValue(QStringLiteral("servers/") + id + QStringLiteral("/port"),
+                     invalidPorts.at(i));
+        raw.sync();
+        ServerProfiles reopened(path);
+        QCOMPARE(reopened.profile(id).value(QStringLiteral("port")).toInt(), 22);
+    }
+}
+
 // The store is the one file on disk that says how to REACH a machine, and it
 // must never say how to AUTHENTICATE to it. addProfile()/updateProfile() take a
 // free-form map straight from QML, and the realistic way a secret gets in is not
@@ -1513,6 +1551,65 @@ void TstServerProfiles::aFirstRunWithNoConfigDirectoryLocksSilently()
     QCOMPARE(reader.activeId(), id);
 }
 
+void TstServerProfiles::failedWritesAreReportedAndCanBeRetried()
+{
+    // A directory is not a settings file, regardless of the test user's
+    // privileges. Do not rely on chmod denying access when running as root.
+    const QString path = iniPath(QStringLiteral("blocked-by-directory.ini"));
+    QVERIFY(QDir().mkdir(path));
+    ServerProfiles store(path);
+    QSignalSpy failed(&store, &ServerProfiles::saveFailed);
+    QSignalSpy degraded(&store, &ServerProfiles::saveDegraded);
+    bool reacquiredLock = false;
+    bool repaired = false;
+    connect(&store, &ServerProfiles::saveFailed, this, [&](const QString&) {
+        QLockFile lock(path + QStringLiteral(".merge-lock"));
+        reacquiredLock = lock.tryLock(0);
+        if (reacquiredLock)
+            lock.unlock();
+        repaired = QDir().rmdir(path);
+        if (!repaired)
+            return;
+        const QString id =
+            store.profiles().first().toMap().value(QStringLiteral("id")).toString();
+        store.updateProfile(id,
+                            QVariantMap{{QStringLiteral("name"), QStringLiteral("retried")}});
+    });
+
+    const QString id = store.addProfile(profileFields(
+        QStringLiteral("first"), QStringLiteral("host"), 22, QStringLiteral("user")));
+    QVERIFY(!id.isEmpty()); // The working in-memory profile is not discarded.
+    QCOMPARE(failed.count(), 1);
+    QVERIFY(failed.first().first().toString().contains(path));
+    QVERIFY(degraded.isEmpty());
+    QVERIFY(reacquiredLock); // Failure callbacks run after unlocking.
+    QVERIFY(repaired);
+
+    ServerProfiles reopened(path);
+    QCOMPARE(reopened.profile(id).value(QStringLiteral("name")).toString(),
+             QStringLiteral("retried"));
+    QCOMPARE(reopened.activeId(), id);
+}
+
+void TstServerProfiles::aFailedUnlockedWriteDoesNotClaimItWasSaved()
+{
+    const QString path = iniPath(QStringLiteral("unlocked-directory.ini"));
+    QVERIFY(QDir().mkdir(path));
+    QLockFile blocker(path + QStringLiteral(".merge-lock"));
+    QVERIFY(blocker.tryLock(0));
+    ServerProfiles store(path);
+    QSignalSpy failed(&store, &ServerProfiles::saveFailed);
+    QSignalSpy degraded(&store, &ServerProfiles::saveDegraded);
+
+    QVERIFY(!store.addProfile(profileFields(
+        QStringLiteral("first"), QStringLiteral("host"), 22,
+        QStringLiteral("user"))).isEmpty());
+
+    QCOMPARE(failed.count(), 1);
+    QVERIFY(degraded.isEmpty());
+    QVERIFY(QFileInfo(path).isDir());
+}
+
 // Read-side counterpart to addRejectsInputThatCouldNeverConnect(): the save
 // path refuses to store a profile with no host or no user, so a store that has
 // one has been hand edited (or written by something that is not this class).
@@ -1972,8 +2069,11 @@ void TstServerProfiles::sheetEmitsConnectAndRemoveForTheSelection()
     QObject* const dialog = root->findChild<QObject*>(QStringLiteral("serverDeleteDialog"));
     QVERIFY(connectButton && deleteButton && dialog);
     QVERIFY(connectButton->property("enabled").toBool());
+    QSignalSpy connectRequested(root, SIGNAL(connectRequested(QString)));
+    QVERIFY(connectRequested.isValid());
     QMetaObject::invokeMethod(connectButton, "clicked");
-    QCOMPARE(app.connectRequests, QStringList({id}));
+    QCOMPARE(connectRequested.count(), 1);
+    QCOMPARE(connectRequested.first().first().toString(), id);
 
     QMetaObject::invokeMethod(deleteButton, "clicked");
     QVERIFY(dialog->property("visible").toBool());
@@ -2356,8 +2456,11 @@ void TstServerProfiles::coldStartAddsAServerThenFindsItAgainAfterRelaunch()
         QCOMPARE(store.activeId(), storedId);
         QObject* const connect = root->findChild<QObject*>(QStringLiteral("serverConnectButton"));
         QVERIFY(connect && connect->property("enabled").toBool());
+        QSignalSpy connectRequested(root, SIGNAL(connectRequested(QString)));
+        QVERIFY(connectRequested.isValid());
         QMetaObject::invokeMethod(connect, "clicked");
-        QCOMPARE(app.connectRequests, QStringList({storedId}));
+        QCOMPARE(connectRequested.count(), 1);
+        QCOMPARE(connectRequested.first().first().toString(), storedId);
         CH_ASSERT_SILENT();
     }
 

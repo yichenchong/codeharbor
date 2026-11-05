@@ -17,8 +17,8 @@
 
 #include <QtTest/QtTest>
 
+#include <QAccessible>
 #include <QBuffer>
-#include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
@@ -40,6 +40,7 @@
 #include <QTemporaryDir>
 #include <QVariant>
 
+#include <algorithm>
 #include <cmath>
 
 #include "EditorFactory.h"
@@ -64,6 +65,17 @@ QyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIwAAAJDD6ACHw+gA
 hwAAAAtzc2gtZWQyNTUxOQAAACCFPLr0I6E8+7CRLJi8cjh4SciVWMEXlHzF/IIDXFBLIw
 AAAEB/HxJkLwbaZm48TCAx96WJuyrDUfAUyv9wZzQGfttws4U8uvQjoTz7sJEsmLxyOHhJ
 yJVYwReUfMX8ggNcUEsjAAAAB2NoLXRlc3QBAgMEBQY=
+-----END OPENSSH PRIVATE KEY-----
+)";
+
+// Disposable encrypted key from tst_mobilekeystore; passphrase is hunter2.
+constexpr auto kShellEncryptedKey = R"(-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABBTcp/M3c
+nNn8Oi2dZiw75dAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIG6EvZuUuzjzQAl2
+i6zHx+GGi4sIsm/e4YX+jRcSrliZAAAAkFIE5FM8xmyrcq/l69BabypTNlP65vuiNTz34Z
+chBfcnKG4McfNNHZdw1TZeacl72vjmFrpAN63bN4HahCvsh+HgoDrgMHRMc39pEQT5EAAn
+EqEzoQ7YsS3Tm6EYunq0XQL0Z8bTlNDGAnTWAZINad542hKZgGDVOkLtxEcWO9HhtJMzxN
+oWZnUXt+al/XIEiA==
 -----END OPENSSH PRIVATE KEY-----
 )";
 
@@ -343,7 +355,7 @@ QByteArray pngBytes()
 }
 
 #if CH_HAVE_QTPDF
-QByteArray linkedPdfBytes()
+QByteArray linkedPdfBytes(int firstPageHeight = 400)
 {
     // The left half of page one is a URI annotation; the right half links to
     // page two. Explicit xref offsets make this a complete, decodable PDF.
@@ -353,8 +365,9 @@ QByteArray linkedPdfBytes()
     const QList<QByteArray> objects{
         "<< /Type /Catalog /Pages 2 0 R >>",
         "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>",
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] "
-        "/Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R /Annots [7 0 R 8 0 R] >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 "
+            + QByteArray::number(firstPageHeight)
+            + "] /Resources << /Font << /F1 9 0 R >> >> /Contents 4 0 R /Annots [7 0 R 8 0 R] >>",
         "<< /Length " + QByteArray::number(textStream.size()) + " >>\nstream\n"
             + textStream + "endstream",
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Contents 6 0 R >>",
@@ -435,6 +448,36 @@ public slots:
     void record(const QUrl &url) { urls.append(url); }
 };
 
+class ConnectionAttemptState : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(QString connectionState READ state NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString statusText READ statusText CONSTANT)
+public:
+    QString state() const { return m_state; }
+    QString statusText() const { return {}; }
+    void setState(const QString &state)
+    {
+        m_state = state;
+        emit connectionStateChanged();
+    }
+    QList<QVariantMap> credentialReplies;
+    QList<bool> trustReplies;
+    Q_INVOKABLE void submitCredential(QString secret, QString kind)
+    {
+        credentialReplies.append({{QStringLiteral("secret"), secret},
+                                  {QStringLiteral("kind"), kind}});
+    }
+    Q_INVOKABLE void acceptHostKey(bool trusted) { trustReplies.append(trusted); }
+    Q_INVOKABLE void connectToServer(QVariantMap profile) { emit connectionRequested(profile); }
+signals:
+    void connectionStateChanged();
+    void credentialPrompt(QString user, QString host, QString prompt, QString kind);
+    void hostKeyPrompt(QString host, QString fingerprint, QString keyType);
+    void connectionRequested(QVariantMap profile);
+private:
+    QString m_state = QStringLiteral("disconnected");
+};
+
 class TstMobileShell : public QObject {
     Q_OBJECT
 private slots:
@@ -453,7 +496,7 @@ private slots:
     void aTerminalLeafLoadsTheTerminalPage();
     void aMarkdownLeafLoadsTheMarkdownPage();
     void paneNavigationPreservesReservedFilenameCharacters();
-    void aWebLeafLoadsItsAddressAndClosesBackToThePicker();
+    void aWebLeafKeepsItsAddressAndClosesBackToThePicker();
     void anUnknownKindLandsOnTheUnsupportedPage();
     void onlyOnePaneIsEverLoaded();
     void backFromThePaneUnloadsIt();
@@ -488,7 +531,26 @@ private slots:
     // those two disagree fails at link time with nothing pointing at the cause.
     void thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies();
     void pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork();
-    void aNavigationToANonHttpAddressIsRefusedAndSaidSo();
+    void aWebPageWithoutNativePolicyRefusesToLoadAndExplainsWhy();
+    void revisitingATextPathDoesNotAcceptItsPreviousRead();
+    void pdfRastersStayBoundedForTallPagesAtMaximumZoom();
+    void markdownImagePrototypeNamesResolveAndLoad_data();
+    void markdownImagePrototypeNamesResolveAndLoad();
+    void markdownLinksAndImagesExposeWorkingAccessibility();
+    void markdownRefusalReasonsUpdateTheVisibleAltText();
+    void nestedMarkdownQuotesRetainTheirIndentation();
+    void deepMarkdownIndentationKeepsTextReadable_data();
+    void deepMarkdownIndentationKeepsTextReadable();
+    void completedConnectionAttemptsForgetUnusedPassphrases_data();
+    void completedConnectionAttemptsForgetUnusedPassphrases();
+    void queuedEditorSavesKeepNewerEditsUnsaved();
+    void aCleanQueuedEditorSaveAllowsLaterExternalReload();
+    void settledAttemptsClosePromptDialogsAndRetireTheirResponses_data();
+    void settledAttemptsClosePromptDialogsAndRetireTheirResponses();
+    void connectingWhilePassphraseIsFocusedTransfersItBeforeDialing();
+    void lateRecoveryScopeKeepsEditsAndSeparatesSnapshotTargets();
+    void recoveryOffersRetireWhenTheirScopeOrDocumentChanges_data();
+    void recoveryOffersRetireWhenTheirScopeOrDocumentChanges();
 
 private:
     // One engine per case: the shell keeps per-session state, and a case that
@@ -563,6 +625,8 @@ private:
                 QStringLiteral("viewerService"), &viewers);
             engine.rootContext()->setContextProperty(
                 QStringLiteral("editorFactory"), &editors);
+            engine.addImageProvider(MobileImageProvider::providerId(),
+                                    viewers.createImageProvider());
 
             const QString source =
                 QStringLiteral("import QtQuick\n"
@@ -1463,7 +1527,7 @@ void TstMobileShell::paneNavigationPreservesReservedFilenameCharacters()
     QCOMPARE(host->property("currentUrl").toUrl(), persisted);
 }
 
-void TstMobileShell::aWebLeafLoadsItsAddressAndClosesBackToThePicker()
+void TstMobileShell::aWebLeafKeepsItsAddressAndClosesBackToThePicker()
 {
 #if !CH_HAVE_QTWEBVIEW
     QSKIP("this build has no Qt WebView, so ViewerWebPage is not in the QML module");
@@ -1909,6 +1973,8 @@ void TstMobileShell::leavingADirtyBufferAsksFirstAndKeepsNamingTheOpenFile()
 {
     PageHost host(QStringLiteral("ViewerEditorPage"),
                   QStringLiteral("remotePath: \"/repo/a.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
                                  "        paneId: \"p1\""));
     QVERIFY(showPage(host));
     QQuickItem *page = host.page();
@@ -1953,6 +2019,8 @@ void TstMobileShell::aLoadLandingOnADirtyBufferKeepsTheEditsAndFlagsAConflict()
 {
     PageHost host(QStringLiteral("ViewerEditorPage"),
                   QStringLiteral("remotePath: \"/repo/a.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
                                  "        paneId: \"p1\""));
     QVERIFY(showPage(host));
     QQuickItem *page = host.page();
@@ -1985,6 +2053,8 @@ void TstMobileShell::anEditMadeWhileASaveIsInFlightStaysUnsaved()
 {
     PageHost host(QStringLiteral("ViewerEditorPage"),
                   QStringLiteral("remotePath: \"/repo/a.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
                                  "        paneId: \"p1\""));
     QVERIFY(showPage(host));
     QQuickItem *page = host.page();
@@ -2026,13 +2096,15 @@ void TstMobileShell::theFirstKeystrokeIsReportedWithoutWaitingForTheDebounce()
 {
     PageHost host(QStringLiteral("ViewerEditorPage"),
                   QStringLiteral("remotePath: \"/repo/a.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
                                  "        paneId: \"p1\""));
     QVERIFY(showPage(host));
     QQuickItem *page = host.page();
     QVERIFY(openEditor(page, QStringLiteral("one"), QStringLiteral("r1"),
                        host.requests(), host.fixture.transport));
-    // Recovery is keyed by the server-reported directory and this pane's id;
-    // without a directory the snapshot is disabled and writes nothing.
+    // Recovery requires both a server-reported directory and this explicit
+    // accepted server/session/pane context, not a globally reused raw pane key.
     host.editors.setRecoveryDir(QStringLiteral("/srv/recovery"));
     host.requests();
 
@@ -2043,7 +2115,9 @@ void TstMobileShell::theFirstKeystrokeIsReportedWithoutWaitingForTheDebounce()
     const QVector<QJsonObject> writes =
         requestsFor(host.requests(), rpc::kMethodWriteFile);
     QCOMPARE(writes.size(), 1);
-    QCOMPARE(requestPath(writes.at(0)), QStringLiteral("/srv/recovery/p1"));
+    const QString recoveryPath = requestPath(writes.at(0));
+    QVERIFY(recoveryPath.startsWith(QStringLiteral("/srv/recovery/")));
+    QVERIFY(recoveryPath != QStringLiteral("/srv/recovery/p1"));
     // And it was not the debounce that did it: the timer never started.
     QObject *timer = page->findChild<QObject *>(QStringLiteral("recoverySnapshotTimer"));
     QVERIFY(timer);
@@ -2293,23 +2367,13 @@ void TstMobileShell::thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies()
 #if !CH_HAVE_QTPDF
     QSKIP("this build has no Qt Pdf, so ViewerPdfPage is not in the QML module");
 #else
-    const QString spoolDir =
-        QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
-        + QStringLiteral("/pdf-spool");
-    const auto spoolFor = [&spoolDir](const QString &path) {
-        // The service names the file by a digest of the remote path, never by
-        // its basename: a server-controlled name must not choose a filename on
-        // this device.
-        return spoolDir + QLatin1Char('/')
-               + QString::fromLatin1(
-                   QCryptographicHash::hash(path.toUtf8(),
-                                            QCryptographicHash::Sha256)
-                       .toHex())
-               + QStringLiteral(".pdf");
-    };
+    const QDir cache(QStandardPaths::writableLocation(QStandardPaths::CacheLocation));
+    const QStringList before = cache.entryList({QStringLiteral("pdf-spool-*")},
+        QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
 
     PageHost host(QStringLiteral("ViewerPdfPage"),
                   QStringLiteral("remotePath: \"/repo/a.pdf\""));
+    QSignalSpy pdfReady(&host.viewers, &MobileViewerService::pdfReady);
     QVERIFY(showPage(host));
     QQuickItem *page = host.page();
 
@@ -2325,30 +2389,35 @@ void TstMobileShell::thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies()
     QCOMPARE(requestPath(live.at(0)), QStringLiteral("/repo/b.pdf"));
     host.deliver(byteReadFrame(requestId(reads.at(0)),
                                QByteArrayLiteral("%PDF-1.4\n")));
-    QVERIFY2(!QFile::exists(spoolFor(QStringLiteral("/repo/a.pdf"))),
-             "a released request still wrote its document into the cache");
+    QVERIFY(pdfReady.isEmpty());
+    QCOMPARE(cache.entryList({QStringLiteral("pdf-spool-*")},
+        QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name), before);
 
     // The live one does produce a file.
     host.deliver(byteReadFrame(requestId(live.at(0)),
                                QByteArrayLiteral("%PDF-1.4\n")));
-    QVERIFY(QFile::exists(spoolFor(QStringLiteral("/repo/b.pdf"))));
+    QCOMPARE(pdfReady.size(), 1);
+    const QString secondSpool = pdfReady.last().at(1).toUrl().toLocalFile();
+    QVERIFY(QFile::exists(secondSpool));
 
     // Moving on releases the document that was on screen.
     page->setProperty("remotePath", QStringLiteral("/repo/c.pdf"));
-    QVERIFY2(!QFile::exists(spoolFor(QStringLiteral("/repo/b.pdf"))),
+    QVERIFY2(!QFile::exists(secondSpool),
              "the previous document was left in the cache");
 
     reads = requestsFor(host.requests(), rpc::kMethodReadFile);
     QCOMPARE(reads.size(), 1);
     host.deliver(byteReadFrame(requestId(reads.at(0)),
                                QByteArrayLiteral("%PDF-1.4\n")));
-    QVERIFY(QFile::exists(spoolFor(QStringLiteral("/repo/c.pdf"))));
+    QCOMPARE(pdfReady.size(), 2);
+    const QString thirdSpool = pdfReady.last().at(1).toUrl().toLocalFile();
+    QVERIFY(QFile::exists(thirdSpool));
 
     // And so does the pane going away. Only the QML object graph is destroyed
     // here: the service outlives it, so this is the PAGE releasing the file and
     // not the service's destructor purging the whole directory.
     host.root.reset();
-    QVERIFY2(!QFile::exists(spoolFor(QStringLiteral("/repo/b.pdf"))),
+    QVERIFY2(!QFile::exists(thirdSpool),
              "the document outlived the pane that was showing it");
 #endif
 }
@@ -2417,37 +2486,30 @@ void TstMobileShell::pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork()
 #endif
 }
 
-// A loaded page can navigate itself — a tapped link, a redirect, a meta refresh —
-// and QtWebView has no request interceptor, so the start of the load is the
-// earliest point this client can act. A file:// destination there would have the
-// platform web view render the app's own sandbox (SPEC 7.4).
-void TstMobileShell::aNavigationToANonHttpAddressIsRefusedAndSaidSo()
+// A missing native guard must be an actual visible refusal, not a load followed
+// by a QML stop(). Native mobile navigation behavior needs platform-level gates.
+void TstMobileShell::aWebPageWithoutNativePolicyRefusesToLoadAndExplainsWhy()
 {
 #if !CH_HAVE_QTWEBVIEW
-    QSKIP("this build has no Qt WebView, so ViewerWebPage is not in the QML "
-          "module");
+    QSKIP("this build has no Qt WebView");
+#elif defined(Q_OS_ANDROID) || defined(Q_OS_DARWIN)
+    QSKIP("this platform has a native policy adapter");
 #else
+    const QString address = QStringLiteral("https://example.invalid/not-loaded");
     PageHost host(QStringLiteral("ViewerWebPage"),
-                  QStringLiteral("webUrl: \"https://example.com/\""));
+                  QStringLiteral("webUrl: \"https://example.invalid/not-loaded\""));
     QVERIFY(showPage(host));
-    QQuickItem *page = host.page();
-
-    const QString refused = QStringLiteral("file:///data/data/app/secrets");
-    QVERIFY(callQmlFunction(page, "noteNavigation", refused));
-    QCOMPARE(page->property("refusedNavigation").toString(), refused);
-    QQuickItem *banner = findItemShowing(
-        page,
-        QStringLiteral("This page tried to open an address that is not http or "
-                       "https, and was stopped: %1").arg(refused));
-    QVERIFY2(banner, "the refusal is not shown anywhere");
-    QVERIFY(banner->isVisible());
-
-    // An allowed destination clears it: a refusal must not outlive the page it
-    // happened on.
-    QVERIFY(callQmlFunction(page, "noteNavigation",
-                            QStringLiteral("https://example.com/next")));
-    QCOMPARE(page->property("refusedNavigation").toString(), QString());
-    QVERIFY(!banner->isVisible());
+    QObject *policy = host.page()->findChild<QObject *>(QStringLiteral("mobileWebViewPolicy"));
+    QVERIFY(policy);
+    QTRY_VERIFY(!policy->property("errorText").toString().isEmpty());
+    QVERIFY(!policy->property("ready").toBool());
+    auto *web = host.page()->findChild<QQuickItem *>(QStringLiteral("mobileWebView"));
+    QVERIFY(web);
+    QVERIFY(web->property("url").toUrl() != QUrl(address));
+    QVERIFY(!web->isVisible());
+    QQuickItem *explanation = findItemShowing(host.page(), policy->property("errorText").toString());
+    QVERIFY(explanation);
+    QVERIFY(explanation->isVisible());
 #endif
 }
 
@@ -2747,6 +2809,752 @@ void TstMobileShell::editingThePasteBoxKeepsTheCursorInView()
     QVERIFY2(sheet->property("height").toReal()
                  <= window->contentItem()->height() - 32.0 + 0.5,
              "the sheet outgrew the screen while following the cursor");
+}
+
+void TstMobileShell::revisitingATextPathDoesNotAcceptItsPreviousRead()
+{
+    PageHost host(QStringLiteral("ViewerTextPage"),
+                  QStringLiteral("remotePath: \"/repo/a.txt\""));
+    QVERIFY(showPage(host));
+    auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    const int oldA = requestId(reads.first());
+    host.page()->setProperty("remotePath", QStringLiteral("/repo/b.txt"));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    const int oldB = requestId(reads.first());
+    host.page()->setProperty("remotePath", QStringLiteral("/repo/a.txt"));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(oldA, QStringLiteral("stale A"), QStringLiteral("r1")));
+    host.deliver(textReadFrame(oldB, QStringLiteral("stale B"), QStringLiteral("r1")));
+    QVERIFY(host.page()->property("loading").toBool());
+    QVERIFY(!findItemShowing(host.page(), QStringLiteral("stale A")));
+    host.deliver(textReadFrame(requestId(reads.first()), QStringLiteral("current A"),
+                               QStringLiteral("r2")));
+    QTRY_VERIFY(findItemShowing(host.page(), QStringLiteral("current A")));
+    QVERIFY(!host.page()->property("loading").toBool());
+}
+
+void TstMobileShell::pdfRastersStayBoundedForTallPagesAtMaximumZoom()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/tall.pdf\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), linkedPdfBytes(40000)));
+    QQuickItem *view = host.page()->findChild<QQuickItem *>(QStringLiteral("pdfView"));
+    QVERIFY(view);
+    QTRY_COMPARE(view->property("count").toInt(), 2);
+    view->setProperty("zoom", 8);
+    view->setProperty("renderedZoom", 8);
+    QQuickItem *image = nullptr;
+    QTRY_VERIFY((image = findItem(host.page(), [](QQuickItem *item) {
+        return item->objectName() == QLatin1String("pdfPageImage")
+               && item->property("currentFrame").toInt() == 0
+               && item->property("status").toInt() == 1;
+    })));
+    const QSize raster = image->property("sourceSize").toSize();
+    QVERIFY(raster.width() > 0 && raster.height() > 0);
+    QVERIFY(raster.width() <= 8192 && raster.height() <= 8192);
+    QVERIFY(qint64(raster.width()) * raster.height() <= 16 * qint64(1024 * 1024));
+    QVERIFY(std::isfinite(view->property("contentHeight").toReal()));
+#endif
+}
+
+void TstMobileShell::markdownImagePrototypeNamesResolveAndLoad_data()
+{
+    QTest::addColumn<QString>("name");
+    QTest::newRow("constructor") << QStringLiteral("constructor");
+    QTest::newRow("toString") << QStringLiteral("toString");
+    QTest::newRow("__proto__") << QStringLiteral("__proto__");
+}
+
+void TstMobileShell::markdownImagePrototypeNamesResolveAndLoad()
+{
+    QFETCH(QString, name);
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\"\n"
+                                 "        repoRoot: \"/repo\""));
+    QVERIFY(showPage(host));
+    auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.first()),
+                               QStringLiteral("![named image](%1)\n").arg(name),
+                               QStringLiteral("r1")));
+    QTRY_VERIFY(host.page()->property("imagePending").value<QJSValue>().property(name).isString());
+    const auto resolves = requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(resolves.size(), 1);
+    const QString path = QStringLiteral("/repo/") + name;
+    host.deliver(resolveFrame(requestId(resolves.first()), path, true));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    QCOMPARE(requestPath(reads.first()), path);
+    host.deliver(byteReadFrame(requestId(reads.first()), pngBytes()));
+    QTRY_VERIFY(findItem(host.page(), [](QQuickItem *item) {
+        return item->objectName() == QLatin1String("markdownImage")
+               && item->property("status").toInt() == 1 && item->isVisible();
+    }));
+}
+
+void TstMobileShell::markdownLinksAndImagesExposeWorkingAccessibility()
+{
+    const bool accessibilityWasActive = QAccessible::isActive();
+    const auto restoreAccessibility = qScopeGuard([accessibilityWasActive] {
+        QAccessible::setActive(accessibilityWasActive);
+    });
+    QAccessible::setActive(true);
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\"\n"
+                                 "        repoRoot: \"/repo\""));
+    QVERIFY(showPage(host));
+    auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.first()),
+                               QStringLiteral("[Documentation](other.md)\n\n![Build status](badge.png)\n"),
+                               QStringLiteral("r1")));
+    QQuickItem *link = nullptr;
+    QTRY_VERIFY((link = findItem(host.page(), [](QQuickItem *item) {
+        if (item->objectName() != QLatin1String("markdownInlineRun"))
+            return false;
+        const QAccessibleInterface *accessible = QAccessible::queryAccessibleInterface(item);
+        return accessible && accessible->role() == QAccessible::Link
+               && accessible->text(QAccessible::Name) == QLatin1String("Documentation");
+    })));
+    QAccessibleInterface *interface = QAccessible::queryAccessibleInterface(link);
+    QVERIFY(interface);
+    QCOMPARE(interface->role(), QAccessible::Link);
+    QCOMPARE(interface->text(QAccessible::Name), QStringLiteral("Documentation"));
+    QAccessibleActionInterface *actions = interface->actionInterface();
+    QVERIFY(actions);
+    QVERIFY(actions->actionNames().contains(QAccessibleActionInterface::pressAction()));
+    actions->doAction(QAccessibleActionInterface::pressAction());
+    QObject *sheet = host.page()->findChild<QObject *>(QStringLiteral("markdownLinkSheet"));
+    QVERIFY(sheet);
+    QTRY_VERIFY(sheet->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(sheet, "close"));
+
+    QTRY_VERIFY(host.page()->property("imagePending").value<QJSValue>()
+                    .property(QStringLiteral("badge.png")).isString());
+    const auto resolves = requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(resolves.size(), 1);
+    host.deliver(resolveFrame(requestId(resolves.first()), QStringLiteral("/repo/badge.png"), true));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), pngBytes()));
+    QQuickItem *image = nullptr;
+    QTRY_VERIFY((image = findItem(host.page(), [](QQuickItem *item) {
+        return item->objectName() == QLatin1String("markdownImage")
+               && item->property("status").toInt() == 1 && item->isVisible();
+    })));
+    interface = QAccessible::queryAccessibleInterface(image);
+    QVERIFY(interface);
+    QCOMPARE(interface->role(), QAccessible::Graphic);
+    QCOMPARE(interface->text(QAccessible::Name), QStringLiteral("Build status"));
+}
+
+void TstMobileShell::markdownRefusalReasonsUpdateTheVisibleAltText()
+{
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\"\n"
+                                 "        repoRoot: \"/repo\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.first()),
+                               QStringLiteral("![Build status](badge.png)\n"), QStringLiteral("r1")));
+    QTRY_VERIFY(host.page()->property("imagePending").value<QJSValue>()
+                    .property(QStringLiteral("badge.png")).isString());
+    const auto resolves = requestsFor(host.requests(), rpc::kMethodResolvePath);
+    QCOMPARE(resolves.size(), 1);
+    host.deliver(errorFrame(requestId(resolves.first()), QStringLiteral("image cannot be resolved")));
+    QTRY_VERIFY(findItemShowing(host.page(), QStringLiteral("Build status (image cannot be resolved)")));
+}
+
+void TstMobileShell::nestedMarkdownQuotesRetainTheirIndentation()
+{
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.first()),
+                               QStringLiteral("> outer\n>> inner\n> outer again\n"),
+                               QStringLiteral("r1")));
+    QQuickItem *outer = nullptr;
+    QQuickItem *inner = nullptr;
+    QTRY_VERIFY((outer = findItem(host.page(), [](QQuickItem *item) {
+        return item->inherits("QQuickText")
+               && item->property("text").toString() == QLatin1String("outer");
+    })));
+    QTRY_VERIFY((inner = findItem(host.page(), [](QQuickItem *item) {
+        return item->inherits("QQuickText")
+               && item->property("text").toString() == QLatin1String("inner");
+    })));
+    QTRY_VERIFY(inner->mapToScene(QPointF()).x() > outer->mapToScene(QPointF()).x());
+    QVERIFY(inner->width() > 0);
+}
+
+void TstMobileShell::deepMarkdownIndentationKeepsTextReadable_data()
+{
+    QTest::addColumn<bool>("list");
+    QTest::newRow("quote") << false;
+    QTest::newRow("list") << true;
+}
+
+void TstMobileShell::deepMarkdownIndentationKeepsTextReadable()
+{
+    QFETCH(bool, list);
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/notes.md\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    QString markdown;
+    if (list) {
+        for (int depth = 0; depth < 39; ++depth)
+            markdown += QString(depth * 4, QLatin1Char(' ')) + QStringLiteral("- parent\n");
+        markdown += QString(39 * 4, QLatin1Char(' ')) + QStringLiteral("- deepest\n");
+    } else {
+        markdown = QString(40, QLatin1Char('>')) + QStringLiteral(" deepest\n");
+    }
+    host.deliver(textReadFrame(requestId(reads.first()), markdown, QStringLiteral("r1")));
+    QQuickItem *blocks = host.page()->findChild<QQuickItem *>(QStringLiteral("markdownBlocks"));
+    QVERIFY(blocks);
+    QTRY_VERIFY(blocks->property("count").toInt() > 0);
+    QVERIFY(QMetaObject::invokeMethod(blocks, "forceLayout"));
+    QVERIFY(QMetaObject::invokeMethod(blocks, "positionViewAtEnd"));
+    QQuickItem *text = nullptr;
+    QTRY_VERIFY((text = findItem(host.page(), [](QQuickItem *item) {
+        return item->inherits("QQuickText")
+               && item->property("text").toString() == QLatin1String("deepest");
+    })));
+    QVERIFY(text->width() > 0);
+    const QRectF bounds = text->mapRectToScene(QRectF(0, 0, text->width(), text->height()));
+    QVERIFY(bounds.left() >= 0);
+    QVERIFY(bounds.right() <= host.window()->width() + 1);
+}
+
+void TstMobileShell::completedConnectionAttemptsForgetUnusedPassphrases_data()
+{
+    QTest::addColumn<QString>("state");
+    QTest::newRow("connected") << QStringLiteral("connected");
+    QTest::newRow("error") << QStringLiteral("error");
+    QTest::newRow("disconnected") << QStringLiteral("disconnected");
+}
+
+void TstMobileShell::completedConnectionAttemptsForgetUnusedPassphrases()
+{
+    QFETCH(QString, state);
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    ConnectionAttemptState attempt;
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("mobile"), &attempt);
+    engine.rootContext()->setContextProperty(QStringLiteral("keyStore"), &store);
+    QQmlComponent component(&engine);
+    component.setData(
+        "import QtQuick\nimport QtQuick.Window\nimport CodeHarbor.Mobile\n"
+        "Window { width: 412; height: 892; visible: true;"
+        " ConnectPage { anchors.fill: parent } }",
+        QUrl(QStringLiteral("qrc:/tst_mobileshell/connection-attempt.qml")));
+    QScopedPointer<QObject> root(component.create());
+    QVERIFY2(root, qPrintable(component.errorString()));
+    auto *window = qobject_cast<QQuickWindow *>(root.data());
+    QVERIFY(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    QQuickItem *page = findByQmlTypeIn(window->contentItem(), QStringLiteral("ConnectPage"));
+    QVERIFY(page);
+    page->setProperty("selectedKeyName", QStringLiteral("key"));
+    attempt.setState(QStringLiteral("connecting"));
+    store.armPassphrase(QStringLiteral("key"), QStringLiteral("armed secret"));
+    QVERIFY(store.hasArmedPassphrase(QStringLiteral("key")));
+    for (const QString &name : {QStringLiteral("passphraseField"), QStringLiteral("secretField")}) {
+        auto *field = page->findChild<QQuickItem *>(name);
+        QVERIFY(field);
+        QVERIFY(QMetaObject::invokeMethod(field, "insert", Q_ARG(int, 0),
+                                          Q_ARG(QString, QStringLiteral("typed secret"))));
+        QVERIFY(QMetaObject::invokeMethod(field, "clear"));
+    }
+    // No credentialPrompt is emitted: another auth method can succeed, or
+    // trust/authentication can fail before the armed passphrase is requested.
+    attempt.setState(state);
+    QVERIFY(!store.hasArmedPassphrase(QStringLiteral("key")));
+    for (const QString &name : {QStringLiteral("passphraseField"), QStringLiteral("secretField")}) {
+        auto *field = page->findChild<QQuickItem *>(name);
+        QVERIFY(field);
+        QCOMPARE(field->property("text").toString(), QString());
+        QVERIFY(QMetaObject::invokeMethod(field, "undo"));
+        QCOMPARE(field->property("text").toString(), QString());
+        QVERIFY(!field->property("canUndo").toBool());
+    }
+}
+
+void TstMobileShell::queuedEditorSavesKeepNewerEditsUnsaved()
+{
+    PageHost host(QStringLiteral("ViewerEditorPage"),
+                  QStringLiteral("remotePath: \"/repo/queued.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
+                                 "        paneId: \"queued-save\""));
+    QVERIFY(showPage(host));
+    QQuickItem *page = host.page();
+    QVERIFY(openEditor(page, QStringLiteral("original"), QStringLiteral("r1"),
+                       host.requests(), host.fixture.transport));
+    host.requests();
+    auto *editor = page->findChild<QQuickItem *>(QStringLiteral("editorText"));
+    QVERIFY(editor);
+    QQuickItem *save = findItemShowing(page, QStringLiteral("Save"));
+    QVERIFY(save);
+    editor->setProperty("text", QStringLiteral("first submitted edit"));
+    QVERIFY(QMetaObject::invokeMethod(save, "clicked"));
+    auto writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QCOMPARE(writes.size(), 1);
+    const int first = requestId(writes.first());
+
+    editor->setProperty("text", QStringLiteral("second submitted edit"));
+    QVERIFY(save->property("enabled").toBool());
+    QVERIFY(QMetaObject::invokeMethod(save, "clicked"));
+    QVERIFY(requestsFor(host.requests(), rpc::kMethodWriteFile).isEmpty());
+    host.deliver(resultFrame(first, QJsonObject{{"revision", "r2"}}));
+    writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QCOMPARE(writes.size(), 1);
+    const QJsonObject queued = writes.first().value(QStringLiteral("params")).toObject();
+    QCOMPARE(queued.value(QStringLiteral("content")).toString(), QStringLiteral("second submitted edit"));
+    QCOMPARE(queued.value(QStringLiteral("expectedRevision")).toString(), QStringLiteral("r2"));
+
+    editor->setProperty("text", QStringLiteral("third, not submitted edit"));
+    host.deliver(resultFrame(requestId(writes.first()), QJsonObject{{"revision", "r3"}}));
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("third, not submitted edit"));
+    QVERIFY(page->property("dirty").toBool());
+    QVERIFY(save->property("enabled").toBool());
+    QCOMPARE(page->property("revision").toString(), QStringLiteral("r3"));
+}
+
+void TstMobileShell::aCleanQueuedEditorSaveAllowsLaterExternalReload()
+{
+    const QString path = QStringLiteral("/repo/clean-queued.txt");
+    PageHost host(QStringLiteral("ViewerEditorPage"),
+                  QStringLiteral("remotePath: \"/repo/clean-queued.txt\"\n"
+                                 "        acceptedServerId: \"srv\"\n"
+                                 "        devSessionId: \"s1\"\n"
+                                 "        paneId: \"clean-queued-save\""));
+    QVERIFY(showPage(host));
+    QQuickItem *page = host.page();
+    auto pending = host.requests();
+    QObject *controller = openEditor(page, QStringLiteral("original"), QStringLiteral("r1"),
+                                     pending, host.fixture.transport);
+    QVERIFY(controller);
+    pending += host.requests();
+    const auto watches = requestsFor(pending, rpc::kMethodWatch);
+    QCOMPARE(watches.size(), 1);
+    host.deliver(resultFrame(requestId(watches.first()), QJsonObject{{"subscriptionId", "clean-watch"}}));
+    for (const auto &stat : requestsFor(pending, rpc::kMethodStat))
+        host.deliver(resultFrame(requestId(stat), QJsonObject{{"path", path}, {"kind", "file"},
+            {"mode", 0644}, {"writable", true}, {"revision", "r1"}, {"size", 8}}));
+    host.requests();
+    auto *editor = page->findChild<QQuickItem *>(QStringLiteral("editorText"));
+    auto *snapshot = page->findChild<QObject *>(QStringLiteral("recoverySnapshotTimer"));
+    QQuickItem *save = findItemShowing(page, QStringLiteral("Save"));
+    QVERIFY(editor);
+    QVERIFY(snapshot);
+    QVERIFY(save);
+    QSignalSpy observedSnapshot(snapshot, SIGNAL(triggered()));
+    editor->setProperty("text", QStringLiteral("submitted A"));
+    QVERIFY(QMetaObject::invokeMethod(save, "clicked"));
+    auto writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QCOMPARE(writes.size(), 1);
+    const int firstWrite = requestId(writes.first());
+    editor->setProperty("text", QStringLiteral("submitted B"));
+    QVERIFY(QMetaObject::invokeMethod(save, "clicked"));
+    QVERIFY(requestsFor(host.requests(), rpc::kMethodWriteFile).isEmpty());
+    // Let the actual debounce report B while it is queued behind A.
+    QTRY_VERIFY(!observedSnapshot.isEmpty());
+    host.requests();
+    host.deliver(resultFrame(firstWrite, QJsonObject{{"revision", "r2"}}));
+    writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QCOMPARE(writes.size(), 1);
+    host.deliver(resultFrame(requestId(writes.first()), QJsonObject{{"revision", "r3"}}));
+    QTRY_VERIFY(!controller->property("dirty").toBool());
+    QCOMPARE(controller->property("fileState").toString(), QStringLiteral("clean"));
+    QVERIFY(!page->property("dirty").toBool());
+    host.requests();
+
+    host.deliver(frame({{"jsonrpc", "2.0"},
+        {"method", QString::fromLatin1(rpc::kWatchEventNotification)},
+        {"params", QJsonObject{{"subscriptionId", "clean-watch"}, {"path", path},
+                               {"event", "modified"}, {"revision", "r4"}}}}));
+    auto changes = host.requests();
+    const auto reads = requestsFor(changes, rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    QCOMPARE(requestPath(reads.first()), path);
+    host.deliver(textReadFrame(requestId(reads.first()), QStringLiteral("external replacement"),
+                               QStringLiteral("r4")));
+    changes += host.requests();
+    for (const auto &stat : requestsFor(changes, rpc::kMethodStat))
+        host.deliver(resultFrame(requestId(stat), QJsonObject{{"path", path}, {"kind", "file"},
+            {"mode", 0644}, {"writable", true}, {"revision", "r4"}, {"size", 20}}));
+    QTRY_COMPARE(editor->property("text").toString(), QStringLiteral("external replacement"));
+    QVERIFY(!controller->property("dirty").toBool());
+    QCOMPARE(controller->property("fileState").toString(), QStringLiteral("clean"));
+}
+
+void TstMobileShell::settledAttemptsClosePromptDialogsAndRetireTheirResponses_data()
+{
+    QTest::addColumn<QString>("state");
+    QTest::addColumn<bool>("trust");
+    for (const QString &state : {QStringLiteral("connected"), QStringLiteral("error"),
+                                 QStringLiteral("disconnected")}) {
+        QTest::newRow(qPrintable(state + QStringLiteral("-credential"))) << state << false;
+        QTest::newRow(qPrintable(state + QStringLiteral("-host-trust"))) << state << true;
+    }
+}
+
+void TstMobileShell::settledAttemptsClosePromptDialogsAndRetireTheirResponses()
+{
+    QFETCH(QString, state);
+    QFETCH(bool, trust);
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    MobileKeyStore store(appData.path());
+    ConnectionAttemptState attempt;
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("mobile"), &attempt);
+    engine.rootContext()->setContextProperty(QStringLiteral("keyStore"), &store);
+    QQmlComponent component(&engine);
+    component.setData(
+        "import QtQuick\nimport QtQuick.Window\nimport CodeHarbor.Mobile\n"
+        "Window { width: 412; height: 892; visible: true;"
+        " ConnectPage { anchors.fill: parent } }",
+        QUrl(QStringLiteral("qrc:/tst_mobileshell/prompt-retirement.qml")));
+    QScopedPointer<QObject> root(component.create());
+    QVERIFY2(root, qPrintable(component.errorString()));
+    auto *window = qobject_cast<QQuickWindow *>(root.data());
+    QVERIFY(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    auto *page = findByQmlTypeIn(window->contentItem(), QStringLiteral("ConnectPage"));
+    QVERIFY(page);
+    attempt.setState(QStringLiteral("connecting"));
+    QObject *dialog = nullptr;
+    if (trust) {
+        for (QObject *child : page->findChildren<QObject *>()) {
+            if (qmlTypeName(child) == QLatin1String("HostTrustSheet")) {
+                dialog = child;
+                break;
+            }
+        }
+        QVERIFY(dialog);
+        emit attempt.hostKeyPrompt(QStringLiteral("host"), QStringLiteral("SHA256:test"),
+                                   QStringLiteral("ssh-ed25519"));
+    } else {
+        dialog = page->findChild<QObject *>(QStringLiteral("secretDialog"));
+        QVERIFY(dialog);
+        emit attempt.credentialPrompt(QStringLiteral("user"), QStringLiteral("host"),
+                                      QStringLiteral("Password"), QStringLiteral("password"));
+    }
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    if (!trust) {
+        auto *field = page->findChild<QQuickItem *>(QStringLiteral("secretField"));
+        QVERIFY(field);
+        QVERIFY(QMetaObject::invokeMethod(field, "insert", Q_ARG(int, 0),
+                                          Q_ARG(QString, QStringLiteral("entered secret"))));
+    }
+    attempt.setState(state);
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    if (trust) {
+        QVERIFY(dialog->property("answered").toBool());
+        QVERIFY(dialog->property("promptHost").toString().isEmpty());
+        QVERIFY(dialog->property("promptFingerprint").toString().isEmpty());
+        QVERIFY(dialog->property("promptKeyType").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(dialog, "trust"));
+        QVERIFY(attempt.trustReplies.isEmpty());
+    } else {
+        QVERIFY(!page->property("credentialActive").toBool());
+        QVERIFY(page->property("credentialKind").toString().isEmpty());
+        QVERIFY(page->property("credentialPrompt").toString().isEmpty());
+        auto *field = page->findChild<QQuickItem *>(QStringLiteral("secretField"));
+        QVERIFY(field);
+        QVERIFY(field->property("text").toString().isEmpty());
+        QVERIFY(callQmlFunction(page, "submitSecret"));
+        QVERIFY(!attempt.credentialReplies.isEmpty());
+        for (const auto &reply : attempt.credentialReplies) {
+            QVERIFY(reply.value(QStringLiteral("secret")).toString().isEmpty());
+            QVERIFY(reply.value(QStringLiteral("kind")).toString().isEmpty());
+        }
+    }
+}
+
+void TstMobileShell::connectingWhilePassphraseIsFocusedTransfersItBeforeDialing()
+{
+#if !CH_HAVE_LIBSSH
+    QSKIP("encrypted-key import requires the optional libssh parser");
+#else
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    SshConnectionPool pool;
+    MobileKeyStore store(appData.path());
+    store.setConnectionPool(&pool);
+    QVERIFY(store.importKeyFromText(QStringLiteral("encrypted"),
+                                    QString::fromLatin1(kShellEncryptedKey)));
+    ConnectionAttemptState attempt;
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("mobile"), &attempt);
+    engine.rootContext()->setContextProperty(QStringLiteral("keyStore"), &store);
+    QQmlComponent component(&engine);
+    component.setData(
+        "import QtQuick\nimport QtQuick.Window\nimport CodeHarbor.Mobile\n"
+        "Window { width: 412; height: 892; visible: true;"
+        " ConnectPage { anchors.fill: parent } }",
+        QUrl(QStringLiteral("qrc:/tst_mobileshell/focused-connect.qml")));
+    QScopedPointer<QObject> root(component.create());
+    QVERIFY2(root, qPrintable(component.errorString()));
+    auto *window = qobject_cast<QQuickWindow *>(root.data());
+    QVERIFY(window);
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    auto *page = findByQmlTypeIn(window->contentItem(), QStringLiteral("ConnectPage"));
+    QVERIFY(page);
+    page->setProperty("hostText", QStringLiteral("host.example"));
+    page->setProperty("userText", QStringLiteral("user"));
+    page->setProperty("nodePathText", QStringLiteral("/usr/bin/node"));
+    page->setProperty("selectedKeyName", QStringLiteral("encrypted"));
+    auto *field = page->findChild<QQuickItem *>(QStringLiteral("passphraseField"));
+    QVERIFY(field);
+    QTRY_VERIFY(field->isVisible());
+    field->forceActiveFocus();
+    QTRY_VERIFY(field->hasActiveFocus());
+    QSignalSpy finished(field, SIGNAL(editingFinished()));
+    QVERIFY(QMetaObject::invokeMethod(field, "insert", Q_ARG(int, 0),
+                                      Q_ARG(QString, QStringLiteral("hunter2"))));
+    bool armedBeforeDial = false;
+    bool fieldEmptyBeforeDial = false;
+    connect(&attempt, &ConnectionAttemptState::connectionRequested, &attempt, [&](const QVariantMap &) {
+        armedBeforeDial = store.hasArmedPassphrase(QStringLiteral("encrypted"));
+        fieldEmptyBeforeDial = field->property("text").toString().isEmpty();
+    });
+    QSignalSpy dial(&attempt, &ConnectionAttemptState::connectionRequested);
+    QVERIFY(finished.isEmpty());
+    QVERIFY(callQmlFunction(page, "connectNow"));
+    QCOMPARE(dial.size(), 1);
+    QVERIFY(armedBeforeDial);
+    QVERIFY(fieldEmptyBeforeDial);
+    QVERIFY(finished.isEmpty());
+#endif
+}
+
+void TstMobileShell::lateRecoveryScopeKeepsEditsAndSeparatesSnapshotTargets()
+{
+    const QString path = QStringLiteral("/repo/scoped.txt");
+    PageHost host(QStringLiteral("ViewerEditorPage"),
+                  QStringLiteral("remotePath: \"/repo/scoped.txt\"\n"
+                                 "        acceptedServerId: \"pending-server\"\n"
+                                 "        paneId: \"stable-pane\""));
+    QVERIFY(showPage(host));
+    QQuickItem *page = host.page();
+    QObject *controller = openEditor(page, QStringLiteral("baseline"), QStringLiteral("r1"),
+                                     host.requests(), host.fixture.transport);
+    QVERIFY(controller);
+    host.editors.setRecoveryDir(QStringLiteral("/srv/recovery"));
+    host.requests();
+    auto *editor = page->findChild<QQuickItem *>(QStringLiteral("editorText"));
+    auto *status = page->findChild<QQuickItem *>(QStringLiteral("editorRecoveryStatus"));
+    auto *snapshot = page->findChild<QObject *>(QStringLiteral("recoverySnapshotTimer"));
+    QVERIFY(editor);
+    QVERIFY(status);
+    QVERIFY(snapshot);
+    QVERIFY(!controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(status->isVisible());
+    editor->setProperty("text", QStringLiteral("edits without a session"));
+    QVERIFY(controller->property("dirty").toBool());
+    QVERIFY(requestsFor(host.requests(), rpc::kMethodWriteFile).isEmpty());
+
+    page->setProperty("acceptedServerId", QStringLiteral("accepted-server"));
+    page->setProperty("devSessionId", QStringLiteral("dev-one"));
+    QVERIFY(!controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(!status->isVisible());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("edits without a session"));
+    QVERIFY(controller->property("dirty").toBool());
+    host.requests();
+    QSignalSpy snapshots(snapshot, SIGNAL(triggered()));
+    editor->setProperty("text", QStringLiteral("first scoped edits"));
+    QTRY_VERIFY(!snapshots.isEmpty());
+    auto writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QVERIFY(!writes.isEmpty());
+    const QString firstPath = requestPath(writes.last());
+    const QJsonObject firstEnvelope = QJsonDocument::fromJson(writes.last()
+        .value(QStringLiteral("params")).toObject().value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(firstEnvelope.value(QStringLiteral("serverId")).toString(), QStringLiteral("accepted-server"));
+    QCOMPARE(firstEnvelope.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("dev-one"));
+    QCOMPARE(firstEnvelope.value(QStringLiteral("paneId")).toString(), QStringLiteral("stable-pane"));
+    QCOMPARE(firstEnvelope.value(QStringLiteral("path")).toString(), path);
+    QCOMPARE(firstEnvelope.value(QStringLiteral("content")).toString(), QStringLiteral("first scoped edits"));
+
+    page->setProperty("acceptedServerId", QString());
+    QVERIFY(!controller->property("recoveryEnabled").toBool());
+    snapshots.clear();
+    editor->setProperty("text", QStringLiteral("edits during authority refresh"));
+    QTRY_VERIFY(!snapshots.isEmpty());
+    QVERIFY(requestsFor(host.requests(), rpc::kMethodWriteFile).isEmpty());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("edits during authority refresh"));
+    QVERIFY(controller->property("dirty").toBool());
+    page->setProperty("acceptedServerId", QStringLiteral("accepted-server"));
+    QTRY_VERIFY(controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(!status->isVisible());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("edits during authority refresh"));
+
+    page->setProperty("acceptedServerId", QStringLiteral("other-accepted-server"));
+    page->setProperty("devSessionId", QStringLiteral("dev-two"));
+    QVERIFY(!controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(status->isVisible());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("edits during authority refresh"));
+    QVERIFY(controller->property("dirty").toBool());
+    host.requests();
+    snapshots.clear();
+    editor->setProperty("text", QStringLiteral("edits still owned by the first document"));
+    QTRY_VERIFY(!snapshots.isEmpty());
+    QVERIFY(!controller->property("recoveryEnabled").toBool());
+    writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QVERIFY(writes.isEmpty());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("edits still owned by the first document"));
+    QVERIFY(controller->property("dirty").toBool());
+
+    page->setProperty("remotePath", QStringLiteral("/repo/other.txt"));
+    QObject *discard = page->findChild<QObject *>(QStringLiteral("unsavedChangesDialog"));
+    QVERIFY(discard);
+    QTRY_VERIFY(discard->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(discard, "discarded"));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    const auto document = std::find_if(reads.begin(), reads.end(), [](const QJsonObject &request) {
+        return requestPath(request) == QLatin1String("/repo/other.txt");
+    });
+    QVERIFY(document != reads.end());
+    host.deliver(textReadFrame(requestId(*document), QStringLiteral("other baseline"), QStringLiteral("r2")));
+    host.requests();
+    QTRY_VERIFY(controller->property("recoveryEnabled").toBool());
+    QTRY_VERIFY(!status->isVisible());
+    editor->setProperty("text", QStringLiteral("other document edits"));
+    writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QVERIFY(!writes.isEmpty());
+    const QString secondPath = requestPath(writes.last());
+    QVERIFY(secondPath != firstPath);
+    const QJsonObject secondEnvelope = QJsonDocument::fromJson(writes.last()
+        .value(QStringLiteral("params")).toObject().value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(secondEnvelope.value(QStringLiteral("serverId")).toString(), QStringLiteral("other-accepted-server"));
+    QCOMPARE(secondEnvelope.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("dev-two"));
+    QCOMPARE(secondEnvelope.value(QStringLiteral("path")).toString(), QStringLiteral("/repo/other.txt"));
+    QCOMPARE(secondEnvelope.value(QStringLiteral("content")).toString(), QStringLiteral("other document edits"));
+
+    page->setProperty("remotePath", QStringLiteral("/repo/third.txt"));
+    QTRY_VERIFY(discard->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(discard, "discarded"));
+    const auto nextReads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    const auto nextDocument = std::find_if(nextReads.begin(), nextReads.end(), [](const QJsonObject &request) {
+        return requestPath(request) == QLatin1String("/repo/third.txt");
+    });
+    QVERIFY(nextDocument != nextReads.end());
+    host.deliver(textReadFrame(requestId(*nextDocument), QStringLiteral("third baseline"), QStringLiteral("r3")));
+    host.requests();
+    editor->setProperty("text", QStringLiteral("third document edits"));
+    writes = requestsFor(host.requests(), rpc::kMethodWriteFile);
+    QVERIFY(!writes.isEmpty());
+    const QString thirdPath = requestPath(writes.last());
+    QVERIFY(thirdPath != firstPath);
+    QVERIFY(thirdPath != secondPath);
+    const QJsonObject thirdEnvelope = QJsonDocument::fromJson(writes.last()
+        .value(QStringLiteral("params")).toObject().value(QStringLiteral("content")).toString().toUtf8()).object();
+    QCOMPARE(thirdEnvelope.value(QStringLiteral("path")).toString(), QStringLiteral("/repo/third.txt"));
+    QCOMPARE(thirdEnvelope.value(QStringLiteral("content")).toString(), QStringLiteral("third document edits"));
+}
+
+void TstMobileShell::recoveryOffersRetireWhenTheirScopeOrDocumentChanges_data()
+{
+    QTest::addColumn<bool>("scopeChange");
+    QTest::newRow("scope") << true;
+    QTest::newRow("document") << false;
+}
+
+void TstMobileShell::recoveryOffersRetireWhenTheirScopeOrDocumentChanges()
+{
+    QFETCH(bool, scopeChange);
+    const QString properties = QStringLiteral(
+        "remotePath: \"/repo/recovery.txt\"\n"
+        "        acceptedServerId: \"accepted-server\"\n"
+        "        devSessionId: \"dev-one\"\n"
+        "        paneId: \"stable-pane\"");
+    QString encodedSnapshot;
+    QString snapshotPath;
+    {
+        PageHost producer(QStringLiteral("ViewerEditorPage"), properties);
+        QVERIFY(showPage(producer));
+        QVERIFY(openEditor(producer.page(), QStringLiteral("baseline"), QStringLiteral("r1"),
+                           producer.requests(), producer.fixture.transport));
+        producer.editors.setRecoveryDir(QStringLiteral("/srv/recovery"));
+        producer.requests();
+        auto *editor = producer.page()->findChild<QQuickItem *>(QStringLiteral("editorText"));
+        QVERIFY(editor);
+        editor->setProperty("text", QStringLiteral("recoverable edits"));
+        const auto writes = requestsFor(producer.requests(), rpc::kMethodWriteFile);
+        QCOMPARE(writes.size(), 1);
+        snapshotPath = requestPath(writes.first());
+        encodedSnapshot = writes.first().value(QStringLiteral("params")).toObject()
+            .value(QStringLiteral("content")).toString();
+    }
+    QVERIFY(!encodedSnapshot.isEmpty());
+    const qint64 snapshotSize = encodedSnapshot.toUtf8().size();
+    PageHost host(QStringLiteral("ViewerEditorPage"), properties);
+    QVERIFY(showPage(host));
+    QObject *controller = openEditor(host.page(), QStringLiteral("baseline"), QStringLiteral("r1"),
+                                     host.requests(), host.fixture.transport);
+    QVERIFY(controller);
+    host.editors.setRecoveryDir(QStringLiteral("/srv/recovery"));
+    QObject *offer = host.page()->findChild<QObject *>(QStringLiteral("recoveryDialog"));
+    QVERIFY(offer);
+    // Drive the production probe/read/revision-check sequence with the actual
+    // envelope generated above, not a hand-written serialization fixture.
+    for (int wave = 0; wave < 8 && !offer->property("visible").toBool(); ++wave) {
+        const auto requests = host.requests();
+        for (const auto &request : requests) {
+            const QString method = request.value(QStringLiteral("method")).toString();
+            const QString target = requestPath(request);
+            if (method == QLatin1String(rpc::kMethodWatch)) {
+                host.deliver(resultFrame(requestId(request), QJsonObject{{"subscriptionId", "recovery-watch"}}));
+            } else if (method == QLatin1String(rpc::kMethodStat)) {
+                const bool snapshot = target == snapshotPath;
+                host.deliver(resultFrame(requestId(request), QJsonObject{
+                    {"path", target}, {"kind", "file"}, {"mode", 0644}, {"writable", true},
+                    {"revision", snapshot ? "snapshot-r1" : "r1"},
+                    {"size", snapshot ? snapshotSize : qint64(8)}}));
+            } else if (method == QLatin1String(rpc::kMethodReadFile) && target == snapshotPath) {
+                host.deliver(textReadFrame(requestId(request), encodedSnapshot, QStringLiteral("snapshot-r1")));
+            }
+        }
+    }
+    QTRY_VERIFY(offer->property("visible").toBool());
+    auto *editor = host.page()->findChild<QQuickItem *>(QStringLiteral("editorText"));
+    QVERIFY(editor);
+    QString expected = QStringLiteral("baseline");
+    if (scopeChange) {
+        host.page()->setProperty("acceptedServerId", QString());
+        QVERIFY(!controller->property("recoveryEnabled").toBool());
+    } else {
+        host.page()->setProperty("remotePath", QStringLiteral("/repo/next.txt"));
+        const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+        const auto next = std::find_if(reads.begin(), reads.end(), [](const QJsonObject &request) {
+            return requestPath(request) == QLatin1String("/repo/next.txt");
+        });
+        QVERIFY(next != reads.end());
+        expected = QStringLiteral("next baseline");
+        host.deliver(textReadFrame(requestId(*next), expected, QStringLiteral("r2")));
+    }
+    QTRY_VERIFY(!offer->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(offer, "accepted"));
+    QCOMPARE(editor->property("text").toString(), expected);
+    QVERIFY(!host.page()->property("dirty").toBool());
 }
 
 // A QGuiApplication is required (this loads and renders real QML), and the style

@@ -504,6 +504,7 @@ Rectangle {
             return;
         const pane = region.paneOwner.takePane(key, paneHost,
                                                { devSessionId: region.devSessionId,
+                                                 placeholder: key.length === 0,
                                                  workingDir: region.workingDir,
                                                  customTitle: region.leafCustomTitle(),
                                                  terminalPaneId: region.leafTerminalPaneId(),
@@ -746,7 +747,12 @@ Rectangle {
             // off `onResizingChanged`, and SplitView only reports `resizing`
             // for a pointer drag, so a split resized with the arrow keys would
             // move on screen and then be forgotten at the next reload.
-            handle: AppSplitHandle { onResized: split.publishRatios() }
+            handle: AppSplitHandle {
+                id: keyHandle
+                onResizeStarted: split.beginKeyboardResize(keyHandle)
+                onResizeCancelled: split.cancelKeyboardResize()
+                onResized: split.finishKeyboardResize(keyHandle)
+            }
 
             // SplitView stretches only the FIRST fillWidth/fillHeight item, so
             // every later child would fall back to a Loader's implicit size of 0
@@ -770,6 +776,33 @@ Rectangle {
             // drag captured one", which is the case when publishRatios() is
             // called directly; it then uses the path the branch has now.
             property var resizePath: null
+            property var keyboardHandle: null
+
+            function beginKeyboardResize(handle) {
+                split.keyboardHandle = handle;
+                split.resizeSessionId = region.paneOwner.devSessionId;
+                split.resizeGeneration = region.paneOwner.layoutGeneration;
+                split.resizePath = region.nodePath.slice();
+            }
+
+            function finishKeyboardResize(handle) {
+                if (split.keyboardHandle !== handle)
+                    return;
+                split.publishRatios();
+                split.cancelKeyboardResize();
+            }
+
+            function cancelKeyboardResize() {
+                const handle = split.keyboardHandle;
+                split.keyboardHandle = null;
+                if (handle)
+                    handle.cancelResize();
+                if (!split.resizing) {
+                    split.resizePath = null;
+                    split.resizeSessionId = "";
+                    split.resizeGeneration = 0;
+                }
+            }
 
             // The extent along the split axis that the sizes currently on the
             // children were computed for. A resize scales them by the ratio
@@ -903,6 +936,7 @@ Rectangle {
 
             onResizingChanged: {
                 if (resizing) {
+                    split.cancelKeyboardResize();
                     split.resizeSessionId = region.paneOwner.devSessionId;
                     split.resizeGeneration = region.paneOwner.layoutGeneration;
                     split.resizePath = region.nodePath;
@@ -921,13 +955,17 @@ Rectangle {
             Connections {
                 target: region
                 function onNodeChanged() {
+                    split.cancelKeyboardResize();
                     split.ratiosApplied = false;
                     split.applyRatios();
                     split.updateNodePaths();
                 }
                 function onNodePathChanged() {
+                    split.cancelKeyboardResize();
                     split.updateNodePaths();
                 }
+                function onDevSessionIdChanged() { split.cancelKeyboardResize(); }
+                function onLayoutGenerationChanged() { split.cancelKeyboardResize(); }
             }
 
             Repeater {

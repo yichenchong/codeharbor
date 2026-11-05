@@ -138,11 +138,14 @@ SessionBootstrap::SessionBootstrap(SshConnectionPool* pool,
             m_reconnectTimer->start();
             return;
         }
+        QPointer<SessionBootstrap> self(this);
         ++m_attempt;
         // This attempt belongs to the ladder, so setReconnectEnabled(false) may
         // abandon it mid-flight; a connectAndWire() may not. See there.
         m_attemptIsRetry = true;
         if (!attemptWire()) {
+            if (!self)
+                return;
             if (m_cancelRequested)
                 return;
             // A prerequisite on the SERVER that the user has to change — no
@@ -895,9 +898,12 @@ void SessionBootstrap::setReconnectEnabled(bool enabled)
         // state is ours to set: it unwinds through scheduleReconnect(), which
         // returns at once for a cancelled attempt.
         const bool wasTearingDown = m_tearingDown;
+        QPointer<SessionBootstrap> self(this);
         m_tearingDown = true;
         if (m_pool)
             m_pool->disconnectFromHost();
+        if (!self)
+            return;
         m_tearingDown = wasTearingDown;
         // The ladder is over, so its counter is history. reconnectAttempt() is
         // public and is what the shell shows as "attempt N of M"; leaving the
@@ -984,10 +990,11 @@ void SessionBootstrap::scheduleReconnect()
     // than a 0 ms spin.
     const int delayMs = qMax<int>(
         1, static_cast<int>(std::llround(delaySeconds * 1000.0 * m_timeScale)));
+    QPointer<SessionBootstrap> self(this);
     setState(State::Reconnecting);
     // State observers can synchronously disconnect, disable the ladder, or
     // start a different session. That newer decision owns the timer.
-    if (m_state != State::Reconnecting || !m_reconnectEnabled
+    if (!self || m_state != State::Reconnecting || !m_reconnectEnabled
         || m_cancelRequested)
         return;
     m_reconnectTimer->start(delayMs);
@@ -996,8 +1003,6 @@ void SessionBootstrap::scheduleReconnect()
 
 void SessionBootstrap::handleConnectionLost(const QString& reason)
 {
-    if (m_tearingDown)
-        return;
     if (m_attempting) {
         // Once a channel exists, a close is a failed setup, not routine
         // handshake churn. Signal delivery during setTransport()/wired() can
@@ -1006,6 +1011,8 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
             m_attemptLoss = reason;
         return;
     }
+    if (m_tearingDown)
+        return;
     if (m_state != State::Wired)
         return;
 
@@ -1014,16 +1021,27 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
     // the session. This loss supersedes it, and scheduleReconnect() below arms
     // the rung that actually belongs to it.
     cancelReconnect();
+    QPointer<SessionBootstrap> self(this);
+    const quint64 generation = m_lifecycleGeneration;
 
     unwire();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     // A channel can die while the SSH session itself still looks connected.
     // Drop that session before arming a retry; otherwise disabling reconnect
     // leaves a pool that reports Connected while this object reports down.
     const bool wasTearingDown = m_tearingDown;
     m_tearingDown = true;
+    auto restore = qScopeGuard([self, wasTearingDown] {
+        if (self)
+            self->m_tearingDown = wasTearingDown;
+    });
     if (m_pool)
         m_pool->disconnectFromHost();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     m_tearingDown = wasTearingDown;
+    restore.dismiss();
     if (!m_reconnectEnabled) {
         setState(State::Disconnected);
     } else {
@@ -1035,6 +1053,8 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
         m_cancelRequested = false;
         scheduleReconnect();
     }
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     // Publish the stable disconnected/reconnecting state before the diagnostic
     // so observers can safely inspect the state from their error handlers.
     emit error(reason);
@@ -1042,6 +1062,8 @@ void SessionBootstrap::handleConnectionLost(const QString& reason)
 
 void SessionBootstrap::disconnectSession()
 {
+    QPointer<SessionBootstrap> self(this);
+    const quint64 generation = ++m_lifecycleGeneration;
     // An attempt parked in the connect pre-flight is interrupted first, so the
     // user's "disconnect" is honoured now rather than after the remaining
     // connect budget — and so the unwinding attempt does not go on to wire the
@@ -1049,15 +1071,24 @@ void SessionBootstrap::disconnectSession()
     abortAttempt();
     const bool wasTearingDown = m_tearingDown;
     m_tearingDown = true;
+    auto restore = qScopeGuard([self, wasTearingDown] {
+        if (self)
+            self->m_tearingDown = wasTearingDown;
+    });
     cancelReconnect();
     unwire();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     if (m_pool)
         m_pool->disconnectFromHost();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     // Restored rather than forced false: this can run from inside a teardown
     // that is already in progress (a handler of the error() fail() emits, say),
     // and clearing the flag under that caller would let the pool and device
     // signals its remaining steps provoke be mistaken for a fresh loss.
     m_tearingDown = wasTearingDown;
+    restore.dismiss();
     if (m_environmentTrustActive) {
         m_trustUnknownHostKeys = m_environmentTrustPrevious;
         m_environmentTrustActive = false;
@@ -1074,14 +1105,25 @@ void SessionBootstrap::disconnectSession()
 
 void SessionBootstrap::fail(const QString& message)
 {
+    QPointer<SessionBootstrap> self(this);
+    const quint64 generation = m_lifecycleGeneration;
     unwire();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     // Authentication may have succeeded before a later provisioning or exec
     // step failed. Do not leave that SSH session alive behind State::Failed.
     const bool wasTearingDown = m_tearingDown;
     m_tearingDown = true;
+    auto restore = qScopeGuard([self, wasTearingDown] {
+        if (self)
+            self->m_tearingDown = wasTearingDown;
+    });
     if (m_pool)
         m_pool->disconnectFromHost();
+    if (!self || generation != m_lifecycleGeneration)
+        return;
     m_tearingDown = wasTearingDown;
+    restore.dismiss();
     emit error(message);
 }
 
@@ -1098,14 +1140,17 @@ void SessionBootstrap::failFatal(const QString& message)
 
 void SessionBootstrap::unwire()
 {
+    QPointer<SessionBootstrap> self(this);
+    const quint64 generation = m_lifecycleGeneration;
     const bool wasTearingDown = m_tearingDown;
     m_tearingDown = true;
-    const auto restore = qScopeGuard([this, wasTearingDown] {
-        m_tearingDown = wasTearingDown;
+    const auto restore = qScopeGuard([self, wasTearingDown] {
+        if (self)
+            self->m_tearingDown = wasTearingDown;
     });
 
-    SshChannelDevice* rpc = m_rpcDevice;
-    SshChannelDevice* agent = m_agentDevice;
+    QPointer<SshChannelDevice> rpc = m_rpcDevice;
+    QPointer<SshChannelDevice> agent = m_agentDevice;
     m_rpcDevice = nullptr;
     m_agentDevice = nullptr;
 
@@ -1120,15 +1165,23 @@ void SessionBootstrap::unwire()
         rpc->disconnect(this);
         rpc->closeChannel();
     }
+    if (!self)
+        return;
     if (agent) {
         agent->disconnect(this);
         agent->closeChannel();
     }
+    if (!self)
+        return;
 
     if (rpc && m_client && m_client->transport() == rpc)
         m_client->setTransport(nullptr);
+    if (!self)
+        return;
     if (agent && m_monitor && m_monitor->transport() == agent)
         m_monitor->setTransport(nullptr);
+    if (!self)
+        return;
 
     // deleteLater, not delete: unwire() runs from inside a device's own
     // readChannelFinished() emission on the loss path, and deleting the sender
@@ -1140,7 +1193,8 @@ void SessionBootstrap::unwire()
 
     // Scoped to the session that just ended: the next attempt's loss must carry
     // ITS remote's words, never the previous one's.
-    m_channelDiagnostics.clear();
+    if (generation == m_lifecycleGeneration)
+        m_channelDiagnostics.clear();
 }
 
 bool SessionBootstrap::connectPool(const QString& host, quint16 port,
@@ -1205,12 +1259,19 @@ bool SessionBootstrap::probeEndpoint(const QString& host, quint16 port,
     deadline.start(m_connectTimeoutMs);
     // Published so abortAttempt() can cut the wait short; cleared on every exit
     // path, including the exceptional one.
+    QPointer<SessionBootstrap> self(this);
+    connect(this, &QObject::destroyed, &loop, &QEventLoop::quit);
     m_nestedLoop = &loop;
-    const auto clearLoop = qScopeGuard([this] { m_nestedLoop = nullptr; });
+    const auto clearLoop = qScopeGuard([self] {
+        if (self)
+            self->m_nestedLoop = nullptr;
+    });
     // ExcludeUserInputEvents: repaints, timers and sockets keep running so the
     // shell stays alive on screen, but a second click cannot re-enter connect.
     if (!settled)
         loop.exec(QEventLoop::ExcludeUserInputEvents);
+    if (!self)
+        return false;
 
     if (spoke && !m_cancelRequested)
         return true;
@@ -1240,6 +1301,7 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(const QString& command,
     // wireChannelSignals() rather than here.
     Q_UNUSED(role);
 
+    QPointer<SessionBootstrap> self(this);
     auto* device = new SshChannelDevice(m_pool, this);
     // Scoped to the exec request and nothing else. startExec() reports failure
     // as a bare false and explains itself through channelError() a moment
@@ -1256,6 +1318,8 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(const QString& command,
                         m_lastDiagnostic = trimmed;
                 });
     const bool started = device->startExec(command);
+    if (!self)
+        return nullptr;
     disconnect(capture);
     if (!started) {
         delete device;
@@ -1267,6 +1331,7 @@ SshChannelDevice* SessionBootstrap::openChannelDevice(const QString& command,
 bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
                                        QString* output, QString* error)
 {
+    QPointer<SessionBootstrap> self(this);
     const QString role = QStringLiteral("codeharbor-provision");
     if (!m_pool) {
         if (error)
@@ -1290,14 +1355,15 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     SshChannelDevice device(m_pool);
     QString diagnostics;
     connect(&device, &SshChannelDevice::channelError, &device,
-            [this, &diagnostics, role](const QString& text) {
+            [self, &diagnostics, role](const QString& text) {
                 const QString trimmed = text.trimmed();
                 if (trimmed.isEmpty())
                     return;
                 if (!diagnostics.isEmpty())
                     diagnostics += QStringLiteral("; ");
                 diagnostics += trimmed;
-                emit channelDiagnostic(role, trimmed);
+                if (self)
+                    emit self->channelDiagnostic(role, trimmed);
             });
 
     // Quoted as one argument to `sh -c` so the script only relies on POSIX sh,
@@ -1310,6 +1376,8 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
                          : diagnostics;
         return false;
     }
+    if (!self)
+        return false;
 
     QEventLoop loop;
     QByteArray collected;
@@ -1320,7 +1388,9 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     // Drain whatever has arrived and republish every COMPLETE progress line.
     // `published` is how far the republishing has got, so a line split across
     // two reads is emitted once and whole.
-    const auto drain = [this, &device, &collected, &published] {
+    const auto drain = [self, &device, &collected, &published] {
+        if (!self)
+            return;
         collected += device.readAll();
         qsizetype newline = collected.indexOf('\n', published);
         while (newline >= 0) {
@@ -1329,7 +1399,9 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
                     .trimmed();
             published = newline + 1;
             if (line.startsWith(progressPrefix()))
-                emit provisioning(line.mid(progressPrefix().size()));
+                emit self->provisioning(line.mid(progressPrefix().size()));
+            if (!self)
+                return;
             newline = collected.indexOf('\n', published);
         }
     };
@@ -1359,8 +1431,12 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
         deadline.start(timeoutMs);
     // Published so abortAttempt() can cut a multi-minute download short the
     // moment the user asks to disconnect; cleared on every exit path.
+    connect(this, &QObject::destroyed, &loop, &QEventLoop::quit);
     m_nestedLoop = &loop;
-    const auto clearLoop = qScopeGuard([this] { m_nestedLoop = nullptr; });
+    const auto clearLoop = qScopeGuard([self] {
+        if (self)
+            self->m_nestedLoop = nullptr;
+    });
     // ExcludeUserInputEvents, exactly as probeEndpoint() does it: the shell
     // keeps repainting (which is the whole point of reporting progress) but a
     // second click cannot re-enter the connect path.
@@ -1383,6 +1459,8 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     drain();
     drain();
     device.closeChannel();
+    if (!self)
+        return false;
 
     if (output)
         *output = QString::fromUtf8(collected);
@@ -1442,6 +1520,7 @@ bool SessionBootstrap::keepExistingService(const QString& reason, bool forced,
 
 bool SessionBootstrap::ensureRemoteService()
 {
+    QPointer<SessionBootstrap> self(this);
     const QString role = QStringLiteral("codeharbor-provision");
     // Whatever the connect was doing before: Connecting for a user-initiated
     // attempt, Reconnecting for a rung of the ladder. Restored on every exit so
@@ -1456,7 +1535,7 @@ bool SessionBootstrap::ensureRemoteService()
     QString reportError;
     const bool asked = runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
                                        kInspectTimeoutMs, &report, &reportError);
-    if (!asked && m_cancelRequested)
+    if (!self || m_cancelRequested)
         return false;
     const RemoteInspection info = asked ? parseInspection(report)
                                         : RemoteInspection{};
@@ -1653,6 +1732,8 @@ bool SessionBootstrap::ensureRemoteService()
     }
 
     setState(State::Provisioning);
+    if (!self || m_cancelRequested)
+        return false;
     emit provisioning(info.entry.isEmpty()
                           ? tr("Installing the CodeHarbor remote service into "
                                "%1 on %2")
@@ -1660,6 +1741,8 @@ bool SessionBootstrap::ensureRemoteService()
                           : tr("Updating the CodeHarbor remote service in %1 on "
                                "%2")
                                 .arg(m_repoRoot, m_host));
+    if (!self || m_cancelRequested)
+        return false;
 
     QString installLog;
     QString installError;
@@ -1670,9 +1753,11 @@ bool SessionBootstrap::ensureRemoteService()
     // from inside runRemoteScript()'s nested loop and has already put us in
     // Disconnected, so restoring `resume` here would resurrect Connecting on an
     // attempt the user just abandoned.
-    if (!ran && m_cancelRequested)
+    if (!self || m_cancelRequested)
         return false;
     setState(resume);
+    if (!self || m_cancelRequested)
+        return false;
     if (!ran || !installLog.contains(installedMarker())) {
         const QString reason =
             tr("Could not install the CodeHarbor remote service into \"%1\" on "
@@ -1695,7 +1780,7 @@ bool SessionBootstrap::ensureRemoteService()
                             kInspectTimeoutMs, &leftReport, &leftError)
                 ? parseInspection(leftReport)
                 : RemoteInspection{};
-        if (m_cancelRequested)
+        if (!self || m_cancelRequested)
             return false;
         if (!left.entry.isEmpty())
             return keepExistingService(reason, forced, left.entry);
@@ -1709,10 +1794,12 @@ bool SessionBootstrap::ensureRemoteService()
     // silently empty install loud.
     QString verifyReport;
     QString verifyError;
-    if (!runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
-                         kInspectTimeoutMs, &verifyReport, &verifyError)) {
-        if (m_cancelRequested)
-            return false;
+    const bool verified =
+        runRemoteScript(remoteInspectScript(m_nodePath, m_repoRoot),
+                        kInspectTimeoutMs, &verifyReport, &verifyError);
+    if (!self || m_cancelRequested)
+        return false;
+    if (!verified) {
         fail(tr("Installed the CodeHarbor remote service into \"%1\" on %2 but "
                 "could not confirm it: %3")
                 .arg(m_repoRoot, m_host, verifyError));
@@ -1797,6 +1884,7 @@ void SessionBootstrap::wireChannelSignals(SshChannelDevice* device,
 
 bool SessionBootstrap::attemptWire()
 {
+    QPointer<SessionBootstrap> self(this);
     if (!m_pool) {
         emit error(QStringLiteral("no SSH connection pool"));
         return false;
@@ -1813,21 +1901,27 @@ bool SessionBootstrap::attemptWire()
     m_lastDiagnostic.clear();
     QElapsedTimer clock;
     clock.start();
-    const auto clearAttempting = qScopeGuard([this, &clock] {
-        m_lastAttemptMs = clock.elapsed();
-        m_attempting = false;
+    const auto clearAttempting = qScopeGuard([self, &clock] {
+        if (self) {
+            self->m_lastAttemptMs = clock.elapsed();
+            self->m_attempting = false;
+        }
     });
 
     unwire();
+    if (!self)
+        return false;
     const int attempt = m_attempt;
-    const auto interrupted = [this, attempt] {
-        if (m_cancelRequested) {
-            unwire();
+    const auto interrupted = [self, attempt] {
+        if (!self)
+            return true;
+        if (self->m_cancelRequested) {
+            self->unwire();
             return true;
         }
-        if (!m_attemptLoss.isEmpty()) {
-            m_attempt = attempt;
-            fail(std::exchange(m_attemptLoss, QString()));
+        if (!self->m_attemptLoss.isEmpty()) {
+            self->m_attempt = attempt;
+            self->fail(std::exchange(self->m_attemptLoss, QString()));
             return true;
         }
         return false;
@@ -1839,7 +1933,10 @@ bool SessionBootstrap::attemptWire()
     // unreachable or mute endpoint costs connectTimeoutMs() of responsive UI
     if (m_connectTimeoutMs > 0) {
         QString reason;
-        if (!probeEndpoint(m_host, m_port, &reason)) {
+        const bool probed = probeEndpoint(m_host, m_port, &reason);
+        if (!self || !m_pool)
+            return false;
+        if (!probed) {
             // A cancellation is the user's own doing, not a fault to report.
             if (!m_cancelRequested)
                 emit error(reason);
@@ -1924,13 +2021,17 @@ bool SessionBootstrap::attemptWire()
             return SshConnectionPool::HostKeyDecision::Accept;
         });
     }
-    const auto dropAutoAccept = qScopeGuard([this, installedAutoAccept] {
-        if (installedAutoAccept)
-            m_pool->setHostKeyCallback({});
+    const QPointer<SshConnectionPool> pool = m_pool;
+    const auto dropAutoAccept = qScopeGuard([pool, installedAutoAccept] {
+        if (installedAutoAccept && pool)
+            pool->setHostKeyCallback({});
     });
 
     m_lastPoolError.clear();
-    if (!connectPool(m_host, m_port, m_user, m_identityFile)) {
+    const bool connected = connectPool(m_host, m_port, m_user, m_identityFile);
+    if (!self || !m_pool)
+        return false;
+    if (!connected) {
         // Same rule probeEndpoint() follows above: a cancellation is the user's
         // own doing, not a fault to report. This one is reachable because the
         // handshake is synchronous and the pool delivers its progress, its
@@ -2031,6 +2132,8 @@ bool SessionBootstrap::attemptWire()
             }
         }
     }
+    if (!self || !m_pool)
+        return false;
 
     // A cancel that was raised DURING the handshake and that the pool did not
     // manage to abort itself: it checks between libssh calls, so a disconnect
@@ -2047,6 +2150,8 @@ bool SessionBootstrap::attemptWire()
         const bool wasTearingDown = m_tearingDown;
         m_tearingDown = true;
         m_pool->disconnectFromHost();
+        if (!self)
+            return false;
         m_tearingDown = wasTearingDown;
         return false;
     }
@@ -2056,7 +2161,8 @@ bool SessionBootstrap::attemptWire()
     // user has to act on (no node, no download tool, an install that did not
     // land) stops the attempt here, and ensureRemoteService() has already
     // reported it. See its comment for why a failed INSPECTION does not.
-    if (!ensureRemoteService())
+    const bool ensured = ensureRemoteService();
+    if (!self || !ensured)
         return false;
     // Provisioning can park this attempt in a nested event loop for minutes,
     // which is exactly where a "disconnect" lands. ensureRemoteService() reports
@@ -2068,8 +2174,11 @@ bool SessionBootstrap::attemptWire()
     if (m_cancelRequested)
         return false;
 
-    m_rpcDevice = openChannelDevice(rpcCommand(m_nodePath, m_repoRoot),
-                                    QStringLiteral("codeharbord"));
+    SshChannelDevice* rpc = openChannelDevice(rpcCommand(m_nodePath, m_repoRoot),
+                                             QStringLiteral("codeharbord"));
+    if (!self)
+        return false;
+    m_rpcDevice = rpc;
     if (interrupted())
         return false;
     if (!m_rpcDevice) {
@@ -2096,8 +2205,12 @@ bool SessionBootstrap::attemptWire()
     if (interrupted())
         return false;
 
-    m_agentDevice = openChannelDevice(bridgeCommand(m_nodePath, m_repoRoot),
-                                      QStringLiteral("codeharbor-bridge"));
+    SshChannelDevice* agent = openChannelDevice(
+        bridgeCommand(m_nodePath, m_repoRoot),
+        QStringLiteral("codeharbor-bridge"));
+    if (!self)
+        return false;
+    m_agentDevice = agent;
     if (interrupted())
         return false;
     if (!m_agentDevice) {
@@ -2144,9 +2257,14 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     // delivers stateChanged() to consumers BEFORE attemptWire() raises that
     // flag, and a handler that called back in here would overwrite the target
     // the outer call is one line away from connecting to.
+    QPointer<SessionBootstrap> self(this);
+    ++m_lifecycleGeneration;
     m_connectRequested = true;
     const auto clearRequest =
-        qScopeGuard([this] { m_connectRequested = false; });
+        qScopeGuard([self] {
+            if (self)
+                self->m_connectRequested = false;
+        });
     if (m_environmentTrustActive && !m_environmentConnectInProgress) {
         // The environment entry point's unattended trust is scoped to its
         // session. A later attended connect must start from the previous policy.
@@ -2173,10 +2291,13 @@ bool SessionBootstrap::connectAndWire(const QString& host, quint16 port,
     m_attemptIsRetry = false;
     m_cancelRequested = false;
     setState(State::Connecting);
-    if (m_cancelRequested)
+    if (!self || m_cancelRequested)
         return false;
 
-    if (attemptWire())
+    const bool wired = attemptWire();
+    if (!self)
+        return false;
+    if (wired)
         return true;
 
     // A connect the user cancelled mid-flight already ended in Disconnected via
@@ -2227,9 +2348,12 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
     m_environmentTrustActive = true;
     m_trustUnknownHostKeys = true;
     m_environmentConnectInProgress = true;
+    QPointer<SessionBootstrap> self(this);
     const bool connected =
         connectAndWire(host, static_cast<quint16>(port), user, nodePath, repoRoot,
                        identityFile);
+    if (!self)
+        return false;
     m_environmentConnectInProgress = false;
     if (!connected && tookTrustScope && m_environmentTrustActive) {
         m_trustUnknownHostKeys = m_environmentTrustPrevious;

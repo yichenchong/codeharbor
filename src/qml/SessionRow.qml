@@ -598,7 +598,7 @@ ItemDelegate {
                 Layout.fillWidth: true
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
-                text: qsTr("Delete the Dev Session \"%1\"? This permanently destroys it, kills the remote tmux sessions of its terminal panes, and cannot be undone.")
+                text: qsTr("Delete the Dev Session \"%1\"? This permanently destroys it, discards its unsaved editor changes, kills the remote tmux sessions of its terminal panes, and cannot be undone.")
                       .arg(row.name)
             }
         }

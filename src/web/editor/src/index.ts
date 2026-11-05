@@ -6,10 +6,9 @@
 // CONTRACT (C3, FROZEN — consumed by both src/web/editor [this file, JS half]
 // and src/editor/EditorController.{h,cpp} [C++ half]). It is WebChannel-native:
 // QWebChannel cannot return a value synchronously from C++ to JS, so there is NO
-// synchronous getValue()/save(): Promise. Instead the single C++ EditorController
-// is exposed to this page under the QWebChannel object name "editor"; its SIGNALS
-// push state to the editor (host callbacks) and its SLOTS receive editor actions
-// (the bridge). Save results arrive as signals, never as a return value.
+// synchronous getValue()/save(): Promise. Each document receives its own
+// EditorPageBridge proxy under the unique WebChannel id in its URL. Signals
+// push state; save outcomes arrive as signals, never as a return value.
 
 // The typed standalone API surface (monaco-editor/esm/vs/editor/editor.api) is
 // the only entry that ships .d.ts. The two side-effect imports below add the
@@ -81,7 +80,11 @@ export interface EditorBridge {
     /** Ask the host to re-fetch the file from the server (SPEC 8.7). */
     requestReload(): void;
 
-    // ---- ADDITIVE (backwards compatible), NOT part of the frozen shapes above.
+    // ---- ADDITIVE document lifecycle, outside the frozen C3 shapes above.
+    /** Exact RAM rehydration for a host-prepared document reload. The baseline
+     *  and pending save are authoritative at ready time, not capture time. */
+    readonly bufferRestored: Signal<(content: string, baselineContent: string,
+        revision: string, pendingSaveContent: string, savePending: boolean) => void>;
     /** Tell the host this page is live and every signal handler above is
      *  attached. The host buffers a load that completed before the WebChannel
      *  page connected and replays it here, so the first buffer is never lost.
@@ -107,6 +110,9 @@ export interface MountOptions {
     /** Remote path of the file this pane shows, used only to pick a Monaco
      *  language for syntax highlighting. Never opened, never read. */
     path?: string;
+    /** Unique WebChannel object id for this document. Required by connectEditor;
+     *  direct mountEditor callers already supply their own bridge object. */
+    bridgeId?: string;
 }
 
 // The host pushes Theme.roles after the page loads. Keeping a complete,
@@ -156,6 +162,14 @@ const defaultThemeRoles: Record<ThemeRoleName, string> = {
 const themeRoleNames = Object.keys(defaultThemeRoles) as ThemeRoleName[];
 let activeThemeRoles: Record<ThemeRoleName, string> = { ...defaultThemeRoles };
 let mountedEditor: monaco.editor.IStandaloneCodeEditor | null = null;
+const mountedEditors = new Set<monaco.editor.IStandaloneCodeEditor>();
+
+/** Capture before a host-initiated document reload retires the old bridge.
+ *  The host applies this value directly only if that document is still current. */
+export function captureEditorContent(): string | null {
+    return mountedEditor ? bufferText(mountedEditor) : null;
+}
+window.captureEditorContent = captureEditorContent;
 
 function isThemeColor(value: unknown): value is string {
     return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value);
@@ -206,6 +220,7 @@ function defineMonacoTheme(roles: Record<ThemeRoleName, string>): void {
 declare global {
     interface Window {
         applyTheme?: (roles: unknown) => void;
+        captureEditorContent?: () => string | null;
     }
 }
 
@@ -245,10 +260,9 @@ export interface EditorHost {
 }
 
 /**
- * Mount a Monaco editor into `element` wired to `bridge` (the QWebChannel proxy
- * for the C++ EditorController, i.e. channel.objects.editor). Implemented by
- * workstream E-web against the frozen contract above; the C++ half implements
- * the matching signals/slots under the object name "editor".
+ * Mount a Monaco editor into `element` wired to this document's `bridge`.
+ * The host retains the controller across documents, but never reuses a page
+ * proxy: delayed callbacks from a retired document cannot address its successor.
  */
 export function mountEditor(
     element: HTMLElement,
@@ -342,6 +356,7 @@ export function mountEditor(
         },
     });
     mountedEditor = editor;
+    mountedEditors.add(editor);
 
     // The revision the current buffer was loaded (or last saved) at; every save
     // is guarded by it (SPEC 8.4/8.6). Empty until the first contentLoaded.
@@ -621,6 +636,27 @@ export function mountEditor(
         renderState();
     });
 
+    bind(bridge.bufferRestored, (content: string, baseline: string, revision: string,
+                                savedText: string, savePending: boolean) => {
+        reporter.cancel();
+        clearNotice();
+        loadedRevision = revision;
+        baselineContent = baseline;
+        pendingSaveContent = savePending ? savedText : undefined;
+        localEditsHeld = false;
+        applyContentLanguage(content);
+        applyingHostEdit = true;
+        try {
+            editor.setValue(content);
+        } finally {
+            applyingHostEdit = false;
+        }
+        dirty = bufferText(editor) !== baselineContent;
+        renderState();
+        bridge.reportDirty(dirty, revision);
+        reporter.schedule(dirty);
+    });
+
     bind(bridge.fileStateChanged, (state: string) => {
         currentFileState = state;
         // An open/reload can finish before the old page's debounce callback is
@@ -734,8 +770,12 @@ export function mountEditor(
     editor.onDidDispose(() => {
         saveAction.dispose();
         reporter.cancel();
-        if (mountedEditor === editor)
+        mountedEditors.delete(editor);
+        if (mountedEditor === editor) {
             mountedEditor = null;
+            for (const remaining of mountedEditors)
+                mountedEditor = remaining;
+        }
     });
 
     // The file state and read-only flag reached before this page finished
@@ -797,9 +837,9 @@ export function mountEditor(
 }
 
 // ---- QWebChannel page-entry bootstrap ----
-// The QML host (QWebEngineView) injects `qt.webChannelTransport` and serves
-// qwebchannel.js, and registers the C++ EditorController under the object name
-// "editor". connectEditor() opens the channel and mounts Monaco against it.
+// The QML host injects qt.webChannelTransport and registers one document-scoped
+// EditorPageBridge under the unique id in the URL. connectEditor resolves only
+// that id; it never falls back to a shared controller object.
 
 /** Minimal ambient shape of the qwebchannel.js runtime injected by the host. */
 interface QWebChannelObjects {
@@ -852,7 +892,7 @@ function showFatal(element: HTMLElement, message: string): void {
 function missingBridgeMember(bridge: EditorBridge): string | null {
     const proxy = bridge as unknown as Record<string, unknown>;
     for (const name of ["contentLoaded", "fileStateChanged", "readOnlyChanged",
-        "saved", "saveConflict", "saveError"]) {
+        "saved", "saveConflict", "saveError", "bufferRestored"]) {
         const signal = proxy[name] as { connect?: unknown; disconnect?: unknown } | undefined;
         if (!signal || typeof signal.connect !== "function"
             || typeof signal.disconnect !== "function") {
@@ -868,8 +908,8 @@ function missingBridgeMember(bridge: EditorBridge): string | null {
 }
 
 /**
- * Page entry point: open the WebChannel injected by the QML host and mount the
- * editor against the "editor" object (the C++ EditorController proxy).
+ * Page entry point: open the host's WebChannel and resolve this document's
+ * explicitly named EditorPageBridge.
  */
 export function connectEditor(element: HTMLElement, options: MountOptions = {}): void {
     if (typeof QWebChannel === "undefined" || typeof qt === "undefined"
@@ -877,8 +917,13 @@ export function connectEditor(element: HTMLElement, options: MountOptions = {}):
         showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
+    const bridgeId = options.bridgeId;
+    if (!bridgeId) {
+        showFatal(element, "This page has no editor document identity.");
+        return;
+    }
     const onChannel = (channel: QWebChannelInstance): void => {
-        const bridge = channel.objects.editor as EditorBridge | undefined;
+        const bridge = channel.objects[bridgeId] as EditorBridge | undefined;
         if (!bridge) {
             showFatal(element, "The editor bridge is missing from this window.");
             return;
@@ -913,8 +958,13 @@ function bootstrap(): void {
     if (!root) {
         return; // embedded by a host that mounts explicitly
     }
-    const path = new URLSearchParams(window.location.search).get("path");
-    connectEditor(root, path ? { path } : {});
+    const query = new URLSearchParams(window.location.search);
+    const path = query.get("path");
+    const bridgeId = query.get("bridge");
+    connectEditor(root, {
+        ...(path ? { path } : {}),
+        ...(bridgeId ? { bridgeId } : {}),
+    });
 }
 
 if (document.readyState === "loading") {

@@ -23,10 +23,55 @@ if [ -L "$fixture" ]; then
     echo "generate-fixture.sh: refusing symlink fixture directory $fixture" >&2
     exit 1
 fi
-fixture=$(CDPATH= cd -- "$fixture" 2>/dev/null && pwd || {
-    mkdir -p "$fixture"
-    CDPATH= cd -- "$fixture" && pwd
-})
+# Resolve the existing ancestor without creating anything: an overlong socket
+# namespace must not reset an existing database or even create a new fixture.
+parent="$fixture"
+suffix=""
+while [ ! -d "$parent" ]; do
+    if [ -e "$parent" ] || [ -L "$parent" ]; then
+        echo "generate-fixture.sh: fixture ancestor is not a directory: $parent" >&2
+        exit 1
+    fi
+    suffix="/$(basename -- "$parent")$suffix"
+    parent=$(dirname -- "$parent")
+done
+parent=$(CDPATH= cd -- "$parent" && pwd -P)
+fixture="${parent%/}$suffix"
+fixture=${fixture:-/}
+runtime="${fixture%/}/runtime"
+# control.ts::mintControlSocketPath uses 8 random bytes as 16 hex characters.
+# Account for its longer name, not just the bridge's codeharbor.sock. Darwin
+# permits 103 pathname bytes (Linux 107); use the portable ceiling, excluding NUL.
+control_path="$runtime/codeharbor-control-0000000000000000.sock"
+socket_bytes=$(LC_ALL=C printf '%s' "$control_path" | wc -c)
+if [ "$socket_bytes" -gt 103 ]; then
+    echo "generate-fixture.sh: fixture control socket needs $socket_bytes bytes; portable Unix limit is 103" >&2
+    echo "Choose a shorter private fixture directory; no fixture files were changed." >&2
+    exit 1
+fi
+
+# Refuse redirected inputs and outputs before changing permissions or creating
+# keys. In particular, `-f` alone follows a private-key symlink, and mv treats a
+# directory (including a symlink to one) as a destination to write inside.
+for name in hostkey id hostkey.pub id.pub authorized_keys sshd_config; do
+    path="$fixture/$name"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        echo "generate-fixture.sh: refusing non-regular fixture file $path" >&2
+        exit 1
+    fi
+done
+
+# Bridge sockets, recovery snapshots and tmux masters have independent namespaces.
+# Keep them private; leave HOME and the account's shell configuration unchanged.
+data="$fixture/data"
+tmux="$fixture/tmux"
+for directory in "$runtime" "$data" "$tmux"; do
+    if [ -L "$directory" ] ||
+       { [ -e "$directory" ] && { [ ! -d "$directory" ] || [ ! -O "$directory" ]; }; }; then
+        echo "generate-fixture.sh: refusing redirected, non-directory, or unowned private directory $directory" >&2
+        exit 1
+    fi
+done
 
 if ! command -v ssh-keygen >/dev/null 2>&1; then
     echo "generate-fixture.sh: ssh-keygen is required to create the live fixture" >&2
@@ -34,7 +79,10 @@ if ! command -v ssh-keygen >/dev/null 2>&1; then
 fi
 
 umask 077
+mkdir -p "$fixture"
 chmod 700 "$fixture"
+mkdir -p "$runtime" "$data" "$tmux"
+chmod 700 "$runtime" "$data" "$tmux"
 
 tmp=""
 cleanup() {
@@ -50,10 +98,6 @@ trap cleanup EXIT
 for key_name in hostkey id; do
     private="$fixture/$key_name"
     public="$fixture/$key_name.pub"
-    if [ -e "$private" ] && [ ! -f "$private" ]; then
-        echo "generate-fixture.sh: $private exists but is not a regular file" >&2
-        exit 1
-    fi
     if [ ! -e "$private" ]; then
         ssh-keygen -q -t ed25519 -f "$private" -N ''
     fi
@@ -94,7 +138,7 @@ StrictModes no
 PasswordAuthentication no
 AllowUsers $user
 Subsystem sftp internal-sftp
-SetEnv "CODEHARBOR_DB=$fixture/workspace.sqlite"
+SetEnv "CODEHARBOR_DB=$fixture/workspace.sqlite" "XDG_RUNTIME_DIR=$runtime" "XDG_DATA_HOME=$data" "HISTFILE=/dev/null" "TMUX_TMPDIR=$tmux"
 EOF
 chmod 600 "$tmp"
 mv -f "$tmp" "$fixture/sshd_config"
@@ -122,6 +166,7 @@ rm -f "$fixture/workspace.sqlite" \
 
 printf 'live SSH fixture generated in %s\n' "$fixture"
 printf 'the workspace database was reset; codeharbord will create a fresh one\n'
+printf 'stop this fixture sshd, daemon/bridge and private tmux master before any future refresh\n'
 printf '\nStart it with:\n'
 printf '  /usr/sbin/sshd -f %s/sshd_config -D\n' "$fixture"
 printf '\nThen arm the live gates with:\n'
@@ -132,3 +177,8 @@ printf '  export CH_LIVE_USER=%s\n' "$user"
 printf '  export CH_LIVE_IDENTITY=%s/id\n' "$fixture"
 printf '\nThe session will see CODEHARBOR_DB=%s/workspace.sqlite,\n' "$fixture"
 printf 'never the developer'"'"'s real ~/.local/share/codeharbor/codeharbor.sqlite.\n'
+printf 'Its private bridge/hook runtime is %s (XDG_RUNTIME_DIR).\n' "$runtime"
+printf 'Runtime contents are retained; no shared user socket is removed.\n'
+printf 'Recovery snapshots stay under %s (XDG_DATA_HOME); contents are retained.\n' "$data"
+printf 'HISTFILE=/dev/null suppresses ordinary Bash history writes; this is not a shell sandbox.\n'
+printf 'The tmux master namespace is %s (TMUX_TMPDIR); contents are retained.\n' "$tmux"

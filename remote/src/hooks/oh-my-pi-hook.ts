@@ -147,7 +147,8 @@ export function readHookInput(
 const USAGE = "usage: node oh-my-pi-hook.ts <native-event>\n" +
     "  env: OMP_DEV_SESSION_ID, OMP_TERMINAL_ID,\n" +
     "       [OMP_HOOK_EVENT], [OMP_TOOL], [OMP_ERROR], [OMP_SUMMARY],\n" +
-    "       [OMP_METADATA] (a JSON object of free-form fields)\n";
+    "       [OMP_METADATA] (a JSON object of free-form fields),\n" +
+    "       [CODEHARBOR_AGENT_SOCKET] (the advertised absolute event socket)\n";
 
 /**
  * CLI entry point. Never throws: on any failure it warns to stderr and returns

@@ -278,14 +278,17 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
     // layer has already re-derived the sidebar row by the time the desktop
     // bubble is raised; notify() is a side effect, not a source of truth, and
     // must never be the thing that tells the UI something changed.
+    // A data slot may also evict this Dev Session after a tree refresh. Stop
+    // the remaining signals in that case; deleted panes must not be adopted or
+    // raise a desktop notification after their state has been dropped.
     QPointer<AgentStatusMonitor> self(this);
     if (changed)
         emit agentStateChanged(dev, term, static_cast<int>(next));
-    if (!self)
+    if (!self || !findStatus(dev, term))
         return;
     if (armedUnseen && m_unseen.contains(dev))
         emit unseenChanged(dev, true);
-    if (!self)
+    if (!self || !findStatus(dev, term))
         return;
     // After the state signals: a consumer of this one may write to the server
     // and refresh the workspace tree, which calls back into setTerminalHarness()
@@ -293,7 +296,7 @@ void AgentStatusMonitor::applyEvent(const AgentEvent& ev)
     // carried by then.
     if (harnessMoved)
         emit harnessObserved(dev, term, ev.harness);
-    if (!self)
+    if (!self || !findStatus(dev, term))
         return;
 
     // Desktop-notification hook: a genuine transition into an attention-worthy

@@ -1,5 +1,6 @@
 #include "ServerProfiles.h"
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -7,6 +8,7 @@
 #include <QLockFile>
 #include <QMetaType>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QUuid>
 #include <QVariant>
@@ -80,7 +82,9 @@ std::optional<int> parsePort(const QVariant& raw)
     }
 
     bool ok = false;
-    const int port = value.toInt(&ok);
+    // QVariant::toInt() does not report overflow from a wider integer in ok;
+    // converting the full spelling first prevents it wrapping into a valid port.
+    const int port = value.toString().toInt(&ok);
     if (!ok || port < kMinPort || port > kMaxPort)
         return std::nullopt;
     return port;
@@ -148,6 +152,54 @@ std::optional<QVariantMap> sanitize(const QVariantMap& in)
     out.insert(kNodePath, in.value(kNodePath).toString().trimmed());
     out.insert(kRepoRoot, in.value(kRepoRoot).toString().trimmed());
     return out;
+}
+
+bool usesRegistry(const QSettings& settings)
+{
+#ifdef Q_OS_WIN
+    return settings.format() == QSettings::NativeFormat
+           || settings.format() == QSettings::Registry32Format
+           || settings.format() == QSettings::Registry64Format;
+#else
+    Q_UNUSED(settings);
+    return false;
+#endif
+}
+
+QString mergeLockPath(const QSettings& settings)
+{
+    const QString storePath = settings.fileName();
+    if (storePath.isEmpty())
+        return {};
+    if (!usesRegistry(settings))
+        return storePath + kLockSuffix;
+
+    // A native Windows store names a registry key, not a filesystem path.
+    // Hash its canonical spelling so every writer of that store shares one
+    // per-user lock, independently of the process's working directory.
+    const QString config =
+        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    if (config.isEmpty())
+        return {};
+    const QByteArray storeId = QCryptographicHash::hash(
+        storePath.toCaseFolded().toUtf8(), QCryptographicHash::Sha256).toHex();
+    return QDir(config).filePath(
+        QStringLiteral("CodeHarbor/profile-locks/") + QString::fromLatin1(storeId)
+        + kLockSuffix);
+}
+
+QString describeSaveFailure(const QSettings& settings)
+{
+    switch (settings.status()) {
+    case QSettings::AccessError:
+        return ServerProfiles::tr("could not write %1").arg(settings.fileName());
+    case QSettings::FormatError:
+        return ServerProfiles::tr("%1 has an invalid settings format")
+            .arg(settings.fileName());
+    case QSettings::NoError:
+        return {};
+    }
+    return {};
 }
 
 // WHY the save could not be serialised, as a clause: the surface that shows it
@@ -336,66 +388,85 @@ void ServerProfiles::writeEntry(const QVariantMap& fields, int ordinal)
 // store would re-enter this function and wait out the whole timeout against a
 // lock this very call stack holds — then report "another process is holding it"
 // about itself. The locked region is therefore only mergeAndWrite(), which
-// touches QSettings and the filesystem and nothing else. The one signal this
-// function emits, saveDegraded(), is emitted AFTER the unlock, precisely so a
-// handler is free to mutate the store; that re-entry is normal and takes the
-// lock cleanly. Anything new that emits belongs after the unlock too.
+// touches QSettings and the filesystem and nothing else. Save-result signals
+// are emitted AFTER unlock so a handler is free to mutate the store.
 void ServerProfiles::persist()
 {
-    const QString settingsPath = m_settings->fileName();
-    // A brand new installation has no config directory yet: QSettings creates it
-    // lazily, on its first write, which is AFTER this point. QLockFile cannot
-    // make its lock file in a directory that does not exist — it fails with
-    // UnknownError — so without this every first run would save its first
-    // profile unlocked and tell the user so. The very first save is the one case
-    // where there is provably no second writer, and it must be silent.
-    const QString directory = QFileInfo(settingsPath).absolutePath();
-    if (!directory.isEmpty())
-        QDir().mkpath(directory);
-    // Beside the settings file, so it is on the same filesystem, and NOT the
-    // plain `.lock` suffix: that one is QSettings' own sync lock, and taking it
-    // here would deadlock inside the sync() calls below.
-    const QString lockPath = settingsPath + kLockSuffix;
+    const QString lockPath = mergeLockPath(*m_settings);
+    const QString directory = lockPath.isEmpty()
+                                  ? QString()
+                                  : QFileInfo(lockPath).absolutePath();
+    // QSettings creates a file's parent lazily, after this point. Registry
+    // stores instead use the dedicated per-user lock directory above.
+    const bool directoryReady =
+        !directory.isEmpty() && QDir().mkpath(directory);
     QLockFile lock(lockPath);
     // A holder that died leaves the file behind; QLockFile notices the recorded
     // pid is gone and clears it. The stale time is the backstop for a holder
     // that is alive but wedged — generous next to a write measured in
     // milliseconds, and still finite, so the store cannot stay locked forever.
     lock.setStaleLockTime(kStaleLockMs);
-    const bool locked = !settingsPath.isEmpty() && lock.tryLock(kLockTimeoutMs);
+    const bool locked = directoryReady && lock.tryLock(kLockTimeoutMs);
     if (locked) {
-        // The lock file records this process's pid and executable name next to a
-        // store we keep owner-only; QLockFile creates it at the umask default.
+        // The lock file records this process's pid and executable name.
+        // QLockFile creates it at the umask default; narrow that metadata too.
         QFile::setPermissions(lockPath, QFile::ReadOwner | QFile::WriteOwner);
     }
 
-    mergeAndWrite();
+    const QString failure = mergeAndWrite();
 
     if (locked)
         lock.unlock();
 
     // After the unlock: a handler is free to react by mutating the store, and
     // must not find the lock still held (see the INVARIANT above).
+    if (!failure.isEmpty()) {
+        m_lastSaveDegraded = false;
+        emit saveFailed(failure);
+        return;
+    }
     //
     // Only the FIRST degraded save of a run is reported. A store that could not
     // get the lock a moment ago will not get it for the next keystroke either,
     // and one toast per keystroke buries the very message it repeats. A save
     // that does get the lock re-arms the report, so a fresh outage is announced
     // again rather than swallowed for the rest of the session.
-    const bool degraded = !locked && !settingsPath.isEmpty();
+    const bool degraded = !locked;
     const bool announce = degraded && !m_lastSaveDegraded;
     m_lastSaveDegraded = degraded;
-    if (announce)
-        emit saveDegraded(describeLockFailure(lock, lockPath));
+    if (announce) {
+        const QString reason =
+            !directoryReady
+                ? tr("the profile lock directory %1 could not be created")
+                      .arg(directory.isEmpty() ? tr("(unavailable)") : directory)
+                : describeLockFailure(lock, lockPath);
+        emit saveDegraded(reason);
+    }
 }
 
-void ServerProfiles::mergeAndWrite()
+QString ServerProfiles::mergeAndWrite()
 {
+    // QSettings remembers its first error for the object's entire lifetime.
+    // Reopen after an earlier failure so repairing the path permits a retry.
+    // Do this under the merge lock: destruction may retry a pending flush.
+    if (m_settings->status() != QSettings::NoError) {
+        if (m_ownsDirectory) {
+            m_settings = std::make_unique<QSettings>(
+                m_settings->format(), m_settings->scope(),
+                m_settings->organizationName(), m_settings->applicationName());
+        } else {
+            const QString path = m_settings->fileName();
+            const QSettings::Format format = m_settings->format();
+            m_settings = std::make_unique<QSettings>(path, format);
+        }
+    }
     // Pick up anything another writer has put in the file since we last looked,
     // so the wipe-and-rewrite below cannot silently delete it. sync() is the
     // only way to make QSettings re-read a file changed underneath it; there is
     // nothing of ours pending at this point, so it cannot flush a half state.
     m_settings->sync();
+    if (m_settings->status() != QSettings::NoError)
+        return describeSaveFailure(*m_settings);
 
     // Profiles in the file that this instance neither holds nor deleted belong
     // to another writer and must survive. An id we removed stays removed even
@@ -431,6 +502,7 @@ void ServerProfiles::mergeAndWrite()
     // half-written server list is exactly what a crash must not leave behind.
     m_settings->sync();
     restrictPermissions();
+    return describeSaveFailure(*m_settings);
 }
 
 // The store holds no secret — authentication is ssh-agent/keys and nothing here
@@ -452,8 +524,12 @@ void ServerProfiles::mergeAndWrite()
 // directory we have no right to relock.
 void ServerProfiles::restrictPermissions() const
 {
+    // Registry keys have ACLs, not QFile permission bits. In particular the
+    // registry key's name must never be treated as a path to chmod.
+    if (usesRegistry(*m_settings))
+        return;
     const QString path = m_settings->fileName();
-    if (path.isEmpty())
+    if (path.isEmpty() || !QFileInfo(path).isFile())
         return;
     QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
     if (!m_ownsDirectory)

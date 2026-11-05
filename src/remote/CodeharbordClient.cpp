@@ -9,7 +9,6 @@
 #include <QPointer>
 #include <QTimer>
 
-#include <limits>
 #include <utility>
 
 namespace ch {
@@ -20,6 +19,10 @@ namespace {
 // shared mirror header so this client's synthetic failures and ch::rpc's
 // contract constants cannot drift apart.
 constexpr int kInternalError = rpc::kInternalError;
+
+// Requests cross JavaScript JSON.parse/stringify at the daemon. Keep minted
+// ids exactly representable there; the response parser still accepts qint64.
+constexpr qint64 kMaxRequestId = 9007199254740991LL; // Number.MAX_SAFE_INTEGER
 
 // Hard cap on ONE framed line, in BOTH directions. Inbound: a well-behaved
 // server delimits every message with '\n'; a peer that streams megabytes
@@ -247,7 +250,7 @@ void CodeharbordClient::setTransport(QIODevice* transport)
 
 void CodeharbordClient::finishTransportBinding()
 {
-    if (m_transportChangeDepth > 0)
+    if (m_transportChangeDepth > 0 || m_readInProgress)
         return;
     if (m_closeDeferred) {
         m_closeDeferred = false;
@@ -276,14 +279,14 @@ void CodeharbordClient::finishTransportBinding()
 qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
                                ResponseCallback cb)
 {
-    // Keep every id unique while it is in flight, including after the positive
-    // qint64 sequence wraps and against heartbeat probes, which use the same
-    // pending map. A wrap is practically unreachable, but skipping an occupied
-    // slot makes the routing invariant true rather than probabilistic.
+    // Keep every id unique while it is in flight, including after the JS-safe
+    // positive sequence wraps and against heartbeat probes in the same map.
+    // A wrap is practically unreachable; skipping occupied slots preserves
+    // routing even at that boundary without sending ids JavaScript rounds.
     qint64 id = m_nextId;
     while (m_pending.contains(id))
-        id = (id == std::numeric_limits<qint64>::max()) ? 1 : id + 1;
-    m_nextId = (id == std::numeric_limits<qint64>::max()) ? 1 : id + 1;
+        id = (id == kMaxRequestId) ? 1 : id + 1;
+    m_nextId = (id == kMaxRequestId) ? 1 : id + 1;
 
     QJsonObject request;
     request.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
@@ -427,7 +430,12 @@ qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,
 
 void CodeharbordClient::onReadyRead()
 {
-    if (m_transportChangeDepth > 0) {
+    readAvailable(true);
+}
+
+void CodeharbordClient::readAvailable(bool allowDeferredRetry)
+{
+    if (m_transportChangeDepth > 0 || m_readInProgress) {
         m_readDeferred = true;
         return;
     }
@@ -435,7 +443,7 @@ void CodeharbordClient::onReadyRead()
         return;
 
     const quint64 transportGeneration = m_transportGeneration;
-    const qsizetype bufferedBefore = m_readBuffer.size();
+    QPointer<CodeharbordClient> self(this);
     // ONE bounded read per call, sized to what is actually waiting.
     // QIODevice::read(n) resizes its result to n BEFORE reading, so asking for
     // the cap unconditionally requested a 32 MiB allocation (16 MiB rounded up
@@ -449,13 +457,33 @@ void CodeharbordClient::onReadyRead()
     const qint64 chunkSize =
         available > 0 ? qMin<qint64>(available, qint64(kMaxLineBytes) + 1)
                       : qint64(kMaxLineBytes) + 1;
-    m_readBuffer.append(m_transport->read(chunkSize));
+    // readData() is virtual and may synchronously announce EOF, rebind the
+    // transport, or delete this client. Keep its bytes local until it returns;
+    // a nested read must not route later bytes ahead of this chunk.
+    m_readInProgress = true;
+    QByteArray chunk = m_transport->read(chunkSize);
+    if (!self)
+        return;
+    m_readInProgress = false;
+    if (m_transportGeneration != transportGeneration) {
+        finishTransportBinding();
+        return;
+    }
+    if (m_closed)
+        return;
+    const bool readDeferred = std::exchange(m_readDeferred, false);
+    const bool readProgress = !chunk.isEmpty();
+    if (m_readBuffer.isEmpty())
+        m_readBuffer = std::move(chunk);
+    else {
+        m_readBuffer.append(chunk);
+        chunk.clear();
+    }
     // ANY bytes from the peer are proof of life, not just a ping reply. This is
     // one serialized JSONL stream, so while the peer is midway through writing a
     // multi-megabyte file.readFile frame its reply to our probe physically
     // cannot arrive — waiting for the reply alone would tear down exactly the
     // slow, healthy, large transfer the heartbeat is supposed to protect.
-    const bool readProgress = m_readBuffer.size() != bufferedBefore;
     if (readProgress) {
         ++m_readGeneration;
         m_heartbeatMisses = 0;
@@ -464,7 +492,6 @@ void CodeharbordClient::onReadyRead()
     // processLine() invokes a user callback that may delete this client. Watch
     // for that with a QPointer and stop touching members the instant it fires,
     // otherwise the loop's next m_readBuffer access is a use-after-free.
-    QPointer<CodeharbordClient> self(this);
 
     // Consume every complete line through a CURSOR pair held in members.
     // m_readPos is the first unconsumed byte; m_scanOffset is how far past it
@@ -494,7 +521,10 @@ void CodeharbordClient::onReadyRead()
         if (newline == -1)
             break;
         if (newline - m_readPos > kMaxLineBytes) {
-            dropUntrustedStream(transportGeneration);
+            dropUntrustedStream(
+                transportGeneration,
+                QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
+                    .arg(kMaxLineBytes));
             return;
         }
         // A DEEP copy, not sliced()/left(): those share m_readBuffer's
@@ -545,7 +575,17 @@ void CodeharbordClient::onReadyRead()
     // belongs to the caller and may still be physically healthy); what is gone
     // is our ability to trust a single byte on it, so nothing more is read.
     if (m_readBuffer.size() > kMaxLineBytes) {
-        dropUntrustedStream(transportGeneration);
+        dropUntrustedStream(
+            transportGeneration,
+            QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
+                .arg(kMaxLineBytes));
+        return;
+    }
+    // EOF emitted from readData() belongs after the bytes that read returned,
+    // not before their responses have been dispatched.
+    if (m_closeDeferred) {
+        m_closeDeferred = false;
+        onTransportClosed();
         return;
     }
     // QIODevice::read() intentionally takes only one bounded chunk. A socket
@@ -554,21 +594,21 @@ void CodeharbordClient::onReadyRead()
     // the event queue so a large burst is drained without ever allocating an
     // unbounded readAll() result.
     //
-    // `readProgress` is the termination condition, and it is not decoration:
-    // bytesAvailable() is only ADVERTISED capacity, so a device that reports
-    // readable bytes and then hands back none — a subclass whose count includes
-    // a partial record it will not release, say — would have this function
-    // re-post itself forever and starve the event loop while never consuming a
-    // byte. Rescheduling only after a read that actually delivered something
-    // makes progress a precondition for continuing, the same rule
-    // onTransportClosed()'s drain loop already applies to its own iteration.
+    // A nested readyRead emitted from an empty read is new readiness, not proof
+    // that the empty read made progress. Honor it once, then require bytes
+    // before another queued retry. This avoids both losing the only readiness
+    // event and spinning on a device that emits readiness but returns no bytes.
     // m_transport is checked for null in its own right: a callback above may
     // have deleted the caller-owned device without rebinding it.
-    if (readProgress && m_transport &&
-        m_transportGeneration == transportGeneration &&
-        !m_closed && m_transport->bytesAvailable() > 0) {
-        QMetaObject::invokeMethod(this, &CodeharbordClient::onReadyRead,
-                                  Qt::QueuedConnection);
+    const bool retryDeferredRead = readDeferred && allowDeferredRetry;
+    if (m_transport && m_transportGeneration == transportGeneration && !m_closed &&
+        (retryDeferredRead || (readProgress && m_transport->bytesAvailable() > 0))) {
+        QMetaObject::invokeMethod(
+            this, [this, transportGeneration, allowRetry = readProgress] {
+                if (m_transportGeneration == transportGeneration && !m_closed)
+                    readAvailable(allowRetry);
+            },
+            Qt::QueuedConnection);
     }
 }
 
@@ -600,21 +640,18 @@ void CodeharbordClient::releaseReadBuffer()
     m_scanOffset = 0;
 }
 
-void CodeharbordClient::dropUntrustedStream(quint64 transportGeneration)
+void CodeharbordClient::dropUntrustedStream(quint64 transportGeneration,
+                                           const QString& warning)
 {
     // Release the garbage BEFORE announcing anything: a protocolWarning slot may
     // delete this client, and the release must not depend on surviving the emit.
     releaseReadBuffer();
-    // Framing is lost: we no longer know where the next message begins, so
-    // nothing still queued on this transport is a message. This is what keeps
-    // onTransportClosed()'s last-gasp drain from reading — and routing — those
-    // very bytes back, which, because each 16 MiB chunk trips the cap again,
-    // re-entered the close path once per chunk of garbage.
+    // Do not drain bytes after framing loss or an unsupported JSON document.
+    // Such a document cannot be routed to its pending id, so continuing could
+    // leave its caller waiting forever while later frames mutate peer state.
     m_streamUntrusted = true;
     QPointer<CodeharbordClient> self(this);
-    emit protocolWarning(
-        QStringLiteral("RPC line exceeded %1 bytes; resetting transport")
-            .arg(kMaxLineBytes));
+    emit protocolWarning(warning);
     if (!self)
         return;
     // Only the transport those bytes came from: a warning slot is free to have
@@ -627,6 +664,16 @@ void CodeharbordClient::processLine(const QByteArray& line)
 {
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
+    if (parseError.error == QJsonParseError::DeepNesting) {
+        // Node accepts deeper valid JSON than Qt. The response id is unavailable
+        // after parse failure, so fail this binding rather than silently losing
+        // a response while healthy heartbeat traffic keeps its caller waiting.
+        dropUntrustedStream(
+            m_transportGeneration,
+            QStringLiteral("RPC JSON exceeds the native parser nesting limit; "
+                           "resetting transport"));
+        return;
+    }
     if (parseError.error != QJsonParseError::NoError) {
         emit protocolWarning(
             QStringLiteral("malformed RPC message: %1").arg(parseError.errorString()));
@@ -683,7 +730,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
     // range and its `defaultValue` otherwise, so probing with two distinct
     // sentinels detects a fractional or out-of-range id without a manual
     // float->int cast (UB out of range). They agree only for a genuine integer
-    // id; ids are 64-bit now, matching m_nextId (RC14).
+    // id. Retain qint64 parsing even though newly minted ids are JS-safe.
     const qint64 id = idValue.toInteger(0);
     if (id != idValue.toInteger(1)) {
         emit protocolWarning(
@@ -822,7 +869,7 @@ void CodeharbordClient::processLine(const QByteArray& line)
 
 void CodeharbordClient::onTransportClosed()
 {
-    if (m_transportChangeDepth > 0) {
+    if (m_transportChangeDepth > 0 || m_readInProgress) {
         m_closeDeferred = true;
         return;
     }
@@ -841,11 +888,8 @@ void CodeharbordClient::onTransportClosed()
     // pending requests; otherwise a valid response just beyond the first
     // chunk would be discarded by the close path.
     //
-    // Skipped entirely once the byte stream has been declared UNTRUSTWORTHY (an
-    // unframed or over-cap line): there we no longer know where a frame begins,
-    // so those bytes are not messages to deliver — and reading them anyway trips
-    // the same cap again, which re-enters this function once per 16 MiB of
-    // garbage instead of closing the transport.
+    // A rejected stream (framing loss or unsupported JSON nesting) must not
+    // drain further frames: those bytes belong to a binding being abandoned.
     while (!m_streamUntrusted && m_transport && m_transport->bytesAvailable() > 0) {
         const qint64 availableBefore = m_transport->bytesAvailable();
         onReadyRead();
@@ -992,9 +1036,9 @@ void CodeharbordClient::onHeartbeatTick()
         m_heartbeatTimer->stop();
         return;
     }
-    // Reads intentionally wait until every invalidation listener has run. A
-    // nested event-loop tick must not mistake that barrier for peer silence.
-    if (m_transportChangeDepth > 0)
+    // Reads wait for invalidation listeners and an active virtual read to finish.
+    // A nested event-loop tick must not mistake either barrier for peer silence.
+    if (m_transportChangeDepth > 0 || m_readInProgress)
         return;
 
     QPointer<CodeharbordClient> self(this);

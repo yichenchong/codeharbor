@@ -21,6 +21,8 @@
 #include <QString>
 #include <QtTest/QtTest>
 
+#include <limits>
+
 using ch::CodeharbordClient;
 using ch::TmuxActivityPoller;
 
@@ -57,8 +59,10 @@ private slots:
     void ageIsComputedFromTheServersNowMs();
     // A pane the daemon could not date is reported as nothing at all.
     void aNullLastActivityEmitsNothing();
+    void malformedTimestampsAreNotActivity();
     // A slow or wedged daemon must not accumulate identical requests.
     void anOverlappingTickIssuesNoSecondRequest();
+    void reentrantPollWaitsUntilTheListingIsPublished();
     void rebindingTheSameClientRejectsItsOldReply();
     void removedDevSessionsAreNotPublished();
     void rebindingFromAnActivitySlotStopsTheOldListing();
@@ -259,6 +263,78 @@ void TstTmuxActivity::aNullLastActivityEmitsNothing()
                                               QStringLiteral("tOk"), 4000)}}});
     QTest::qWait(100);
     QCOMPARE(spy.count(), 1);
+}
+
+void TstTmuxActivity::malformedTimestampsAreNotActivity()
+{
+    QSignalSpy spy(m_poller, &TmuxActivityPoller::activityObserved);
+    m_poller->setDevSessionIds({QStringLiteral("d1")});
+    const QList<QJsonObject> first = takeRequests();
+    QCOMPARE(first.size(), 1);
+    respond(first.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{
+                {QStringLiteral("nowMs"), 10000},
+                {QStringLiteral("panes"),
+                 QJsonArray{paneEntry("d1", "negative", -1),
+                            paneEntry("d1", "fractional", 999.5),
+                            paneEntry("d1", "unsafe", 9007199254740992.0),
+                            paneEntry("d1", "overflow", 1e100),
+                            paneEntry("d1", "negativeOverflow", -1e100),
+                            paneEntry("d1", "nativeMin",
+                                      QJsonValue(std::numeric_limits<qint64>::min())),
+                            paneEntry("d1", "valid", 9000),
+                            paneEntry("d1", "epoch", 0)}},
+            });
+    QTRY_COMPARE(spy.count(), 2);
+    QCOMPARE(spy.at(0).at(1).toString(), QStringLiteral("valid"));
+    QCOMPARE(spy.at(0).at(2).toLongLong(), 1000LL);
+    QCOMPARE(spy.at(1).at(1).toString(), QStringLiteral("epoch"));
+    QCOMPARE(spy.at(1).at(2).toLongLong(), 10000LL);
+
+    // An unusable listing clock invalidates even an otherwise valid pane.
+    for (double nowMs : {-1.0, 10000.5, 9007199254740992.0, 1e100}) {
+        m_poller->pollNow();
+        const QList<QJsonObject> request = takeRequests();
+        QCOMPARE(request.size(), 1);
+        respond(request.first().value(QStringLiteral("id")).toInteger(),
+                QJsonObject{{QStringLiteral("nowMs"), nowMs},
+                            {QStringLiteral("panes"),
+                             QJsonArray{paneEntry("d1", "invalidClock", 9000)}}});
+        QTest::qWait(50);
+        QCOMPARE(spy.count(), 2);
+    }
+
+    // Both endpoints remain representable when the timestamp is in the future.
+    m_poller->pollNow();
+    const QList<QJsonObject> last = takeRequests();
+    QCOMPARE(last.size(), 1);
+    respond(last.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 0},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "future", 9007199254740991.0)}}});
+    QTRY_COMPARE(spy.count(), 3);
+    QCOMPARE(spy.last().at(2).toLongLong(), -9007199254740991LL);
+}
+
+void TstTmuxActivity::reentrantPollWaitsUntilTheListingIsPublished()
+{
+    QSignalSpy spy(m_poller, &TmuxActivityPoller::activityObserved);
+    connect(m_poller, &TmuxActivityPoller::activityObserved, this,
+            [this] { m_poller->pollNow(); });
+    m_poller->setDevSessionIds({QStringLiteral("d1")});
+    const QList<QJsonObject> first = takeRequests();
+    QCOMPARE(first.size(), 1);
+    respond(first.first().value(QStringLiteral("id")).toInteger(),
+            QJsonObject{{QStringLiteral("nowMs"), 10000},
+                        {QStringLiteral("panes"),
+                         QJsonArray{paneEntry("d1", "first", 9000),
+                                    paneEntry("d1", "second", 9500)}}});
+    QTRY_COMPARE(spy.count(), 2);
+    QCOMPARE(takeRequests(100).size(), 0);
+
+    // Publication releases the guard; the next deliberate poll is not lost.
+    m_poller->pollNow();
+    QCOMPARE(takeRequests().size(), 1);
 }
 
 // A daemon that has gone slow or wedged must not accumulate an unbounded queue

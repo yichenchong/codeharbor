@@ -10,6 +10,8 @@ import path from "node:path";
 
 export const CH_EVENT_VERSION = 1 as const;
 
+export const AGENT_SOCKET_ENV = "CODEHARBOR_AGENT_SOCKET";
+
 export const AGENT_STATES = [
     "starting",
     "running",
@@ -179,11 +181,12 @@ export function parseEventLine(line: unknown): AgentEvent | null {
 }
 
 /**
- * Resolve the bridge socket path (SPEC 6.3): `$XDG_RUNTIME_DIR/codeharbor.sock`
- * when the runtime directory is set, otherwise `~/.cache/codeharbor/events.sock`.
- * The two file names differ; that is what SPEC 6.3 specifies, and both the
- * bridge and every hook resolve the path through this one function so the two
- * ends cannot disagree.
+ * Resolve the bridge socket path (SPEC 6.3). An explicit CODEHARBOR_AGENT_SOCKET
+ * carries the service's actual shared endpoint into tmux children whose HOME or
+ * XDG_RUNTIME_DIR may differ. Preserve that exact absolute pathname; a present
+ * but invalid override throws rather than silently routing to another socket.
+ * When absent, use `$XDG_RUNTIME_DIR/codeharbor.sock`, otherwise
+ * `~/.cache/codeharbor/events.sock`.
  *
  * A RELATIVE $XDG_RUNTIME_DIR is ignored rather than honoured. The variable is
  * defined to be an absolute path, and joining a relative one produces a socket
@@ -202,6 +205,13 @@ export function parseEventLine(line: unknown): AgentEvent | null {
  * `os.homedir()` remains the fallback for an unset or relative $HOME.
  */
 export function resolveSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+    const explicit = env[AGENT_SOCKET_ENV];
+    if (explicit !== undefined) {
+        if (!path.isAbsolute(explicit) || explicit.includes("\0")) {
+            throw new Error(`${AGENT_SOCKET_ENV} must be an absolute socket pathname without NUL bytes`);
+        }
+        return explicit;
+    }
     const runtimeDir = env.XDG_RUNTIME_DIR;
     if (runtimeDir && path.isAbsolute(runtimeDir)) {
         return path.join(runtimeDir, "codeharbor.sock");

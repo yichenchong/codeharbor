@@ -22,6 +22,7 @@
 #include <QSignalSpy>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QVector>
 #include <QtTest/QtTest>
 
@@ -209,6 +210,7 @@ private:
     QString m_user;
     QString m_node;
     QString m_repo;
+    std::optional<QTemporaryDir> m_knownHostsDir;
     QString m_knownHostsPath;
 
     // Remote scratch dir selecting a private bridge socket, so this gate never
@@ -254,8 +256,11 @@ void TstLiveAgent::initTestCase()
     m_repo = env("CH_LIVE_REPO");
     m_knownHostsPath = env("CH_LIVE_KNOWN_HOSTS");
     if (m_knownHostsPath.isEmpty()) {
-        m_knownHostsPath =
-            QDir::temp().filePath(QStringLiteral("ch_live_agent_known_hosts"));
+        m_knownHostsDir.emplace(
+            QDir::tempPath() + QStringLiteral("/ch-live-agent-known-hosts-XXXXXX"));
+        QVERIFY2(m_knownHostsDir->isValid(),
+                 qPrintable(m_knownHostsDir->errorString()));
+        m_knownHostsPath = m_knownHostsDir->filePath(QStringLiteral("known_hosts"));
     }
     QVERIFY2(!m_host.isEmpty() && m_port != 0 && !m_user.isEmpty()
                  && !m_node.isEmpty() && !m_repo.isEmpty(),

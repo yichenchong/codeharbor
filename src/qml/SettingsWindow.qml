@@ -46,6 +46,10 @@ Rectangle {
     // The Name field lives inside the server pane's Component and cannot be
     // reached from here by id; the pane listens for this instead.
     signal profileNameFocusRequested()
+    // The shell owns leaving a workspace, including its unsaved-edit prompt.
+    signal connectRequested(string profileId)
+    signal disconnectRequested()
+    signal upgradeRequested(string profileId)
 
     // The host owns visibility; this component only manages its sheet content.
     color: Theme.surface
@@ -1605,24 +1609,30 @@ Rectangle {
                     SheetButton {
                         objectName: "serverConnectButton"
                         text: qsTr("Connect")
-                        enabled: root.hasSelection()
+                        enabled: root.hasSelection() && root.profileValid()
                                   && typeof app !== "undefined" && app
                         accent: Theme.success
-                        onClicked: app.connectToProfile(root.selectedProfileId)
+                        onClicked: {
+                            root.saveProfile();
+                            root.connectRequested(root.selectedProfileId);
+                        }
                     }
                     SheetButton {
                         objectName: "serverDisconnectButton"
                         text: qsTr("Disconnect")
                         enabled: typeof app !== "undefined" && app
-                        onClicked: app.disconnectServer()
+                        onClicked: root.disconnectRequested()
                     }
                     SheetButton {
                         objectName: "serverUpgradeButton"
                         text: qsTr("Update Remote Service")
-                        enabled: root.hasSelection()
+                        enabled: root.hasSelection() && root.profileValid()
                                   && typeof app !== "undefined" && app
                         accent: Theme.warning
-                        onClicked: app.upgradeRemoteService(root.selectedProfileId)
+                        onClicked: {
+                            root.saveProfile();
+                            root.upgradeRequested(root.selectedProfileId);
+                        }
                     }
                 }
             }

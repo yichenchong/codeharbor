@@ -17,9 +17,10 @@ import QtQuick.Shapes
 // QML-reachable in-memory load and no image-provider equivalent for PDF pages —
 // so the document is spooled to app-private storage by
 // ch::MobileViewerService::requestPdf() and the URL of THAT file is what
-// PdfDocument sees. The file is deleted on unload (releasePdf below), on service
-// destruction, and at app start; and it is never handed to an OS handler. The
-// in-memory route was preferred and is not available; see requestPdf()'s note.
+// PdfDocument sees. The pane deletes its file on unload; peer retirement and
+// service destruction remove only this service's private temporary directory.
+// Crash leftovers can remain in app cache until OS eviction. No OS handler sees
+// the URL; the in-memory route was preferred but is not exposed by QtQuick.Pdf.
 Item {
     id: root
 
@@ -43,6 +44,18 @@ Item {
     // the time onRemotePathChanged runs, and from `requestedPath`, which is
     // cleared the moment a reply lands.
     property string spooledPath: ""
+
+    // A compressed PDF can describe a page far larger than a phone can raster.
+    // Keep each page at <= 16 Mi pixels and <= 8192 pixels on either axis,
+    // independently of zoom, device pixel ratio and the page's aspect ratio.
+    function boundedRasterSize(width, height) {
+        if (!isFinite(width) || !isFinite(height) || width <= 0 || height <= 0)
+            return Qt.size(1, 1); // Zero would ask the image loader for its default size.
+        const scale = Math.min(1, 8192 / width, 8192 / height,
+                               Math.sqrt((16 * 1024 * 1024) / width / height));
+        return Qt.size(Math.max(1, Math.floor(width * scale)),
+                       Math.max(1, Math.floor(height * scale)));
+    }
 
     // Delete every spool file this page still owns: the document on screen, and
     // any request whose reply this page will now ignore. requestPdf() writes the
@@ -101,7 +114,10 @@ Item {
         root.started = true;
         root.reload();
     }
-    Component.onDestruction: root.releaseSpool()
+    Component.onDestruction: {
+        root.documentSource = "";
+        root.releaseSpool();
+    }
 
     Connections {
         target: root.service
@@ -176,20 +192,36 @@ Item {
             id: pdfPage
             required property int index
             readonly property size pointSize: pdfDocument.pagePointSize(index)
-            readonly property real pageScale: width > 0 && pointSize.width > 0
-                                              ? width / pointSize.width : 1
+            readonly property bool validGeometry: pointSize.width > 0 && pointSize.height > 0
+                && isFinite(pointSize.width) && isFinite(pointSize.height)
+                && isFinite(width * pointSize.height / pointSize.width)
+            readonly property real rasterWidth: view.width * view.renderedZoom * Screen.devicePixelRatio
+            readonly property size rasterSize: root.boundedRasterSize(
+                rasterWidth, rasterWidth * pointSize.height / pointSize.width)
+            readonly property real pageScale: validGeometry ? width / pointSize.width : 1
             width: view.contentWidth
-            height: pointSize.height * pageScale
+            height: validGeometry ? pointSize.height * pageScale : view.height
 
             PdfPageImage {
                 id: pageImage
                 objectName: "pdfPageImage"
                 anchors.fill: parent
-                document: pdfDocument
+                document: pdfPage.validGeometry ? pdfDocument : null
                 currentFrame: pdfPage.index
                 asynchronous: true
-                sourceSize.width: Math.ceil(view.width * view.renderedZoom * Screen.devicePixelRatio)
+                sourceSize: pdfPage.rasterSize
+                cache: false
                 fillMode: Image.PreserveAspectFit
+            }
+            Text {
+                anchors.centerIn: parent
+                width: view.width - 2 * MobileTheme.spacingLarge
+                visible: !pdfPage.validGeometry
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                horizontalAlignment: Text.AlignHCenter
+                color: MobileTheme.textDim
+                text: qsTr("This page has invalid dimensions and cannot be drawn.")
             }
             Shape {
                 anchors.fill: parent

@@ -183,19 +183,20 @@ struct UpdateTerminalPaneParams {
 // is failed with the reserved code -32603, because decoding it would manufacture
 // a record with an empty id that the rest of the client cannot tell from a real
 // one. Concretely, a result that is not the expected JSON kind (an object per
-// record, an array for list()), an acknowledgement without boolean `ok:true`,
-// and, for getLayout/setLayout, a SessionLayout row whose `tree` is missing or
-// fails split-tree validation. getLayout is the sole
+// record, an array for list()), a present record member of the wrong type or an
+// out-of-int-range/fractional position, an acknowledgement without boolean
+// `ok:true`, and, for getLayout/setLayout, a SessionLayout row whose `tree` is
+// missing or fails split-tree validation. getLayout is the sole
 // method for which a JSON null result is legitimate — it means "this region has
 // no persisted layout" and delivers std::nullopt with no error. An existing but
 // unreadable tree must fail instead: treating it as absent would let callers
 // overwrite the server's layout with a newly seeded default.
 //
-// Two failures are detected here rather than received, and both are the
+// Two kinds of failure are detected here rather than received, and both are the
 // CALLER's mistake, not the server's: an addressing-mode violation in
-// resolveTerminalPane and a setLayout tree that cannot be serialized. They are
-// reported as -32602 ("invalid params"), the code the server itself would have
-// answered with, and they are always delivered ASYNCHRONOUSLY — posted to the
+// resolveTerminalPane and a setLayout/ensureInitialLayout tree that cannot be
+// serialized. They are reported as -32602 ("invalid params"), the code the server
+// itself would have answered with, and always arrive asynchronously — posted to the
 // client's event loop, never invoked before the method returns.
 //
 // Lifetime: `client` is borrowed, not owned, must be non-null, and must outlive
@@ -324,8 +325,8 @@ public:
     // needs it, it should be added with the DeleteCallback shape the other two
     // deletes use, because that method reports tmux targets too.
 
-    // Per-region split layouts. getLayout delivers std::nullopt when the region
-    // has no persisted layout (and likewise when the stored tree is unreadable);
+    // Per-region split layouts. getLayout delivers std::nullopt with no error
+    // only when the region has no persisted layout; an unreadable tree fails.
     // setLayout delivers the stored tree on success, and fails with -32603
     // rather than delivering an empty std::nullopt if the echoed row carries no
     // valid tree. A `tree` that SplitNode::tryToJson() refuses is never sent:
@@ -335,6 +336,15 @@ public:
                    LayoutCallback cb);
     void setLayout(const ServerId& serverId, const DevSessionId& devSessionId,
                    Region region, const SplitNode& tree, LayoutCallback cb);
+    // Initialize only an absent region row, atomically on the server. The
+    // returned tree is authoritative: another client may have initialized first,
+    // and initial terminal ids are minted by the server, not copied from `tree`.
+    // Existing empty layouts are preserved. An unreadable winning row fails
+    // with -32603 rather than authorizing a replacement. Invalid input trees
+    // fail asynchronously with -32602, like setLayout.
+    void ensureInitialLayout(const ServerId& serverId,
+                             const DevSessionId& devSessionId, Region region,
+                             const SplitNode& tree, LayoutCallback cb);
 
 private:
     CodeharbordClient* m_client;

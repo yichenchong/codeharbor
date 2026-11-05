@@ -142,20 +142,27 @@ QVariantMap readViewerDefaults(QSettings& settings)
 // properties are the only way in or out of these keys.
 bool isReservedPath(const QString& path)
 {
-    return path == kThemeKey || path == kPaletteKey || path == kPaletteSizeKey
-           || path == kToolbarKey || path == kFontSizeKey
-           || path == kPixelRatioKey
-           || path.startsWith(kViewerDefaultsGroup + QLatin1Char('/'));
+    // Native and INI keys are case-insensitive on Windows. Reserve the same
+    // spellings everywhere so a portable generic pair cannot bypass validation.
+    return path.compare(kThemeKey, Qt::CaseInsensitive) == 0
+           || path.compare(kPaletteKey, Qt::CaseInsensitive) == 0
+           || path.compare(kPaletteSizeKey, Qt::CaseInsensitive) == 0
+           || path.compare(kToolbarKey, Qt::CaseInsensitive) == 0
+           || path.compare(kFontSizeKey, Qt::CaseInsensitive) == 0
+           || path.compare(kPixelRatioKey, Qt::CaseInsensitive) == 0
+           || path.startsWith(kViewerDefaultsGroup + QLatin1Char('/'),
+                              Qt::CaseInsensitive);
 }
 
-// A generic pair may not carry '/': the separator is what keeps one group's
-// keys inside its own subtree, and a key containing it could otherwise be spelt
-// so that it lands somewhere under `settings/` that this pair does not name.
+// Neither separator is portable inside a generic pair: QSettings also treats
+// backslashes as path separators on Windows.
 bool isAddressable(const QString& group, const QString& key)
 {
     return !group.isEmpty() && !key.isEmpty()
            && !group.contains(QLatin1Char('/'))
+           && !group.contains(QLatin1Char('\\'))
            && !key.contains(QLatin1Char('/'))
+           && !key.contains(QLatin1Char('\\'))
            && !isReservedPath(kPrefix + group + QLatin1Char('/') + key);
 }
 

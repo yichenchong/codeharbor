@@ -180,9 +180,9 @@ void InternalUrlMap::evictIfNeeded()
     // screen — so pinned entries are neither evicted nor counted. Counting them
     // would be worse than useless: with the cap reached and every entry pinned,
     // the next mint would be evicted the instant it was handed out, killing the
-    // URL a pane had just been given. The number of pins is bounded by the
-    // number of live panes, which is orders of magnitude below maxEntries, so
-    // the table stays bounded either way.
+    // URL a pane had just been given. Pins follow live resources, including
+    // Markdown images, rather than just panes: the unpinned cache is bounded,
+    // while displayed resources remain mapped until their owners release them.
     if (m_lru.size() <= m_maxEntries)
         return; // cheap common case: not even the pins could push it over
     qsizetype unpinned = m_lru.size() - m_pins.size();
@@ -477,11 +477,8 @@ void InternalUrlSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         refuse(Failure::UnknownResource, QWebEngineUrlRequestJob::UrlNotFound);
         return;
     }
-    // Every id must stand for a REMOTE FILE. The map itself accepts any QUrl,
-    // so this is the one place that pins the invariant: without it an id minted
-    // for, say, an http URL would be turned into a server path below and read
-    // off the remote filesystem — an attacker-chosen path smuggled in through a
-    // URL the app was merely asked to display.
+    // Every id must stand for a REMOTE FILE. The map rejects other schemes when
+    // minting ids; retain this check at the read boundary as well.
     if (fileUrl.scheme().compare(QLatin1String("file"), Qt::CaseInsensitive) != 0) {
         refuse(Failure::NotARemoteFile, QWebEngineUrlRequestJob::UrlNotFound);
         return;

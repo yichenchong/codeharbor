@@ -141,21 +141,26 @@ function(codeharbor_embed_web_bundle)
     # exactly the same list as before.
     file(GLOB_RECURSE _chb_inputs CONFIGURE_DEPENDS
          ${_chb_src}/src/*.ts ${_chb_src}/src/*.css)
+    # A lockfile-only dependency update changes the emitted bundle even when
+    # no workspace source or manifest changed.
     list(APPEND _chb_inputs
          ${_chb_src}/build.mjs
          ${_chb_src}/index.html
-         ${_chb_src}/package.json)
+         ${_chb_src}/package.json
+         ${CMAKE_SOURCE_DIR}/package.json
+         ${CMAKE_SOURCE_DIR}/package-lock.json)
 
     set(_chb_stale FALSE)
-    if(NOT EXISTS ${_chb_dist}/index.html)
-        set(_chb_stale TRUE)
-    else()
-        foreach(_chb_in IN LISTS _chb_inputs)
-            if("${_chb_in}" IS_NEWER_THAN "${_chb_dist}/index.html")
-                set(_chb_stale TRUE)
-            endif()
-        endforeach()
-    endif()
+    foreach(_chb_file IN LISTS CHB_FILES)
+        if(NOT EXISTS ${_chb_dist}/${_chb_file})
+            set(_chb_stale TRUE)
+        endif()
+    endforeach()
+    foreach(_chb_in IN LISTS _chb_inputs)
+        if("${_chb_in}" IS_NEWER_THAN "${_chb_dist}/index.html")
+            set(_chb_stale TRUE)
+        endif()
+    endforeach()
 
     # Flipping the source-map setting changes what dist/ must CONTAIN without
     # touching the mtime of a single input, so the timestamp comparison above

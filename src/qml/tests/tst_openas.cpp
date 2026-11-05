@@ -178,6 +178,7 @@ private slots:
     void menuContentsForTextFile();
     void menuContentsForImageFile();
     void openAsNewPanePreservesOriginal();
+    void openWithDialogDoesNotFollowDirectoryNavigation();
 
 private:
     QQuickView *directoryView(ViewerStub *stub, const QVariantList &entries,
@@ -287,6 +288,60 @@ void TstOpenAs::menuContentsForImageFile()
     QCOMPARE(openAs.constFirst().at(0).toString(), QStringLiteral("/repo/logo.png"));
     QCOMPARE(openAs.constFirst().at(1).toString(), QStringLiteral("image"));
     QCOMPARE(openAs.constFirst().at(2).toBool(), false);
+}
+
+void TstOpenAs::openWithDialogDoesNotFollowDirectoryNavigation()
+{
+    ViewerStub stub;
+    std::unique_ptr<QQuickView> view;
+    const QVariantList entries = {
+        QVariantMap{{QStringLiteral("name"), QStringLiteral("main.cpp")},
+                    {QStringLiteral("kind"), QStringLiteral("file")}}};
+    QVERIFY(directoryView(&stub, entries, view));
+    QObject *const root = view->rootObject();
+    QSignalSpy opened(root, SIGNAL(openWithRequested(QString, QString)));
+    QVERIFY(opened.isValid());
+
+    QObject *row = findRow(root, QStringLiteral("main.cpp"));
+    QVERIFY(row);
+    QObject *menu = findNamed(row, QStringLiteral("directoryContextMenu"));
+    QVERIFY(menu);
+    QObject *action = findText(menu, QStringLiteral("Open with\u2026"));
+    QVERIFY(action);
+    QVERIFY(QMetaObject::invokeMethod(action, "triggered"));
+    QObject *const dialog = findNamed(root, QStringLiteral("customApplicationSchemeDialog"));
+    QObject *const field = findNamed(root, QStringLiteral("customApplicationSchemeField"));
+    QVERIFY(dialog);
+    QVERIFY(field);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    field->setProperty("text", QStringLiteral("zed"));
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QCOMPARE(opened.size(), 1);
+    QCOMPARE(opened.constFirst().at(0).toString(), QStringLiteral("/repo/main.cpp"));
+    QCOMPARE(opened.constFirst().at(1).toString(), QStringLiteral("zed"));
+
+    QVERIFY(QMetaObject::invokeMethod(action, "triggered"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    field->setProperty("text", QStringLiteral("zed"));
+    // An agent can navigate this same directory handler while its modal dialog
+    // is open. The old row must not become "/other/main.cpp" on acceptance.
+    root->setProperty("url", QUrl(QStringLiteral("file:///other/")));
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QCOMPARE(opened.size(), 1);
+
+    // A fresh action in the new directory still names its own target.
+    QTRY_VERIFY((row = findRow(root, QStringLiteral("main.cpp"))));
+    menu = findNamed(row, QStringLiteral("directoryContextMenu"));
+    QVERIFY(menu);
+    action = findText(menu, QStringLiteral("Open with\u2026"));
+    QVERIFY(action);
+    QVERIFY(QMetaObject::invokeMethod(action, "triggered"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    field->setProperty("text", QStringLiteral("zed"));
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QCOMPARE(opened.size(), 2);
+    QCOMPARE(opened.constLast().at(0).toString(), QStringLiteral("/other/main.cpp"));
 }
 
 void TstOpenAs::openAsNewPanePreservesOriginal()

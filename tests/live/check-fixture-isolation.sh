@@ -18,9 +18,11 @@ generator="$script_dir/generate-fixture.sh"
 
 fail() {
     echo "LIVE FIXTURE ISOLATION FAILED: $*" >&2
-    echo "Run $generator, then restart the fixture sshd before retrying." >&2
-    echo "Proceeding without that repair can make codeharbord migrate and corrupt" >&2
-    echo "the developer's real ~/.local/share/codeharbor/codeharbor.sqlite." >&2
+    echo "Stop only this fixture's sshd/daemon/bridge/private tmux, run $generator," >&2
+    echo "then restart its sshd before retrying." >&2
+    echo "Unsafe environments can migrate the developer's real workspace database" >&2
+    echo "or collide with their ordinary bridge socket. Never remove a shared socket." >&2
+    echo "Recovery snapshots and Bash history must also remain isolated." >&2
     exit 1
 }
 
@@ -71,12 +73,76 @@ if parent=$(CDPATH= cd -- "$(dirname -- "$default_db")" 2>/dev/null && pwd -P); 
     default_db="$parent/$(basename -- "$default_db")"
 fi
 printf 'DB=%s\nHOME=%s\nDEFAULT_DB=%s\n' "$db" "$home" "$default_db"
+runtime=${XDG_RUNTIME_DIR-}
+case "$runtime" in
+    /*) ;;
+    *) echo "XDG_RUNTIME_DIR must name the fixture's absolute private runtime" >&2; exit 1 ;;
+esac
+if [ -L "$runtime" ] || [ ! -d "$runtime" ]; then
+    echo "refusing redirected or missing XDG_RUNTIME_DIR ($runtime)" >&2
+    exit 1
+fi
+private=$(find "$runtime" -prune -type d -user "$(id -u)" -perm 0700 -print) || exit 1
+if [ -z "$private" ]; then
+    echo "XDG_RUNTIME_DIR must be owned by this account with mode 0700 ($runtime)" >&2
+    exit 1
+fi
+runtime=$(CDPATH= cd -- "$runtime" && pwd -P) || exit 1
+if [ "$runtime" != "$(dirname -- "$db")/runtime" ]; then
+    echo "XDG_RUNTIME_DIR is not the database fixture's reserved runtime ($runtime)" >&2
+    exit 1
+fi
+printf 'RUNTIME=%s\n' "$runtime"
+data=${XDG_DATA_HOME-}
+case "$data" in
+    /*) ;;
+    *) echo "XDG_DATA_HOME must name the fixture's absolute private data directory" >&2; exit 1 ;;
+esac
+if [ -L "$data" ] || [ ! -d "$data" ]; then
+    echo "refusing redirected or missing XDG_DATA_HOME ($data)" >&2
+    exit 1
+fi
+private=$(find "$data" -prune -type d -user "$(id -u)" -perm 0700 -print) || exit 1
+if [ -z "$private" ]; then
+    echo "XDG_DATA_HOME must be owned by this account with mode 0700 ($data)" >&2
+    exit 1
+fi
+data=$(CDPATH= cd -- "$data" && pwd -P) || exit 1
+if [ "$data" != "$(dirname -- "$db")/data" ]; then
+    echo "XDG_DATA_HOME is not the database fixture's reserved data directory ($data)" >&2
+    exit 1
+fi
+if [ "${HISTFILE-}" != /dev/null ]; then
+    echo "HISTFILE must be /dev/null in the live fixture session" >&2
+    exit 1
+fi
+printf 'DATA=%s\n' "$data"
+tmux=${TMUX_TMPDIR-}
+case "$tmux" in
+    /*) ;;
+    *) echo "TMUX_TMPDIR must name the fixture's absolute private tmux directory" >&2; exit 1 ;;
+esac
+if [ -L "$tmux" ] || [ ! -d "$tmux" ]; then
+    echo "refusing redirected or missing TMUX_TMPDIR ($tmux)" >&2
+    exit 1
+fi
+private=$(find "$tmux" -prune -type d -user "$(id -u)" -perm 0700 -print) || exit 1
+if [ -z "$private" ]; then
+    echo "TMUX_TMPDIR must be owned by this account with mode 0700 ($tmux)" >&2
+    exit 1
+fi
+tmux=$(CDPATH= cd -- "$tmux" && pwd -P) || exit 1
+if [ "$tmux" != "$(dirname -- "$db")/tmux" ]; then
+    echo "TMUX_TMPDIR is not the database fixture's reserved tmux directory ($tmux)" >&2
+    exit 1
+fi
+printf 'TMUX=%s\n' "$tmux"
 SH
 )
 set -- "$@" "$user@$host" "$remote_probe"
 
 if ! reported=$(ssh "$@" 2>&1); then
-    fail "could not ask the fixture what CODEHARBOR_DB is set to: $reported"
+    fail "could not verify the fixture database/runtime/recovery/history/tmux environment: $reported"
 fi
 
 # A here-string, not `printf ... | awk`. `set -o pipefail` is on and the awk

@@ -54,10 +54,12 @@ Item {
     //   pending  — resolvePath asked, answer outstanding
     //   resolved — absolute remote path, inside the root, safe to read
     //   refused  — why it will not be fetched (shown as alt text instead)
-    property var imagePending: ({})
-    property var imageResolved: ({})
-    property var imageRefused: ({})
-    property var imageSources: ({})
+    // Remote paths can be "constructor" or "__proto__"; none may inherit an
+    // Object.prototype entry and look as if it had already been requested.
+    property var imagePending: Object.create(null)
+    property var imageResolved: Object.create(null)
+    property var imageRefused: Object.create(null)
+    property var imageSources: Object.create(null)
 
     // ch::MarkdownModel, minted by the service and parented to this page (see
     // MobileViewerService::createMarkdownModel). Not a declarative type because
@@ -84,10 +86,10 @@ Item {
         root.errorText = "";
         root.truncated = false;
         root.loading = false;
-        root.imagePending = ({});
-        root.imageResolved = ({});
-        root.imageRefused = ({});
-        root.imageSources = ({});
+        root.imagePending = Object.create(null);
+        root.imageResolved = Object.create(null);
+        root.imageRefused = Object.create(null);
+        root.imageSources = Object.create(null);
         if (root.blocks)
             root.blocks.clear();
         if (root.remotePath.length === 0 || !root.service)
@@ -139,7 +141,8 @@ Item {
     }
 
     function refuseImage(writtenPath, reason) {
-        const refused = root.imageRefused;
+        // Replace the map so bindings to individual refusal reasons are notified.
+        const refused = Object.assign(Object.create(null), root.imageRefused);
         refused[writtenPath] = reason;
         root.imageRefused = refused;
         const pending = root.imagePending;
@@ -228,8 +231,8 @@ Item {
             const keys = root.resolvedKeysFor(path);
             if (keys.length === 0)
                 return;
-            const sources = Object.assign({}, root.imageSources);
-            const pending = Object.assign({}, root.imagePending);
+            const sources = Object.assign(Object.create(null), root.imageSources);
+            const pending = Object.assign(Object.create(null), root.imagePending);
             for (const key of keys) {
                 sources[key] = url;
                 delete pending[key];
@@ -421,16 +424,25 @@ Item {
                     model: lineFlow.modelData
                     delegate: Item {
                         required property var modelData
+                        objectName: "markdownInlineRun"
                         // A URL or identifier may exceed a phone's width. Wrap
                         // it instead of clipping the only item that contains it.
                         width: Math.min(label.implicitWidth, Math.max(0, lineFlow.width))
                         height: label.implicitHeight
+                        Accessible.role: modelData.target.length > 0
+                                         ? Accessible.Link : Accessible.NoRole
+                        Accessible.name: modelData.target.length > 0 ? modelData.text : ""
+                        Accessible.onPressAction: {
+                            if (modelData.target.length > 0)
+                                root.offerLink(modelData.target);
+                        }
                         Text {
                             id: label
                             width: parent.width
                             textFormat: Text.PlainText
                             wrapMode: Text.WrapAnywhere
                             text: modelData.text
+                            Accessible.ignored: modelData.target.length > 0
                             color: modelData.target.length > 0 ? MobileTheme.accent : spanFlow.textColor
                             font.pixelSize: spanFlow.size
                             font.bold: spanFlow.bold || modelData.strong
@@ -580,11 +592,16 @@ Item {
                 Component {
                     id: listBlock
                     Row {
+                        id: listRow
+                        objectName: "markdownListRow"
+                        readonly property real nestingIndent: Math.min(
+                            blockDelegate.level * MobileTheme.spacingLarge,
+                            Math.max(0, width - 4 * MobileTheme.spacing - MobileTheme.touchTarget))
                         width: blockDelegate.width
                         spacing: MobileTheme.spacing
                         // Indent by nesting level, so a nested list reads as one.
                         leftPadding: MobileTheme.spacing
-                                     + blockDelegate.level * MobileTheme.spacingLarge
+                                     + listRow.nestingIndent
                         Text {
                             textFormat: Text.PlainText
                             color: MobileTheme.textDim
@@ -603,8 +620,8 @@ Item {
                                   : (blockDelegate.checked ? "☑" : "☐")
                         }
                         SpanText {
-                            width: blockDelegate.width - 4 * MobileTheme.spacing
-                                   - blockDelegate.level * MobileTheme.spacingLarge
+                            width: Math.max(0, blockDelegate.width - 4 * MobileTheme.spacing
+                                            - listRow.nestingIndent)
                             body: blockDelegate.text
                             spans: blockDelegate.spans
                         }
@@ -614,9 +631,14 @@ Item {
                 Component {
                     id: quoteBlock
                     Row {
+                        id: quoteRow
+                        objectName: "markdownQuoteRow"
+                        readonly property real nestingIndent: Math.min(
+                            Math.max(0, blockDelegate.level - 1) * MobileTheme.spacingLarge,
+                            Math.max(0, width - 4 * MobileTheme.spacing - MobileTheme.touchTarget))
                         width: blockDelegate.width
                         spacing: MobileTheme.spacing
-                        leftPadding: MobileTheme.spacing
+                        leftPadding: MobileTheme.spacing + quoteRow.nestingIndent
                         Rectangle {
                             width: 3
                             height: quoteText.implicitHeight
@@ -624,7 +646,8 @@ Item {
                         }
                         SpanText {
                             id: quoteText
-                            width: blockDelegate.width - 4 * MobileTheme.spacing
+                            width: Math.max(0, blockDelegate.width - 4 * MobileTheme.spacing
+                                            - quoteRow.nestingIndent)
                             body: blockDelegate.text
                             spans: blockDelegate.spans
                             textColor: MobileTheme.textDim
@@ -671,6 +694,9 @@ Item {
 
                         Image {
                             id: remoteImage
+                            objectName: "markdownImage"
+                            Accessible.role: Accessible.Graphic
+                            Accessible.name: blockDelegate.text
                             x: MobileTheme.spacing
                             // Fit to the pane, but never UPSCALE: a 16-pixel
                             // badge blown up to the full pane width is a blurry
@@ -696,6 +722,7 @@ Item {
 
                         Text {
                             id: altText
+                            objectName: "markdownImageAlt"
                             x: MobileTheme.spacing
                             width: parent.width - 2 * MobileTheme.spacing
                             visible: !remoteImage.visible

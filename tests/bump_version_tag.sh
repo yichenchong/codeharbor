@@ -474,6 +474,96 @@ fi
 git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null \
     || fail "a rejected push lost the local release tag"
 
+# --- 18d. preflight must not replace the commit whose version was checked ----
+make_repo 0.1.8
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.preflight = ["git checkout -q --detach HEAD~1"];
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+git commit -q -am "preflight that changes the checked-out commit"
+git init -q --bare "$work/preflight-remote.git"
+git remote add origin "$work/preflight-remote.git"
+if bash "$bump" --set 0.2.0 --push >"$work/out-preflight-head" 2>&1; then
+    fail "a preflight that changed HEAD was allowed to publish a release"
+fi
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    cat "$work/out-preflight-head" >&2
+    fail "preflight left a tag on a commit whose version was not checked"
+fi
+if git --git-dir="$work/preflight-remote.git" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "preflight published a tag after changing HEAD"
+fi
+
+# --- 18e. an old predictable staging path must not redirect file writes ------
+make_repo 0.1.8
+printf 'outside data must not change\n' >"$work/staging-sentinel"
+outside_before="$(cksum <"$work/staging-sentinel")"
+node --input-type=module - "$bumpctl" "$work/staging-sentinel" <<'JS'
+import { rmSync, symlinkSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const tool = process.argv[2];
+const outside = process.argv[3];
+const trapPath = resolve(`CMakeLists.txt.bumpctl-${process.pid}`);
+symlinkSync(outside, trapPath);
+process.argv = [process.argv[0], tool, "apply", "0.2.0"];
+try {
+  await import(pathToFileURL(tool).href);
+} finally {
+  rmSync(trapPath, { force: true });
+}
+JS
+[ "$(cksum <"$work/staging-sentinel")" = "$outside_before" ] \
+    || fail "apply wrote through a staging symlink outside the repository"
+node "$bumpctl" check --root "$work/repo" >"$work/out-staging-check" 2>&1 \
+    || { cat "$work/out-staging-check" >&2; fail "safe staging left version files inconsistent"; }
+[ -z "$(git ls-files --others --exclude-standard)" ] \
+    || fail "successful apply left staging files behind"
+
+# --- 18f. rollback must not depend on writing originals after a disk failure --
+make_repo 0.1.8
+chmod +x CMakeLists.txt
+before="$(snapshot)"
+if node --input-type=module - "$bumpctl" >"$work/out-rollback" 2>&1 <<'JS'
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const tool = process.argv[2];
+const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+const targets = new Set(config.sources.map((source) => resolve(source.path)));
+const rename = fs.renameSync;
+const write = fs.writeFileSync;
+let renames = 0;
+fs.renameSync = (from, to) => {
+  if (++renames === 2) {
+    throw Object.assign(new Error("injected rename failure"), { code: "ENOSPC" });
+  }
+  return rename(from, to);
+};
+fs.writeFileSync = (path, ...args) => {
+  if (targets.has(resolve(String(path)))) {
+    throw Object.assign(new Error("injected write failure"), { code: "ENOSPC" });
+  }
+  return write(path, ...args);
+};
+syncBuiltinESMExports();
+process.argv = [process.argv[0], tool, "apply", "0.2.0"];
+await import(pathToFileURL(tool).href);
+JS
+then
+    fail "apply unexpectedly succeeded despite an injected rename failure"
+fi
+[ "$(snapshot)" = "$before" ] \
+    || { cat "$work/out-rollback" >&2; fail "failed apply left version files half-bumped"; }
+[ -x CMakeLists.txt ] || fail "rollback dropped the original file mode"
+[ -z "$(git ls-files --others --exclude-standard)" ] \
+    || fail "successful rollback left staging files behind"
+
 # --- 19. the continuous-integration wrapper runs and agrees ------------------
 # .github/scripts/check-versions.mjs resolves the repository root from its OWN
 # location, so it can only ever check this checkout. That is exactly why it is

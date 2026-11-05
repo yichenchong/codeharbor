@@ -15,6 +15,8 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -25,9 +27,14 @@
 #include <QMetaObject>
 #include <QMetaProperty>
 #include <QPointer>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QScopeGuard>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 
 #include <limits>
 
@@ -108,9 +115,16 @@ public:
 class AttachingFactory : public OfflineFactory {
 public:
     using OfflineFactory::OfflineFactory;
+    int openCount = 0;
+    QString lastCommand;
 
 protected:
-    bool openPty(SshChannelDevice*, int, int, const QString&) override { return true; }
+    bool openPty(SshChannelDevice*, int, int, const QString& command) override
+    {
+        ++openCount;
+        lastCommand = command;
+        return true;
+    }
 };
 
 QByteArray jsonLine(const QJsonObject& obj)
@@ -298,7 +312,13 @@ private slots:
     void attachRejectsTargetNotResolvedByServer();
     void attachWithoutATargetIsRefused();
     void attachRefusesATargetTmuxWouldReadAsAnIdRatherThanAName();
+    void attachObserversCanCancelOrReplaceTheOpeningChannel_data();
+    void attachObserversCanCancelOrReplaceTheOpeningChannel();
     void resolveTargetWithoutAServerRefuses();
+    void workspaceIdentityMustBeAcceptedBeforeUsingAConnectedTransport();
+    void unacceptedReconnectCannotCompleteThePreviousIdentityLookup();
+    void anIdentityBoundaryDuringAttachCancelsThatAttempt();
+    void newTmuxChildrenUseCurrentEndpointsWithoutInheritedCapabilities();
     void paneKeysAddressOneSlotOfOneDevSession();
     void resolveAddressesAPaneByItsRowIdAndNeverByItsLabel();
     void detachAndKillWithoutAnAttachmentAreNoOps();
@@ -313,8 +333,12 @@ private slots:
     void bridgeDecodesBinaryInputAndRefusesMalformedBase64();
     void bridgeReportsPartialInputWithoutDisconnectingOrReplaying_data();
     void bridgeReportsPartialInputWithoutDisconnectingOrReplaying();
+    void queuedInputCannotCrossATransportReplacement_data();
+    void queuedInputCannotCrossATransportReplacement();
     void bridgeHoldsOutputUntilTheRendererIsReady();
     void bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer();
+    void aHiddenReplacementMountNeverReleasesRetainedOutput_data();
+    void aHiddenReplacementMountNeverReleasesRetainedOutput();
     void bridgePreservesHiddenReportBeforeReady();
     void bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload();
     void bridgeIsInertOnceItsControllerIsDestroyed();
@@ -330,6 +354,10 @@ private slots:
     void aPaneReportsItsOutputUnderTheRowIdTheServerAnswered();
     void aCachedLegacyAnswerStillReportsItsRowSoTheBackfillCanBeRetried();
     void aPaneRetargetedMidLookupNeverReportsUnderTheSupersededPanesIdentity();
+    void supersededResolutionErrorsDoNotReplaceTheCurrentAnswer();
+    void detachCancelsPendingResolution_data();
+    void detachCancelsPendingResolution();
+    void cancellingOldServerFlightsDoesNotCancelReentrantNewRequests();
     void aFailedResolutionLeavesThePaneWithNoIdentity();
     void targetCannotCrossAWorkspaceServerSwitch();
     void oldResolutionsCannotCompleteANewServerRequest_data();
@@ -459,6 +487,54 @@ void TstTerminalFactory::attachWithoutAConnectionFailsAndReportsWhy()
     QCOMPARE(poollessErrors.count(), 1);
 }
 
+void TstTerminalFactory::attachObserversCanCancelOrReplaceTheOpeningChannel_data()
+{
+    QTest::addColumn<TerminalState>("phase");
+    QTest::addColumn<bool>("replace");
+    QTest::newRow("cancel-opening") << TerminalState::OpeningChannel << false;
+    QTest::newRow("replace-opening") << TerminalState::OpeningChannel << true;
+    QTest::newRow("cancel-attaching") << TerminalState::AttachingTmux << false;
+    QTest::newRow("replace-attaching") << TerminalState::AttachingTmux << true;
+}
+
+void TstTerminalFactory::attachObserversCanCancelOrReplaceTheOpeningChannel()
+{
+    QFETCH(TerminalState, phase);
+    QFETCH(bool, replace);
+    AttachingFactory factory(nullptr);
+    TerminalController* controller = factory.create();
+    bool acted = false;
+    bool replacementAttached = false;
+    QPointer<QIODevice> openingTransport;
+    connect(controller, &TerminalController::stateChanged, controller,
+            [&](TerminalState state) {
+                if (acted || state != phase)
+                    return;
+                acted = true;
+                openingTransport = controller->transport();
+                if (replace)
+                    replacementAttached = factory.attach(
+                        controller, QStringLiteral("ch_replacement"), QString(), 100, 30);
+                else
+                    factory.detach(controller);
+            });
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_original"), QString(), 80, 24));
+    QVERIFY(acted);
+    QVERIFY(openingTransport);
+    const int originalOpens = phase == TerminalState::OpeningChannel ? 0 : 1;
+    QCOMPARE(factory.openCount, originalOpens + (replace ? 1 : 0));
+    if (replace) {
+        QVERIFY(replacementAttached);
+        QVERIFY(controller->transport());
+        QVERIFY(controller->transport() != openingTransport);
+        QCOMPARE(factory.targetFor(controller), QStringLiteral("ch_replacement"));
+        // The retiring attach must not replace the attachment table's live
+        // device with its old channel after its state notification returns.
+        factory.detach(controller);
+    }
+    QVERIFY(!controller->transport());
+}
+
 // A target supplied by a QML caller is not trusted merely because it is
 // non-empty. Once the workspace repository is configured, attach() accepts only
 // the target returned by resolveTarget(), so a stale or compromised caller
@@ -471,6 +547,7 @@ void TstTerminalFactory::attachRejectsTargetNotResolvedByServer()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -521,6 +598,7 @@ void TstTerminalFactory::attachRefusesATargetTmuxWouldReadAsAnIdRatherThanAName(
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -596,6 +674,408 @@ void TstTerminalFactory::resolveTargetWithoutAServerRefuses()
     // Nothing was answered: a refusal is not a resolution, and a pane must
     // never be handed a target that did not come from the server.
     QCOMPARE(resolved.count(), 0);
+}
+
+void TstTerminalFactory::workspaceIdentityMustBeAcceptedBeforeUsingAConnectedTransport()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    TerminalController* controller = factory.create();
+    QVERIFY(factory.connected());
+    QVERIFY(!factory.workspaceReady());
+    QVERIFY(!factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                   QStringLiteral("row-A"), QString()));
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_s1_row-A"), QString(), 80, 24));
+    QCOMPARE(factory.openCount, 0);
+    QVERIFY(rpc.takeRequest(50).isEmpty());
+
+    factory.setWorkspaceReady(true);
+    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A")));
+    controller->setViewVisible(false);
+    controller->ingestOutput(QByteArrayLiteral("retained screen"));
+    QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("retained screen"));
+    factory.detach(controller);
+    factory.setWorkspaceReady(false);
+    QVERIFY(!factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                   QStringLiteral("row-A"), QString()));
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_s1_row-A"), QString(), 80, 24));
+    factory.kill(controller);
+    QCOMPARE(factory.targetFor(controller), QStringLiteral("ch_s1_row-A"));
+    QCOMPARE(controller->hiddenBuffer(), QByteArrayLiteral("retained screen"));
+    QCOMPARE(factory.openCount, 1);
+    QVERIFY(rpc.takeRequest(50).isEmpty());
+
+    // The id does not change on an ordinary reconnect. Only the explicit
+    // accepted-identity handoff may reopen the cached attachment path.
+    factory.setServerId(QStringLiteral("srv-1"));
+    QVERIFY(!factory.workspaceReady());
+    factory.setWorkspaceReady(true);
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                  QStringLiteral("row-A"), QString()));
+    QTRY_COMPARE(resolved.count(), 1);
+    QCOMPARE(resolved.first().at(1).toString(), QStringLiteral("ch_s1_row-A"));
+    QVERIFY(rpc.takeRequest(50).isEmpty());
+    QVERIFY(factory.attach(controller, QStringLiteral("ch_s1_row-A"), QString(), 80, 24));
+    QCOMPARE(factory.targetFor(controller), QStringLiteral("ch_s1_row-A"));
+    QCOMPARE(controller->hiddenBuffer(), QByteArrayLiteral("retained screen"));
+}
+
+void TstTerminalFactory::unacceptedReconnectCannotCompleteThePreviousIdentityLookup()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* controller = factory.create();
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                  QStringLiteral("row-A"), QString()));
+    const QJsonObject oldRequest = rpc.takeRequest();
+    factory.setWorkspaceReady(false);
+    rpc.answerWithRow(oldRequest.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("row-A"), QStringLiteral("s1"), QString(),
+                      QStringLiteral("ch_old_answer"), QString());
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
+    QCOMPARE(resolved.count(), 0);
+    factory.setWorkspaceReady(true);
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                  QStringLiteral("row-A"), QString()));
+    const QJsonObject currentRequest = rpc.takeRequest();
+    QVERIFY(!currentRequest.isEmpty());
+    rpc.answerWithRow(currentRequest.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("row-A"), QStringLiteral("s1"), QString(),
+                      QStringLiteral("ch_current_answer"), QString());
+    QTRY_COMPARE(resolved.count(), 1);
+    QCOMPARE(resolved.first().at(1).toString(), QStringLiteral("ch_current_answer"));
+}
+
+void TstTerminalFactory::anIdentityBoundaryDuringAttachCancelsThatAttempt()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* controller = factory.create();
+    QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A")));
+    bool changedIdentity = false;
+    connect(controller, &TerminalController::stateChanged, controller,
+            [&](TerminalState state) {
+                if (changedIdentity || state != TerminalState::OpeningChannel)
+                    return;
+                changedIdentity = true;
+                factory.setWorkspaceReady(false);
+                factory.setWorkspaceReady(true);
+            });
+    QVERIFY(!factory.attach(controller, QStringLiteral("ch_s1_row-A"), QString(), 80, 24));
+    QVERIFY(changedIdentity);
+    QVERIFY(!controller->transport());
+    QCOMPARE(factory.openCount, 1);
+    QVERIFY(factory.attach(controller, QStringLiteral("ch_s1_row-A"), QString(), 80, 24));
+    QCOMPARE(factory.openCount, 2);
+}
+
+void TstTerminalFactory::newTmuxChildrenUseCurrentEndpointsWithoutInheritedCapabilities()
+{
+#if !defined(Q_OS_LINUX)
+    QSKIP("the isolated real-tmux PTY fixture requires Linux script(1)");
+#else
+    const QString tmux = QStandardPaths::findExecutable(QStringLiteral("tmux"));
+    const QString script = QStandardPaths::findExecutable(QStringLiteral("script"));
+    const QString node = QStandardPaths::findExecutable(QStringLiteral("node"));
+    if (tmux.isEmpty() || script.isEmpty() || node.isEmpty())
+        QSKIP("tmux, script and node are required for the private endpoint regression");
+    QTemporaryDir fixture(QDir::temp().filePath(QStringLiteral("ntc9-XXXXXX")));
+    QVERIFY(fixture.isValid());
+    const QString privateTmux = fixture.filePath(QStringLiteral("tmux"));
+    const QString masterRuntime = fixture.filePath(QStringLiteral("master-runtime"));
+    const QString clientRuntime = fixture.filePath(QStringLiteral("client-runtime"));
+    const QString masterHome = fixture.filePath(QStringLiteral("master-home"));
+    const QString firstWorkingDirectory = fixture.filePath(QStringLiteral("cwd;"));
+    const QString secondWorkingDirectory = fixture.filePath(QStringLiteral("cwd\\;"));
+    QVERIFY(QDir().mkpath(firstWorkingDirectory));
+    QVERIFY(QDir().mkpath(secondWorkingDirectory));
+    QVERIFY(QDir().mkpath(fixture.filePath(QStringLiteral("cwd"))));
+    const QString clientHome = fixture.filePath(QStringLiteral("client-home"));
+    for (const QString& directory : {privateTmux, masterRuntime, clientRuntime,
+                                    masterHome, clientHome})
+        QVERIFY(QDir().mkpath(directory));
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.remove(QStringLiteral("TMUX"));
+    environment.remove(QStringLiteral("TMUX_PANE"));
+    environment.remove(QStringLiteral("NODE_OPTIONS"));
+    environment.remove(QStringLiteral("BASH_ENV"));
+    environment.remove(QStringLiteral("ENV"));
+    environment.insert(QStringLiteral("TMUX_TMPDIR"), privateTmux);
+    environment.insert(QStringLiteral("HOME"), masterHome);
+    environment.insert(QStringLiteral("XDG_RUNTIME_DIR"), masterRuntime);
+    environment.insert(QStringLiteral("CODEHARBOR_AGENT_SOCKET"),
+                       fixture.filePath(QStringLiteral("stale-master.sock")));
+    environment.insert(QStringLiteral("CODEHARBOR_CONTROL_SOCKET"),
+                       fixture.filePath(QStringLiteral("stale-window.sock")));
+    environment.insert(QStringLiteral("OMP_DEV_SESSION_ID"), QStringLiteral("wrong-dev"));
+    environment.insert(QStringLiteral("OMP_TERMINAL_ID"), QStringLiteral("wrong-terminal"));
+    environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    QString diagnostic;
+    QProcess attachment;
+    attachment.setProcessChannelMode(QProcess::MergedChannels);
+    const auto runTmux = [&](const QStringList& arguments) {
+        QProcess process;
+        process.setProcessEnvironment(environment);
+        process.setProcessChannelMode(QProcess::MergedChannels);
+        process.start(tmux, arguments);
+        if (!process.waitForStarted(5000) || !process.waitForFinished(5000)) {
+            process.kill();
+            process.waitForFinished(5000);
+            diagnostic = QString::fromUtf8(process.readAll());
+            return false;
+        }
+        diagnostic = QString::fromUtf8(process.readAll());
+        return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+    };
+    const auto cleanup = qScopeGuard([&]() {
+        runTmux({QStringLiteral("kill-server")});
+        if (attachment.state() != QProcess::NotRunning
+            && !attachment.waitForFinished(5000)) {
+            attachment.kill();
+            attachment.waitForFinished(5000);
+        }
+    });
+    QVERIFY2(runTmux({QStringLiteral("-f"), QStringLiteral("/dev/null"),
+                      QStringLiteral("new-session"), QStringLiteral("-d"),
+                      QStringLiteral("-s"), QStringLiteral("bootstrap"),
+                      QStringLiteral("/bin/sleep"), QStringLiteral("60")}),
+             qPrintable(diagnostic));
+    QVERIFY(runTmux({QStringLiteral("set-option"), QStringLiteral("-g"),
+                     QStringLiteral("update-environment"), QString()}));
+    QVERIFY(runTmux({QStringLiteral("set-option"), QStringLiteral("-g"),
+                     QStringLiteral("default-shell"), QStringLiteral("/bin/sh")}));
+    QVERIFY(runTmux({QStringLiteral("set-window-option"), QStringLiteral("-g"),
+                     QStringLiteral("remain-on-exit"), QStringLiteral("on")}));
+    const QString helperPath = fixture.filePath(QStringLiteral("child.mjs"));
+    const QString clearedPath = fixture.filePath(QStringLiteral("cleared"));
+    QFile helper(helperPath);
+    QVERIFY(helper.open(QIODevice::WriteOnly));
+    const QByteArray helperSource = QByteArrayLiteral(R"JS(
+import net from "node:net";
+import { writeFileSync, renameSync } from "node:fs";
+const inherited = {
+    dev: process.env.OMP_DEV_SESSION_ID ?? null,
+    terminal: process.env.OMP_TERMINAL_ID ?? null,
+    agent: process.env.CODEHARBOR_AGENT_SOCKET ?? null,
+    control: process.env.CODEHARBOR_CONTROL_SOCKET ?? null,
+    runtime: process.env.XDG_RUNTIME_DIR,
+    cwd: process.cwd()
+};
+if (!inherited.agent && !inherited.control) {
+    writeFileSync(process.argv[2] + ".tmp", JSON.stringify(inherited));
+    renameSync(process.argv[2] + ".tmp", process.argv[2]);
+} else {
+    for (const key of ["CODEHARBOR_AGENT_SOCKET", "CODEHARBOR_CONTROL_SOCKET"]) {
+        if (!process.env[key]) continue;
+        const socket = net.createConnection({ path: process.env[key] });
+        socket.once("connect", () => socket.write(JSON.stringify({ ...inherited, key }) + "\n"));
+        socket.once("data", () => socket.end());
+        socket.once("error", () => { process.exitCode = 1; });
+    }
+}
+)JS");
+    QCOMPARE(helper.write(helperSource), qint64(helperSource.size()));
+    helper.close();
+    const auto quoted = [](QString value) {
+        value.replace(QLatin1Char('\''), QStringLiteral("'\\''"));
+        return QLatin1Char('\'') + value + QLatin1Char('\'');
+    };
+    QVERIFY(runTmux({QStringLiteral("set-option"), QStringLiteral("-g"),
+                     QStringLiteral("default-command"),
+                     quoted(node) + QLatin1Char(' ') + quoted(helperPath)
+                         + QLatin1Char(' ') + quoted(clearedPath)}));
+    // The SSH-side client has a different HOME/XDG from the already-running
+    // master. Neither is rewritten by the production command under test.
+    environment.insert(QStringLiteral("HOME"), clientHome);
+    environment.insert(QStringLiteral("XDG_RUNTIME_DIR"), clientRuntime);
+    QLocalServer firstEndpoint;
+    QLocalServer secondEndpoint;
+    QLocalServer firstControl;
+    QLocalServer secondControl;
+    QLocalServer staleAgent;
+    QLocalServer staleWindow;
+    QLocalServer truncatedFirstAgent;
+    QLocalServer truncatedSecondAgent;
+    QLocalServer truncatedFirstControl;
+    QLocalServer truncatedSecondControl;
+    const QString firstControlPath = fixture.filePath(QStringLiteral("window's endpoint\\;"));
+    const QString secondControlPath = fixture.filePath(QStringLiteral("new-window;"));
+    const QString firstPath = fixture.filePath(QStringLiteral("agent's endpoint;"));
+    const QString secondPath = fixture.filePath(QStringLiteral("replacement\\;"));
+    QVERIFY(firstEndpoint.listen(firstPath));
+    QVERIFY(secondEndpoint.listen(secondPath));
+    QVERIFY(firstControl.listen(firstControlPath));
+    QVERIFY(secondControl.listen(secondControlPath));
+    QVERIFY(staleAgent.listen(fixture.filePath(QStringLiteral("stale-master.sock"))));
+    QVERIFY(staleWindow.listen(fixture.filePath(QStringLiteral("stale-window.sock"))));
+    // These are the actual wrong endpoints produced by tmux's unescaped
+    // trailing-semicolon grammar, including removal of one literal backslash.
+    QVERIFY(truncatedFirstAgent.listen(firstPath.chopped(1)));
+    QVERIFY(truncatedSecondAgent.listen(secondPath.left(secondPath.size() - 2) + QLatin1Char(';')));
+    QVERIFY(truncatedFirstControl.listen(
+        firstControlPath.left(firstControlPath.size() - 2) + QLatin1Char(';')));
+    QVERIFY(truncatedSecondControl.listen(secondControlPath.chopped(1)));
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* controller = factory.create();
+    const QString target = QStringLiteral("ch_s1_row-A");
+    const QString advertisedDev = QStringLiteral("s1;");
+    const QString advertisedTerminal = QStringLiteral("row-A\\;");
+    const auto attachPty = [&](const QString& command, const QString& barrier) {
+        attachment.setProcessEnvironment(environment);
+        attachment.start(script,
+                         {QStringLiteral("-q"), QStringLiteral("-c"),
+                          command + QStringLiteral(" \\; wait-for -S ") + barrier,
+                          QStringLiteral("/dev/null")});
+        return attachment.waitForStarted(5000)
+            && runTmux({QStringLiteral("wait-for"), barrier});
+    };
+    for (int stage = 0; stage < 2; ++stage) {
+        factory.setAgentSocket(stage == 0 ? firstPath : secondPath);
+        factory.setControlSocket(stage == 0 ? firstControlPath : secondControlPath);
+        if (stage == 0) {
+            QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+            QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                          QStringLiteral("row-A"), fixture.path()));
+            const QJsonObject request = rpc.takeRequest();
+            QVERIFY(!request.isEmpty());
+            rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
+                              advertisedTerminal, advertisedDev, QString(),
+                              target, QString());
+            QTRY_COMPARE(resolved.count(), 1);
+        }
+        QVERIFY(factory.attach(controller, target,
+                               stage == 0 ? firstWorkingDirectory : secondWorkingDirectory,
+                               80, 24));
+        QVERIFY2(attachPty(factory.lastCommand,
+                           stage == 0 ? QStringLiteral("created") : QStringLiteral("refreshed")),
+                 qPrintable(diagnostic + QString::fromUtf8(attachment.readAll())));
+        if (stage != 0)
+            QVERIFY(runTmux({QStringLiteral("new-window"), QStringLiteral("-t"),
+                             QLatin1Char('=') + target + QLatin1Char(':')}));
+        QLocalServer& endpoint = stage == 0 ? firstEndpoint : secondEndpoint;
+        QLocalServer& control = stage == 0 ? firstControl : secondControl;
+        for (QLocalServer* destination : {&endpoint, &control}) {
+            QVERIFY2(destination->waitForNewConnection(5000),
+                     qPrintable(QString::fromUtf8(attachment.readAll())));
+            QLocalSocket* peer = destination->nextPendingConnection();
+            QVERIFY(peer);
+            QTRY_VERIFY_WITH_TIMEOUT(peer->canReadLine(), 5000);
+            const QJsonObject event = QJsonDocument::fromJson(peer->readLine()).object();
+            QCOMPARE(event.value(QStringLiteral("runtime")).toString(), masterRuntime);
+            QCOMPARE(event.value(QStringLiteral("dev")).toString(), advertisedDev);
+            QCOMPARE(event.value(QStringLiteral("terminal")).toString(), advertisedTerminal);
+            QCOMPARE(event.value(QStringLiteral("agent")).toString(),
+                     stage == 0 ? firstPath : secondPath);
+            QCOMPARE(event.value(QStringLiteral("control")).toString(),
+                     stage == 0 ? firstControlPath : secondControlPath);
+            if (stage == 0)
+                QCOMPARE(event.value(QStringLiteral("cwd")).toString(),
+                         QDir(firstWorkingDirectory).canonicalPath());
+            QCOMPARE(event.value(QStringLiteral("key")).toString(),
+                     destination == &endpoint ? QStringLiteral("CODEHARBOR_AGENT_SOCKET")
+                                              : QStringLiteral("CODEHARBOR_CONTROL_SOCKET"));
+            peer->write("done");
+            if (peer->bytesToWrite() > 0)
+                QVERIFY(peer->waitForBytesWritten(5000));
+        }
+        QVERIFY(runTmux({QStringLiteral("detach-client"), QStringLiteral("-s"),
+                         QLatin1Char('=') + target}));
+        QVERIFY(attachment.waitForFinished(5000));
+    }
+    for (QLocalServer* wrongEndpoint : {&truncatedFirstAgent, &truncatedSecondAgent,
+                                       &truncatedFirstControl, &truncatedSecondControl})
+        QVERIFY(!wrongEndpoint->hasPendingConnections());
+    // A missing endpoint must suppress even the stale global value installed
+    // when the private master started, not expose it again through -u.
+    factory.setAgentSocket(QString());
+    factory.setControlSocket(QString());
+    QVERIFY(factory.attach(controller, target, fixture.path(), 80, 24));
+    QVERIFY(attachPty(factory.lastCommand, QStringLiteral("cleared")));
+    QVERIFY(runTmux({QStringLiteral("new-window"), QStringLiteral("-t"),
+                     QLatin1Char('=') + target + QLatin1Char(':')}));
+    QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(clearedPath), 5000);
+    QVERIFY(!firstEndpoint.hasPendingConnections());
+    QVERIFY(!secondEndpoint.hasPendingConnections());
+    QVERIFY(!firstControl.hasPendingConnections());
+    QVERIFY(!secondControl.hasPendingConnections());
+    QVERIFY(!staleAgent.hasPendingConnections());
+    QVERIFY(!staleWindow.hasPendingConnections());
+    QFile cleared(clearedPath);
+    QVERIFY(cleared.open(QIODevice::ReadOnly));
+    const QJsonObject removed = QJsonDocument::fromJson(cleared.readAll()).object();
+    QVERIFY(removed.value(QStringLiteral("agent")).isNull());
+    QVERIFY(removed.value(QStringLiteral("control")).isNull());
+    QCOMPARE(removed.value(QStringLiteral("dev")).toString(), advertisedDev);
+    QCOMPARE(removed.value(QStringLiteral("terminal")).toString(), advertisedTerminal);
+    cleared.close();
+    QVERIFY(runTmux({QStringLiteral("detach-client"), QStringLiteral("-s"),
+                     QLatin1Char('=') + target}));
+    QVERIFY(attachment.waitForFinished(5000));
+    struct UnknownIdentity {
+        QString dev;
+        QString terminal;
+    };
+    const UnknownIdentity unknownIdentities[]{
+        {},
+        {QStringLiteral("known-dev"), QString()},
+        {QString(), QStringLiteral("known-terminal")},
+    };
+    for (int index = 0; index < 3; ++index) {
+        QVERIFY(QFile::remove(clearedPath));
+        const QString anonymousTarget = QStringLiteral("ch_unidentified_%1").arg(index);
+        const QString literalDirectory = index == 1 ? secondWorkingDirectory : firstWorkingDirectory;
+        const QString command = TerminalController::tmuxNewSessionCommand(
+            anonymousTarget, literalDirectory, unknownIdentities[index].dev,
+            unknownIdentities[index].terminal, firstControlPath, firstPath);
+        QVERIFY(attachPty(command, QStringLiteral("anonymous_%1").arg(index)));
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(clearedPath), 5000);
+        QVERIFY(cleared.open(QIODevice::ReadOnly));
+        const QJsonObject firstChild = QJsonDocument::fromJson(cleared.readAll()).object();
+        cleared.close();
+        QCOMPARE(firstChild.value(QStringLiteral("cwd")).toString(),
+                 QDir(literalDirectory).canonicalPath());
+        for (const QString& key : {QStringLiteral("dev"), QStringLiteral("terminal"),
+                                   QStringLiteral("agent"), QStringLiteral("control")}) {
+            QVERIFY(firstChild.value(key).isString());
+            QVERIFY(firstChild.value(key).toString().isEmpty());
+        }
+        QVERIFY(QFile::remove(clearedPath));
+        QVERIFY(runTmux({QStringLiteral("new-window"), QStringLiteral("-t"),
+                         QLatin1Char('=') + anonymousTarget + QLatin1Char(':')}));
+        QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(clearedPath), 5000);
+        QVERIFY(cleared.open(QIODevice::ReadOnly));
+        const QJsonObject futureChild = QJsonDocument::fromJson(cleared.readAll()).object();
+        cleared.close();
+        for (const QString& key : {QStringLiteral("dev"), QStringLiteral("terminal"),
+                                   QStringLiteral("agent"), QStringLiteral("control")})
+            QVERIFY(futureChild.value(key).isNull());
+        QVERIFY(!firstEndpoint.hasPendingConnections());
+        QVERIFY(!firstControl.hasPendingConnections());
+        QVERIFY(!staleAgent.hasPendingConnections());
+        QVERIFY(!staleWindow.hasPendingConnections());
+        QVERIFY(runTmux({QStringLiteral("detach-client"), QStringLiteral("-s"),
+                         QLatin1Char('=') + anonymousTarget}));
+        QVERIFY(attachment.waitForFinished(5000));
+    }
+#endif
 }
 
 // The address a pane resolution is keyed by. It is a PAIR — Dev Session plus
@@ -778,55 +1258,34 @@ void TstTerminalFactory::killCommandQuotesAdversarialTargets()
 // and the `-t` target with one.
 void TstTerminalFactory::attachCommandQuotesAdversarialIdsAndWorkingDir()
 {
-    // The pane identity is left unknown throughout: this case is about the
-    // target and the working directory, and the quoting of the exported
-    // OMP_DEV_SESSION_ID / OMP_TERMINAL_ID values is pinned next to the builder
-    // in tst_terminalcontroller. An unidentified pane exports neither, which
-    // keeps the quoted-argument count below meaningful.
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(QStringLiteral("ch_dev_t1"),
-                                                       QStringLiteral("/srv/repo"),
-                                                       QString(), QString()),
-             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '/srv/repo'"
-                            " \\; set-option -t '=ch_dev_t1:' mouse on"
-                            " \\; set-option -t '=ch_dev_t1:' destroy-unattached off"));
+    // Keep the shell-quoting/security assertions independent of the complete
+    // command template; managed environment entries may be cleared explicitly.
 
     // A working directory is the field most likely to carry a real quote, and
     // the one a user can type. Breaking out of it would run `id` on the host.
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '"),
-                 QString(), QString()),
-             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' "
-                            "-c '/tmp/x'\\''; id; echo '\\'''"
-                            " \\; set-option -t '=ch_dev_t1:' mouse on"
-                            " \\; set-option -t '=ch_dev_t1:' destroy-unattached off"));
+    const QString quotedDirectory = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_dev_t1"), QStringLiteral("/tmp/x'; id; echo '"),
+        QString(), QString(), QString(), QString());
+    QVERIFY(quotedDirectory.contains(QStringLiteral("-c '/tmp/x'\\''; id; echo '\\'''")));
 
-    // The target arrives from the server: a quote in it must not escape. It
-    // reaches the command THREE times — as the new session's name and as the
-    // target of each session option — so every copy is checked.
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w"),
-                 QString(), QString()),
-             QStringLiteral("tmux new-session -A -s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`' "
-                            "-c '/w'"
-                            " \\; set-option -t "
-                            "'=ch_d'\\''; rm -rf ~; '\\''_t`whoami`:' mouse on"
-                            " \\; set-option -t "
-                            "'=ch_d'\\''; rm -rf ~; '\\''_t`whoami`:' destroy-unattached off"));
+    // Server-provided names and all session-option targets must remain shell-inert.
+    const QString quotedTarget = TerminalController::tmuxNewSessionCommand(
+        QStringLiteral("ch_d'; rm -rf ~; '_t`whoami`"), QStringLiteral("/w"),
+        QString(), QString(), QString(), QString());
+    QVERIFY(quotedTarget.contains(
+        QStringLiteral("-s 'ch_d'\\''; rm -rf ~; '\\''_t`whoami`'")));
+    QVERIFY(quotedTarget.contains(
+        QStringLiteral("-t '=ch_d'\\''; rm -rf ~; '\\''_t`whoami`:' mouse on")));
+    QVERIFY(quotedTarget.contains(
+        QStringLiteral("-t '=ch_d'\\''; rm -rf ~; '\\''_t`whoami`:' destroy-unattached off")));
 
     // A leading `-` in the working directory is consumed as the value of -c by
     // getopt, and a newline is inert inside the quotes: neither adds a word to
     // the command.
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev_t1"), QStringLiteral("-rf /\nrm -rf ~"), QString(),
-        QString());
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev_t1' -c '-rf /\nrm -rf ~'"
-                            " \\; set-option -t '=ch_dev_t1:' mouse on"
-                            " \\; set-option -t '=ch_dev_t1:' destroy-unattached off"));
-    // Exactly four quoted arguments — the session name, the working directory
-    // and one target apiece for the two session options — so nothing became an
-    // extra word.
-    QCOMPARE(command.count(QLatin1Char('\'')), 8);
+        QString(), QString(), QString());
+    QVERIFY(command.contains(QStringLiteral("-c '-rf /\nrm -rf ~'")));
     // The option's target is tmux-pinned with the `=` sigil INSIDE the quotes,
     // so it cannot fnmatch onto another session; the sigil is tmux syntax, not
     // shell syntax (the same rule as the kill command above).
@@ -917,7 +1376,7 @@ void TstTerminalFactory::bridgeExposesNoRemoteTargetingSlots()
     properties.sort();
     QCOMPARE(properties,
              QStringList({QStringLiteral("columns"), QStringLiteral("connectionState"),
-                          QStringLiteral("rows")}));
+                          QStringLiteral("inputGeneration"), QStringLiteral("rows")}));
 }
 
 // The TerminalBridge slots the page calls, each landing on the controller:
@@ -935,8 +1394,8 @@ void TstTerminalFactory::bridgeForwardsInputResizeAndVisibility()
 
     // UTF-8 on the way in as well: a composed keystroke must reach the PTY as
     // the bytes the remote expects, not as a lossy latin1 squash.
-    bridge->sendInput(QStringLiteral("ls\n"));
-    bridge->sendInput(QString::fromUtf8("é"));
+    QVERIFY(bridge->sendInput(QStringLiteral("ls\n"), bridge->inputGeneration()));
+    QVERIFY(bridge->sendInput(QString::fromUtf8("é"), bridge->inputGeneration()));
     QCOMPARE(transport.data(), QByteArrayLiteral("ls\n\xC3\xA9"));
 
     QSignalSpy geometry(bridge, &TerminalBridge::geometryChanged);
@@ -958,7 +1417,7 @@ void TstTerminalFactory::bridgeForwardsInputResizeAndVisibility()
     bridge->resize(100, 30);
     QCOMPARE(geometry.count(), 1);
 
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(controller->viewVisible());
     bridge->notifyViewVisible(false);
     QVERIFY(!controller->viewVisible());
@@ -982,7 +1441,8 @@ void TstTerminalFactory::bridgeDecodesBinaryInputAndRefusesMalformedBase64()
     // sendInput() would destroy — its QString is encoded as UTF-8, so 0xAB would
     // arrive as the two bytes 0xC2 0xAB.
     const QByteArray report = QByteArrayLiteral("\x1b[M\x20\xAB\xFF");
-    bridge->sendBinaryInput(QString::fromLatin1(report.toBase64()));
+    QVERIFY(bridge->sendBinaryInput(QString::fromLatin1(report.toBase64()),
+                                    bridge->inputGeneration()));
     QCOMPARE(transport.data(), report);
 
     // Malformed payloads are REFUSED, not partially written: a lenient decode
@@ -990,20 +1450,36 @@ void TstTerminalFactory::bridgeDecodesBinaryInputAndRefusesMalformedBase64()
     // way of being malformed — a character outside the alphabet, a length that
     // cannot be a whole number of bytes, and a non-Latin-1 string that only a
     // page confused about the encoding would send.
-    bridge->sendBinaryInput(QStringLiteral("****"));
-    bridge->sendBinaryInput(QStringLiteral("QUJD*g=="));
-    bridge->sendBinaryInput(QStringLiteral("A"));
-    bridge->sendBinaryInput(QString::fromUtf8("héllo!!"));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("****"), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("QUJD*g=="), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("A"), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("===="), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("A==="), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QStringLiteral("AA=A"), bridge->inputGeneration()));
+    QVERIFY(!bridge->sendBinaryInput(QString::fromUtf8("héllo!!"), bridge->inputGeneration()));
     QCOMPARE(transport.data(), report);
 
     // Nothing to send is not an error, and it must not disturb the stream.
-    bridge->sendBinaryInput(QString());
+    QVERIFY(bridge->sendBinaryInput(QString(), bridge->inputGeneration()));
     QCOMPARE(transport.data(), report);
 
     // Still the same pane afterwards: a refused payload leaves the input path
     // working rather than wedged.
-    bridge->sendInput(QStringLiteral("ls\n"));
+    QVERIFY(bridge->sendInput(QStringLiteral("ls\n"), bridge->inputGeneration()));
     QCOMPARE(transport.data(), report + QByteArrayLiteral("ls\n"));
+    // Valid one-/two-byte tails carry padding; a full byte alphabet must also
+    // survive unchanged, including NUL and values that are not UTF-8 text.
+    QByteArray alphabet;
+    for (int value = 0; value <= 255; ++value)
+        alphabet.append(static_cast<char>(value));
+    QByteArray expected = transport.data();
+    for (const int size : {1, 2, 3, 256}) {
+        const QByteArray bytes = alphabet.left(size);
+        QVERIFY(bridge->sendBinaryInput(QString::fromLatin1(bytes.toBase64()),
+                                        bridge->inputGeneration()));
+        expected.append(bytes);
+        QCOMPARE(transport.data(), expected);
+    }
 }
 
 void TstTerminalFactory::bridgeReportsPartialInputWithoutDisconnectingOrReplaying_data()
@@ -1031,9 +1507,10 @@ void TstTerminalFactory::bridgeReportsPartialInputWithoutDisconnectingOrReplayin
     const QByteArray input = binary ? QByteArray::fromHex("1b5b4d20abff")
                                    : QByteArrayLiteral("echo command\n");
     if (binary)
-        bridge->sendBinaryInput(QString::fromLatin1(input.toBase64()));
+        QVERIFY(!bridge->sendBinaryInput(QString::fromLatin1(input.toBase64()),
+                                         bridge->inputGeneration()));
     else
-        bridge->sendInput(QString::fromUtf8(input));
+        QVERIFY(!bridge->sendInput(QString::fromUtf8(input), bridge->inputGeneration()));
     QCOMPARE(transport.written(), input.left(3));
     QCOMPARE(rejected.count(), 1);
     QCOMPARE(errors.count(), 1);
@@ -1048,9 +1525,49 @@ void TstTerminalFactory::bridgeReportsPartialInputWithoutDisconnectingOrReplayin
     controller->setTransport(&replacement);
     QCoreApplication::processEvents();
     QVERIFY(replacement.data().isEmpty());
-    bridge->sendInput(QStringLiteral("fresh"));
+    QVERIFY(bridge->sendInput(QStringLiteral("fresh"), bridge->inputGeneration()));
     QCOMPARE(replacement.data(), QByteArrayLiteral("fresh"));
     QCOMPARE(errors.count(), 1);
+}
+
+void TstTerminalFactory::queuedInputCannotCrossATransportReplacement_data()
+{
+    QTest::addColumn<bool>("binary");
+    QTest::addColumn<bool>("reusePointer");
+    QTest::newRow("text") << false << false;
+    QTest::newRow("binary") << true << false;
+    QTest::newRow("text-reused-pointer") << false << true;
+    QTest::newRow("binary-reused-pointer") << true << true;
+}
+
+void TstTerminalFactory::queuedInputCannotCrossATransportReplacement()
+{
+    QFETCH(bool, binary);
+    QFETCH(bool, reusePointer);
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create();
+    TerminalBridge* bridge = factory.createBridge(controller);
+    FakeTransport oldTransport;
+    FakeTransport replacement;
+    controller->setTransport(&oldTransport);
+    const quint64 oldGeneration = bridge->inputGeneration();
+    QVERIFY(bridge->sendInput(QStringLiteral("prefix"), oldGeneration));
+    controller->setTransport(nullptr);
+    controller->setTransport(reusePointer ? &oldTransport : &replacement);
+    QSignalSpy rejected(bridge, &TerminalBridge::inputRejected);
+    const QByteArray suffix = QByteArrayLiteral("old paste suffix\n");
+    const bool accepted = binary
+        ? bridge->sendBinaryInput(QString::fromLatin1(suffix.toBase64()), oldGeneration)
+        : bridge->sendInput(QString::fromLatin1(suffix), oldGeneration);
+    QVERIFY(!accepted);
+    QCOMPARE(rejected.count(), 1);
+    QCOMPARE(oldTransport.data(), QByteArrayLiteral("prefix"));
+    QVERIFY(replacement.data().isEmpty());
+    QVERIFY(bridge->sendInput(QStringLiteral("fresh input"), bridge->inputGeneration()));
+    if (reusePointer)
+        QCOMPARE(oldTransport.data(), QByteArrayLiteral("prefixfresh input"));
+    else
+        QCOMPARE(replacement.data(), QByteArrayLiteral("fresh input"));
 }
 
 // The page mounts asynchronously; output produced while it loads must reach the
@@ -1069,7 +1586,7 @@ void TstTerminalFactory::bridgeHoldsOutputUntilTheRendererIsReady()
     QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("early output"));
     QCOMPARE(writes.count(), 0);
 
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(bridge->rendererReady());
     // Exactly one replay batch, in arrival order.
     QCOMPARE(writes.count(), 1);
@@ -1109,7 +1626,7 @@ void TstTerminalFactory::bridgeIgnoresAVisibleReportFromAPaneWithNoRenderer()
     QCOMPARE(writes.count(), 0);
 
     // The handshake is the only thing that may release the buffer.
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(controller->viewVisible());
     QCOMPARE(writes.count(), 1);
     QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("first screenful"));
@@ -1126,13 +1643,49 @@ void TstTerminalFactory::bridgePreservesHiddenReportBeforeReady()
     bridge->notifyViewVisible(false);
     controller->ingestOutput(QByteArrayLiteral("hidden while loading"));
     QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("hidden while loading"));
-    bridge->ready();
+    bridge->ready(false);
 
     QVERIFY(!controller->viewVisible());
     QCOMPARE(writes.count(), 0);
     bridge->notifyViewVisible(true);
     QCOMPARE(writes.count(), 1);
     QCOMPARE(writes.at(0).at(0).toString(), QStringLiteral("hidden while loading"));
+}
+
+void TstTerminalFactory::aHiddenReplacementMountNeverReleasesRetainedOutput_data()
+{
+    QTest::addColumn<bool>("outgoingReportedHidden");
+    QTest::newRow("ordinary-reload") << true;
+    QTest::newRow("crashed-renderer") << false;
+}
+
+void TstTerminalFactory::aHiddenReplacementMountNeverReleasesRetainedOutput()
+{
+    QFETCH(bool, outgoingReportedHidden);
+    TerminalFactory factory(nullptr);
+    TerminalController* controller = factory.create();
+    TerminalBridge* bridge = factory.createBridge(controller);
+    bridge->ready(true);
+    QSignalSpy writes(bridge, &TerminalBridge::write);
+    controller->ingestOutput(
+        QByteArray(TerminalController::kMaxUnacknowledgedBytes, 'x'));
+    QCOMPARE(controller->unacknowledgedBytes(),
+             qint64(TerminalController::kMaxUnacknowledgedBytes));
+    controller->ingestOutput(QByteArrayLiteral("retained for the replacement"));
+    QTRY_COMPARE(controller->hiddenBuffer(),
+                 QByteArrayLiteral("retained for the replacement"));
+    if (outgoingReportedHidden)
+        bridge->notifyViewVisible(false);
+    const int before = writes.count();
+    bridge->ready(false);
+    QVERIFY(!controller->viewVisible());
+    QCOMPARE(controller->unacknowledgedBytes(), qint64(0));
+    QCOMPARE(writes.count(), before);
+    QCOMPARE(controller->hiddenBuffer(), QByteArrayLiteral("retained for the replacement"));
+    bridge->notifyViewVisible(true);
+    QCOMPARE(writes.count(), before + 1);
+    QCOMPARE(writes.last().first().toString(), QStringLiteral("retained for the replacement"));
+    QVERIFY(controller->hiddenBuffer().isEmpty());
 }
 
 // The other side of the same rule, in the two shapes production produces:
@@ -1143,7 +1696,7 @@ void TstTerminalFactory::bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload()
     TerminalFactory factory(nullptr);
     TerminalController* controller = factory.create(&pane);
     TerminalBridge* bridge = factory.createBridge(controller, &pane);
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(controller->viewVisible());
     QSignalSpy writes(bridge, &TerminalBridge::write);
 
@@ -1168,7 +1721,7 @@ void TstTerminalFactory::bridgeRetainsOutputForAHiddenPaneAndAcrossAPageReload()
     QTRY_COMPARE(controller->hiddenBuffer(), QByteArrayLiteral("across the reload"));
     QCOMPARE(writes.count(), 1);
 
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(controller->viewVisible());
     QCOMPARE(writes.count(), 2);
     QCOMPARE(writes.at(1).at(0).toString(), QStringLiteral("across the reload"));
@@ -1196,11 +1749,11 @@ void TstTerminalFactory::bridgeIsInertOnceItsControllerIsDestroyed()
     QSignalSpy geometry(bridge, &TerminalBridge::geometryChanged);
     QSignalSpy cleared(bridge, &TerminalBridge::clearRequested);
 
-    bridge->sendInput(QStringLiteral("ls\n"));
+    QVERIFY(!bridge->sendInput(QStringLiteral("ls\n"), bridge->inputGeneration()));
     bridge->resize(120, 40);
     bridge->notifyViewVisible(false);
     bridge->notifyViewVisible(true);
-    bridge->ready();
+    bridge->ready(true);
     bridge->requestClear();
 
     QCOMPARE(bridge->columns(), 0);
@@ -1221,7 +1774,7 @@ void TstTerminalFactory::bridgeDestructorHidesItsController()
     TerminalController* controller = factory.create(&pane);
     QPointer<TerminalBridge> bridge = factory.createBridge(controller, &pane);
 
-    bridge->ready();
+    bridge->ready(true);
     QVERIFY(controller->viewVisible());
     delete bridge;
     QVERIFY(bridge.isNull());
@@ -1245,7 +1798,7 @@ void TstTerminalFactory::bridgeDecodesUtf8SplitAcrossFlushes()
     TerminalFactory factory(nullptr);
     TerminalController* controller = factory.create(&pane);
     TerminalBridge* bridge = factory.createBridge(controller, &pane);
-    bridge->ready();
+    bridge->ready(true);
     QSignalSpy writes(bridge, &TerminalBridge::write);
 
     // "✔" is E2 9C 94, fed in two pieces cut after the second byte.
@@ -1291,7 +1844,7 @@ void TstTerminalFactory::bridgeStartsAFreshDecodeForAReplacementRenderer()
     TerminalFactory factory(nullptr);
     TerminalController* controller = factory.create(&pane);
     TerminalBridge* bridge = factory.createBridge(controller, &pane);
-    bridge->ready();
+    bridge->ready(true);
     QSignalSpy writes(bridge, &TerminalBridge::write);
 
     // Two thirds of "✔" (E2 9C 94) reach the page's decoder and stay there.
@@ -1299,7 +1852,7 @@ void TstTerminalFactory::bridgeStartsAFreshDecodeForAReplacementRenderer()
     QCOMPARE(writes.count(), 0);
 
     // The page reloads and announces itself. Its first batch is plain ASCII.
-    bridge->ready();
+    bridge->ready(true);
     emit controller->flushReady(QByteArrayLiteral("fresh"));
 
     QCOMPARE(writes.count(), 1);
@@ -1321,7 +1874,7 @@ void TstTerminalFactory::bridgeCarriesByteWeightAndFeedsAcknowledgementsBack()
     TerminalFactory factory(nullptr);
     TerminalController* controller = factory.create(&pane);
     TerminalBridge* bridge = factory.createBridge(controller, &pane);
-    bridge->ready();
+    bridge->ready(true);
     QSignalSpy writes(bridge, &TerminalBridge::write);
 
     // Run the renderer's credit down to zero without acknowledging anything.
@@ -1359,7 +1912,7 @@ void TstTerminalFactory::bridgeCarriesByteWeightAndFeedsAcknowledgementsBack()
     const QByteArray stranded = controller->hiddenBuffer();
 
     const int before = writes.count();
-    bridge->ready(); // the replacement page mounts; no hidden report preceded it
+    bridge->ready(true); // the replacement page mounts; no hidden report preceded it
     QCOMPARE(writes.count(), before + 1);
     QCOMPARE(writes.at(before).at(0).toString(), QString::fromUtf8(stranded));
     QVERIFY(controller->hiddenBuffer().isEmpty());
@@ -1384,7 +1937,7 @@ void TstTerminalFactory::bridgeReportsStateTransitionsAsStrings()
 
     // A page that mounts late gets the current state re-announced by the
     // handshake, so its status strip is never stuck on "unloaded".
-    bridge->ready();
+    bridge->ready(true);
     QCOMPARE(states.count(), 3);
     QCOMPARE(states.at(2).at(0).toString(), toString(TerminalState::Ready));
 
@@ -1481,6 +2034,7 @@ void TstTerminalFactory::aPaneReportsItsOutputUnderTheRowIdTheServerAnswered()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -1550,6 +2104,7 @@ void TstTerminalFactory::aCachedLegacyAnswerStillReportsItsRowSoTheBackfillCanBe
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -1615,6 +2170,7 @@ void TstTerminalFactory::aPaneRetargetedMidLookupNeverReportsUnderTheSupersededP
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     // BOTH candidate terminals are registered and attached, so a byte reported
@@ -1652,7 +2208,8 @@ void TstTerminalFactory::aPaneRetargetedMidLookupNeverReportsUnderTheSupersededP
                       QStringLiteral("row-A"), QStringLiteral("s1"),
                       QStringLiteral("terminal-1"), QStringLiteral("ch_s1_row-A"),
                       QStringLiteral("generic"));
-    QTRY_COMPARE(resolved.count(), 1);
+    QTRY_COMPARE(rpc.client()->pendingCount(), 1);
+    QCOMPARE(resolved.count(), 0);
 
     // The pane prints on the channel it opened for row-A.
     controller->ingestOutput(QByteArrayLiteral("output from the pane we left"));
@@ -1668,12 +2225,145 @@ void TstTerminalFactory::aPaneRetargetedMidLookupNeverReportsUnderTheSupersededP
                       QStringLiteral("row-B"), QStringLiteral("s1"),
                       QStringLiteral("terminal-2"), QStringLiteral("ch_s1_row-B"),
                       QStringLiteral("generic"));
-    QTRY_COMPARE(resolved.count(), 2);
+    QTRY_COMPARE(resolved.count(), 1);
     controller->ingestOutput(QByteArrayLiteral("output from the pane we are on"));
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-B")),
              asInt(AgentState::Running));
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("row-A")),
              asInt(AgentState::Starting));
+}
+
+void TstTerminalFactory::supersededResolutionErrorsDoNotReplaceTheCurrentAnswer()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    AttachingFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* controller = factory.create();
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                  QStringLiteral("row-A"), QString()));
+    const QJsonObject oldRequest = rpc.takeRequest();
+    QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                  QStringLiteral("row-B"), QString()));
+    const QJsonObject currentRequest = rpc.takeRequest();
+    rpc.answerWithRow(currentRequest.value(QStringLiteral("id")).toInt(),
+                      QStringLiteral("row-B"), QStringLiteral("s1"), QString(),
+                      QStringLiteral("ch_s1_row-B"), QString());
+    QTRY_COMPARE(resolved.count(), 1);
+    rpc.answerWithError(oldRequest.value(QStringLiteral("id")).toInt(),
+                        QStringLiteral("the old row was deleted"));
+    QTRY_COMPARE(rpc.client()->pendingCount(), 0);
+    QCOMPARE(resolved.count(), 1);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(factory.attach(controller, resolved.first().at(1).toString(), QString(), 80, 24));
+    QCOMPARE(factory.targetFor(controller), QStringLiteral("ch_s1_row-B"));
+}
+
+void TstTerminalFactory::detachCancelsPendingResolution_data()
+{
+    QTest::addColumn<bool>("cached");
+    QTest::newRow("rpc-answer") << false;
+    QTest::newRow("queued-cache-answer") << true;
+}
+
+void TstTerminalFactory::detachCancelsPendingResolution()
+{
+    QFETCH(bool, cached);
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* controller = factory.create();
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    QSignalSpy errors(&factory, &TerminalFactory::error);
+    const auto resolve = [&]() {
+        return factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
+                                     QStringLiteral("row-A"), QString());
+    };
+    QVERIFY(resolve());
+    const QJsonObject request = rpc.takeRequest();
+    if (cached) {
+        rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
+                          QStringLiteral("row-A"), QStringLiteral("s1"), QString(),
+                          QStringLiteral("ch_s1_row-A"), QString());
+        QTRY_COMPARE(resolved.count(), 1);
+        resolved.clear();
+        QVERIFY(resolve());
+    }
+    factory.detach(controller);
+    if (!cached) {
+        rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
+                          QStringLiteral("row-A"), QStringLiteral("s1"), QString(),
+                          QStringLiteral("ch_s1_row-A"), QString());
+        QTRY_COMPARE(rpc.client()->pendingCount(), 0);
+    }
+    QCoreApplication::processEvents();
+    QCOMPARE(resolved.count(), 0);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(!controller->transport());
+    // Cancellation is per waiter, not eviction of a server-authoritative
+    // answer. A later request for this same terminal still resolves normally.
+    QVERIFY(resolve());
+    QTRY_COMPARE(resolved.count(), 1);
+    QCOMPARE(resolved.first().at(1).toString(), QStringLiteral("ch_s1_row-A"));
+}
+
+void TstTerminalFactory::cancellingOldServerFlightsDoesNotCancelReentrantNewRequests()
+{
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    TerminalController* first = factory.create();
+    TerminalController* second = factory.create();
+    const auto resolve = [&](TerminalController* controller, const QString& row) {
+        return factory.resolveTarget(controller, QStringLiteral("s1"), QString(), row, QString());
+    };
+    QVERIFY(resolve(first, QStringLiteral("row-A")));
+    const QJsonObject oldFirst = rpc.takeRequest();
+    QVERIFY(resolve(second, QStringLiteral("row-B")));
+    const QJsonObject oldSecond = rpc.takeRequest();
+    bool renewed = false;
+    bool renewalAccepted = false;
+    connect(&factory, &TerminalFactory::error, &factory,
+            [&](TerminalController*, const QString&) {
+                if (renewed)
+                    return;
+                renewed = true;
+                factory.detach(first);
+                factory.detach(second);
+                renewalAccepted = resolve(first, QStringLiteral("row-A"))
+                    && resolve(second, QStringLiteral("row-B"));
+            });
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+    factory.setServerId(QStringLiteral("srv-2"));
+    QVERIFY(renewed);
+    QVERIFY(renewalAccepted);
+    QCOMPARE(resolved.count(), 0);
+    const QJsonObject newFirst = rpc.takeRequest();
+    const QJsonObject newSecond = rpc.takeRequest();
+    QVERIFY(!newFirst.isEmpty());
+    QVERIFY(!newSecond.isEmpty());
+    for (const QJsonObject& request : {oldFirst, oldSecond})
+        rpc.answerWithError(request.value(QStringLiteral("id")).toInt(),
+                            QStringLiteral("old server request"));
+    for (const QJsonObject& request : {newFirst, newSecond}) {
+        const QString row = request.value(QStringLiteral("params")).toObject()
+                                .value(QStringLiteral("id")).toString();
+        rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(), row,
+                          QStringLiteral("s1"), QString(), QStringLiteral("ch_") + row, QString());
+    }
+    QTRY_COMPARE(resolved.count(), 2);
+    for (const QList<QVariant>& answer : resolved)
+        QVERIFY(!answer.at(1).toString().isEmpty());
 }
 
 // A pane pointed somewhere new whose lookup FAILS has no identity at all. It
@@ -1690,6 +2380,7 @@ void TstTerminalFactory::aFailedResolutionLeavesThePaneWithNoIdentity()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -1782,6 +2473,7 @@ void TstTerminalFactory::oldResolutionsCannotCompleteANewServerRequest()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
@@ -1843,6 +2535,7 @@ void TstTerminalFactory::aServerSwitchDuringResolutionDeliveryCancelsTheOtherWai
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     QObject pane;
     TerminalController* first = factory.create(&pane);
     TerminalController* second = factory.create(&pane);
@@ -1890,6 +2583,7 @@ void TstTerminalFactory::aServerAnswerWithAnUnusableTmuxTargetFailsTheResolution
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -1959,6 +2653,7 @@ void TstTerminalFactory::changingTheWorkspaceServerForgetsRememberedRowIdentitie
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -2037,6 +2732,7 @@ void TstTerminalFactory::aChangedHarnessSurvivesTheResolutionCache()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -2105,6 +2801,7 @@ void TstTerminalFactory::repeatingAnUnchangedHarnessDoesNotRestartTheClock()
     OfflineFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
 
     QObject pane;
@@ -2175,6 +2872,7 @@ void TstTerminalFactory::aFirstAttachStaysSilentEvenWhenItCreatedTheSession()
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2207,6 +2905,7 @@ void TstTerminalFactory::aReattachThatCreatedTheSessionSaysTheOldOneIsGone()
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2246,6 +2945,7 @@ void TstTerminalFactory::anOrdinaryReconnectToASessionThatWasStillThereStaysSile
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2294,6 +2994,7 @@ void TstTerminalFactory::aPaneThatNeverHadASessionStaysSilentWhenOneIsFinallyCre
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2342,6 +3043,7 @@ void TstTerminalFactory::aFailedOrEmptyListingReportsNothingAndRaisesNoError()
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2407,6 +3109,7 @@ void TstTerminalFactory::aRetargetWhileTheProbeIsInFlightReportsNothing()
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
 
     QObject pane;
     TerminalController* controller = factory.create(&pane);
@@ -2468,6 +3171,7 @@ void TstTerminalFactory::anOlderAttachmentProbeCannotReportForANewerChannel()
     factory.setWorkspace(rpc.db());
     factory.setRpcClient(rpc.client());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     QObject pane;
     TerminalController* controller = factory.create(&pane);
     const QString target = QStringLiteral("ch_s1_row-A");
@@ -2508,6 +3212,7 @@ void TstTerminalFactory::outputDuringChannelOpenIsNotResetToStarting()
     AttachingFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
     TerminalController* controller = factory.create();
     connect(controller, &TerminalController::stateChanged, controller,
@@ -2540,6 +3245,7 @@ void TstTerminalFactory::endedTerminalObservationAcceptsRemoteActivity()
     AttachingFactory factory(nullptr);
     factory.setWorkspace(rpc.db());
     factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
     factory.setAgentMonitor(&monitor);
     TerminalController* controller = factory.create();
     QVERIFY(resolveAndAttach(factory, rpc, controller, QStringLiteral("ch_s1_row-A"),

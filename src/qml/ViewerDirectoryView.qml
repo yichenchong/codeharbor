@@ -34,7 +34,7 @@ Rectangle {
     signal openWithRequested(string path, string scheme)
     signal messageRequested(string message)
 
-    property var customSchemeRow: null
+    property string customSchemePath: ""
 
     property var entries: []
     property string errorText: ""
@@ -178,7 +178,7 @@ Rectangle {
     }
 
     function showCustomScheme(row) {
-        root.customSchemeRow = row;
+        root.customSchemePath = root.pathFor(row);
         customSchemeField.text = "";
         customSchemeDialog.open();
     }
@@ -191,9 +191,9 @@ Rectangle {
     }
 
     function submitCustomScheme() {
-        const row = root.customSchemeRow;
+        const path = root.customSchemePath;
         const scheme = customSchemeField.text.trim();
-        if (!row || row.kind === "parent")
+        if (path.length === 0)
             return true;
 
         const valid = root.viewerModel
@@ -206,8 +206,8 @@ Rectangle {
                                        + "letters, digits, '+', '-' or '.'."));
             return false;
         }
-        root.openWithRequested(root.pathFor(row), scheme);
-        root.customSchemeRow = null;
+        root.openWithRequested(path, scheme);
+        root.customSchemePath = "";
         return true;
     }
 
@@ -228,6 +228,9 @@ Rectangle {
     }
 
     onUrlChanged: {
+        root.customSchemePath = "";
+        if (customSchemeDialog)
+            customSchemeDialog.close();
         list.currentIndex = -1;
         reload();
     }
@@ -505,7 +508,7 @@ Rectangle {
 
         onOpened: customSchemeField.forceActiveFocus()
         onAccepted: if (!root.submitCustomScheme()) customSchemeDialog.open()
-        onRejected: root.customSchemeRow = null
+        onRejected: root.customSchemePath = ""
     }
 
 

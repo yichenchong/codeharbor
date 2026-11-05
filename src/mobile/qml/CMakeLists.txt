@@ -32,9 +32,9 @@ set_source_files_properties(${CMAKE_SOURCE_DIR}/src/qml/EndpointField.js
 qt_add_qml_module(codeharbor_mobile_qml
     URI CodeHarbor.Mobile
     VERSION 1.0
-    # Output dir must end in the module target path (URI) so qmllint/qmlls
-    # tooling resolves the module correctly.
-    OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/CodeHarbor/Mobile
+    # Share the Core module's import root: placing this parent URI under this
+    # subdirectory's binary tree would hide Core from qmllint/qmlimportscanner.
+    OUTPUT_DIRECTORY ${_ch_mobile_qml_import_root}/CodeHarbor/Mobile
     QML_FILES
         MobileTheme.qml
         MobileMain.qml

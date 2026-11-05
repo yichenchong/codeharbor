@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
     AGENT_STATES,
+    AGENT_SOCKET_ENV,
     CH_EVENT_VERSION,
     HARNESSES,
     makeEvent,
@@ -163,6 +164,25 @@ test("resolveSocketPath prefers XDG_RUNTIME_DIR, else falls back to cache", () =
         resolveSocketPath({ XDG_RUNTIME_DIR: "/run/user/7", HOME: "/home/someone" }),
         "/run/user/7/codeharbor.sock",
     );
+});
+
+test("the advertised agent endpoint overrides inherited runtime and home exactly (NTC9)", () => {
+    const endpoint = "/run/codeharbor actual/events.sock";
+    assert.equal(resolveSocketPath({
+        [AGENT_SOCKET_ENV]: endpoint,
+        XDG_RUNTIME_DIR: "/run/stale-tmux",
+        HOME: "/home/stale-tmux",
+    }), endpoint);
+});
+
+test("an invalid explicit agent endpoint never falls back to inherited directories (NTC9)", () => {
+    for (const endpoint of ["", "relative.sock", " \t ", "/run/agent\0.sock"]) {
+        assert.throws(() => resolveSocketPath({
+            [AGENT_SOCKET_ENV]: endpoint,
+            XDG_RUNTIME_DIR: "/run/stale-tmux",
+            HOME: "/home/stale-tmux",
+        }), /CODEHARBOR_AGENT_SOCKET.*absolute.*NUL/);
+    }
 });
 
 // The bridge reads JSONL off a socket, and a producer that ends its lines with

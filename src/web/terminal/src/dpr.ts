@@ -45,6 +45,14 @@ export function createDevicePixelRatioController(
     view: DevicePixelRatioWindow,
 ): DevicePixelRatioController {
     const descriptor = Object.getOwnPropertyDescriptor(view, "devicePixelRatio");
+    // Keep the browser accessor even while an own override shadows it. Its
+    // value changes when the window moves between screens or changes zoom.
+    let nativeDescriptor = descriptor;
+    let prototype: object | null = Object.getPrototypeOf(view);
+    while (!nativeDescriptor && prototype) {
+        nativeDescriptor = Object.getOwnPropertyDescriptor(prototype, "devicePixelRatio");
+        prototype = Object.getPrototypeOf(prototype);
+    }
     const descriptorValue = descriptor?.get
         ? Number(descriptor.get.call(view))
         : Number(descriptor?.value);
@@ -71,6 +79,12 @@ export function createDevicePixelRatioController(
             return state;
         },
         set(preference: number): DevicePixelRatioState {
+            const observedActual = nativeDescriptor?.get
+                ? Number(nativeDescriptor.get.call(view))
+                : overridden ? state.actual : Number(view.devicePixelRatio);
+            const actual = Number.isFinite(observedActual) && observedActual > 0
+                ? observedActual
+                : state.actual;
             const finite = Number.isFinite(preference) ? preference : 0;
             const clamped = finite > 0
                 ? Math.min(kMaxTerminalPixelRatio,
@@ -86,8 +100,8 @@ export function createDevicePixelRatioController(
             // where raising the resolution also enlarged the text. The setting
             // therefore only ever lowers the render resolution; the real ratio
             // is already the sharpest correct value.
-            const requested = clamped > 0 ? Math.min(clamped, state.actual) : 0;
-            if (requested === 0 || requested >= state.actual
+            const requested = clamped > 0 ? Math.min(clamped, actual) : 0;
+            if (requested === 0 || requested >= actual
                 || descriptor?.configurable === false) {
                 if (overridden) {
                     try {
@@ -117,7 +131,7 @@ export function createDevicePixelRatioController(
                     get: () => requested,
                 });
                 overridden = true;
-                state = { actual: state.actual, effective: requested, overridden: true };
+                state = { actual, effective: requested, overridden: true };
             } catch {
                 // The browser's ratio remains authoritative if the host refuses
                 // a property override; callers still get an honest diagnostic.

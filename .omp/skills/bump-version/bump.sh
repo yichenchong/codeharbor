@@ -233,11 +233,11 @@ fi
 # integration is then pointed at that extracted tree - one implementation, not
 # two that can disagree.
 command -v tar >/dev/null || die "tar not found (needed to verify the tagged tree)"
-git rev-parse -q --verify HEAD >/dev/null || die "no commit to tag"
+release_commit="$(git rev-parse -q --verify HEAD)" || die "no commit to tag"
 
 verify_tree="$(mktemp -d)"
 trap 'rm -rf "$verify_tree"' EXIT
-git archive HEAD -- "${INPUT_FILES[@]}" .bumpversion.json \
+git archive "$release_commit" -- "${INPUT_FILES[@]}" .bumpversion.json \
     | tar -x -C "$verify_tree" \
     || die "could not read the version files out of HEAD; refusing to tag $tag"
 
@@ -264,7 +264,11 @@ if [ "$DO_PUSH" -eq 1 ] && [ "${#PREFLIGHT[@]}" -gt 0 ]; then
     echo "Release preflight passed"
 fi
 
-git tag -a "$tag" -m "$tag"
+# Preflight commands are arbitrary project commands. They must not move HEAD
+# after its version was verified, or the implicit tag target would be unchecked.
+[ "$(git rev-parse --verify HEAD)" = "$release_commit" ] \
+    || die "HEAD changed during release preflight; refusing to tag an unchecked commit"
+git tag -a "$tag" "$release_commit" -m "$tag"
 echo "Created annotated tag $tag"
 
 if [ "$DO_PUSH" -eq 1 ]; then

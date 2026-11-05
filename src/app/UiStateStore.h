@@ -34,7 +34,7 @@ namespace ch {
 // legacy one; there is only one version today, so no migration runs. The stamp
 // only ever moves forward — a file a newer build wrote is left alone.
 //
-// Only `region` is checked for a '/' (see setNextPaneSuffix()), and the
+// Only `region` is checked for '/' or '\\' (see setNextPaneSuffix()), and the
 // asymmetry is deliberate rather than an oversight. `region` is a two-word
 // vocabulary this client owns, so a separator in it can only be QML misuse and
 // would silently address a key shape that is not the documented one. A Dev
@@ -43,8 +43,8 @@ namespace ch {
 // matching write did, so a separator inside one merely nests the key one level
 // deeper and still round-trips, and none of the shapes above can collide with
 // another (`selectedPane/a/b` is a different key from `selectedPane/a`, and the
-// only spelling that could reach `paneSuffix/a/b/c` two ways has the '/' in the
-// region half, which is refused). Rejecting ids here would instead throw away
+// only spelling that could reach `paneSuffix/a/b/c` two ways has a separator in
+// the region half, which is refused). Rejecting ids here would instead throw away
 // state for sessions the server is perfectly happy with.
 class UiStateStore : public QObject {
     Q_OBJECT
@@ -118,10 +118,10 @@ public:
     // this counter - or one whose settings file was cleared - still cannot
     // label a new pane with a number a pane already on screen is wearing.
     //
-    // An empty devSessionId or region, or a region containing '/', is not a
-    // valid address. Reads answer the default and writes are dropped, so
+    // An empty devSessionId or region, or a region containing '/' or '\\', is
+    // not a valid address. Reads answer the default and writes are dropped, so
     // nothing is ever parked under a bare "paneSuffix//<region>" key or a
-    // nested region path.
+    // nested region path, including on Windows where '\\' is also a separator.
     Q_INVOKABLE void setNextPaneSuffix(const QString& devSessionId,
                                        const QString& region, int suffix);
     Q_INVOKABLE int nextPaneSuffix(const QString& devSessionId,

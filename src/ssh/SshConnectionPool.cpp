@@ -630,12 +630,12 @@ void SshConnectionPool::disconnectFromHost()
 
 namespace {
 
-// SH15: bound the synchronous handshake's worst-case UI freeze. libssh's own
-// default packet timeout is much longer and version-dependent, so without this
-// a black-holed endpoint could stall the calling (UI) thread for that whole
-// default. 15s is long enough for a slow but live server to finish key exchange
-// and authentication, and is consistent with the connect-side budgets in
-// SessionBootstrap.
+// Limit libssh's individual blocking waits. Its default packet timeout is much
+// longer and version-dependent, so a black-holed endpoint could otherwise
+// stall the calling (UI) thread for that whole default. This is not a total
+// handshake deadline: multiple blocking operations can each consume a timeout.
+// 15s gives a slow but live server room to make progress and is consistent
+// with the connect-side budgets in SessionBootstrap.
 constexpr long kHandshakeTimeoutSeconds = 15;
 
 bool usesUnsupportedWindowsAgent()
@@ -932,6 +932,11 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         const bool cancelled = cancelledBeforeClose || m_disconnectRequested;
         if (m_state != State::NotAvailable)
             setState(cancelled ? State::Disconnected : State::Error);
+        // Error handlers may ask to disconnect too. That request is deferred
+        // while this handshake is active, just like one made during libssh,
+        // but there is no later abortRequested() on a failure return path.
+        if (m_disconnectRequested && m_state != State::NotAvailable)
+            setState(State::Disconnected);
     };
     const auto abortRequested = [this] {
         if (!m_disconnectRequested)
@@ -1046,7 +1051,7 @@ bool SshConnectionPool::connectToHost(const QString& host, quint16 port,
         return false;
     }
 
-    // SH15: cap the worst-case handshake freeze (see kHandshakeTimeoutSeconds).
+    // Apply the default libssh timeout (see kHandshakeTimeoutSeconds).
     // Applied BEFORE the user's OpenSSH config is parsed, not after: libssh's
     // config parser calls ssh_options_set(SSH_OPTIONS_TIMEOUT) for a
     // ConnectTimeout directive, so a user who set one still wins, while a user

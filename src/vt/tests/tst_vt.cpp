@@ -100,6 +100,7 @@ private slots:
     void savedCursorRestoresDeferredWrap();
     void autowrapOffOverwritesLastColumn();
     void honoursScrollRegionForLineFeedAndEditing();
+    void invalidScrollMarginsPreserveRegionAndCursor();
     void scrollsUpAndDownWithinRegion();
     void scrollingPrimaryScreenFeedsHistory();
     void eraseDisplayThreeClearsHistory();
@@ -110,6 +111,8 @@ private slots:
     void appliesIndexedAndTruecolourSgr();
     void appliesColonSeparatedSgr();
     void trailingOmittedSgrParameterResetsRendition();
+    void underlineSubparameterZeroDisablesUnderline();
+    void unsupportedCsiFormsHaveNoSideEffects();
     void answersDeviceStatusReports();
     void setsWindowTitleFromOsc();
     void discardsUnknownOscAndDcsPayloads();
@@ -129,6 +132,7 @@ private slots:
     void nestedWriteFromReplyHandlerJoinsTheBatch();
     void resizeTruncatesWithoutReflowing();
     void resetRestoresDefaults();
+    void softResetPreservesActiveCursor();
     void coalescesNotificationsPerWrite();
     void encodesCursorKeysInBothModes();
     void encodesEditingAndFunctionKeys();
@@ -554,6 +558,36 @@ void TstVt::honoursScrollRegionForLineFeedAndEditing()
     screen.write(csi("1;1H") + csi("3L"));
     QCOMPARE(lineText(screen, 0), QStringLiteral("A"));
     QCOMPARE(lineText(screen, 1), QStringLiteral("D"));
+}
+
+void TstVt::invalidScrollMarginsPreserveRegionAndCursor()
+{
+    const QByteArray invalid[] = {"1;1r", "4;2r", "3;3r", "99999;0r", "0;1r"};
+    for (const QByteArray &sequence : invalid) {
+        VtScreen screen;
+        screen.resize(10, 5);
+        screen.write(QByteArrayLiteral("A\r\nB\r\nC\r\nD\r\nE")
+                     + csi("2;4r") + csi("3;3H"));
+        feedByte(screen, csi(sequence));
+        QCOMPARE(screen.cursorRow(), 2);
+        QCOMPARE(screen.cursorColumn(), 2);
+
+        // The old region still protects the first and last screen rows.
+        screen.write(csi("4;1H") + QByteArrayLiteral("\n"));
+        QCOMPARE(screen.historyLines(), 0);
+        QCOMPARE(lineText(screen, 0), QStringLiteral("A"));
+        QCOMPARE(lineText(screen, 1), QStringLiteral("C"));
+        QCOMPARE(lineText(screen, 2), QStringLiteral("D"));
+        QCOMPARE(lineText(screen, 3), QString());
+        QCOMPARE(lineText(screen, 4), QStringLiteral("E"));
+
+        // Explicit zeros still select the full-screen defaults and home.
+        screen.write(csi("0;0r"));
+        QCOMPARE(screen.cursorRow(), 0);
+        QCOMPARE(screen.cursorColumn(), 0);
+        screen.write(csi("5;1H") + QByteArrayLiteral("\n"));
+        QCOMPARE(screen.historyLines(), 1);
+    }
 }
 
 void TstVt::scrollsUpAndDownWithinRegion()
@@ -1279,6 +1313,40 @@ void TstVt::boundsParameterAndStringOverflow()
     QCOMPARE(lineText(screen, screen.firstScreenRow()), QStringLiteral("after"));
 }
 
+void TstVt::unsupportedCsiFormsHaveNoSideEffects()
+{
+    const QByteArray unsupported[] = {
+        "1:2;3H", "?25:7l", "?25!l", "?1049!h", "?1$h", "6:1n"
+    };
+    for (const QByteArray &sequence : unsupported) {
+        VtScreen screen;
+        screen.resize(10, 4);
+        screen.write(QByteArrayLiteral("content") + csi("2;3H") + csi("31m"));
+        const QString before = snapshot(screen);
+        QSignalSpy replySpy(&screen, &VtScreen::reply);
+        feedByte(screen, csi(sequence));
+        QCOMPARE(snapshot(screen), before);
+        QCOMPARE(replySpy.count(), 0);
+        screen.write(QByteArrayLiteral("X"));
+        QCOMPARE(cellAt(screen, 1, 2).text, char32_t('X'));
+        QCOMPARE(cellAt(screen, 1, 2).fg, vt::xterm256Color(1));
+    }
+}
+
+void TstVt::underlineSubparameterZeroDisablesUnderline()
+{
+    VtScreen screen;
+    screen.resize(10, 3);
+    screen.write(csi("1;4;31m") + QByteArrayLiteral("A"));
+    feedByte(screen, csi("4:0m"));
+    screen.write(QByteArrayLiteral("B"));
+    QCOMPARE(cellAt(screen, 0, 0).attrs, quint16(VtBold | VtUnderline));
+    QCOMPARE(cellAt(screen, 0, 1).attrs, quint16(VtBold));
+    QCOMPARE(cellAt(screen, 0, 1).fg, vt::xterm256Color(1));
+    screen.write(csi("4:3m") + QByteArrayLiteral("C"));
+    QCOMPARE(cellAt(screen, 0, 2).attrs, quint16(VtBold | VtUnderline));
+}
+
 // --- geometry and reset -----------------------------------------------------
 
 void TstVt::resizeTruncatesWithoutReflowing()
@@ -1365,6 +1433,35 @@ void TstVt::resetRestoresDefaults()
     screen.reset();
     screen.write(QByteArrayLiteral("31mQ"));
     QCOMPARE(lineText(screen, 0), QStringLiteral("31mQ"));
+}
+
+void TstVt::softResetPreservesActiveCursor()
+{
+    VtScreen screen;
+    screen.resize(10, 4);
+    screen.write(QByteArrayLiteral("A\r\nB\r\nC\r\nD\r\nE")
+                 + csi("2;3r") + csi("3;5H") + csi("31m")
+                 + QByteArrayLiteral("\x1b""7"));
+    const int history = screen.historyLines();
+    QSignalSpy replySpy(&screen, &VtScreen::reply);
+    feedByte(screen, csi("!p"));
+    screen.write(csi("6n") + QByteArrayLiteral("X"));
+    QCOMPARE(replySpy.count(), 1);
+    QCOMPARE(replySpy.at(0).at(0).toByteArray(), csi("3;5R"));
+    QCOMPARE(cellAt(screen, screen.firstScreenRow() + 2, 4).text, char32_t('X'));
+    QCOMPARE(cellAt(screen, screen.firstScreenRow() + 2, 4).fg,
+             VtScreen::defaultForeground());
+    QCOMPARE(screen.historyLines(), history);
+    QCOMPARE(lineText(screen, 0), QStringLiteral("A"));
+
+    // The saved state, unlike the active position, is reset to home.
+    screen.write(QByteArrayLiteral("\x1b""8"));
+    QCOMPARE(screen.cursorRow(), 0);
+    QCOMPARE(screen.cursorColumn(), 0);
+
+    // Resetting the margins still permits full-screen scrolling.
+    screen.write(csi("4;1H") + QByteArrayLiteral("\n"));
+    QCOMPARE(screen.historyLines(), history + 1);
 }
 
 void TstVt::coalescesNotificationsPerWrite()

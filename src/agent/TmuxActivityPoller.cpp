@@ -11,6 +11,24 @@
 
 namespace ch {
 
+namespace {
+
+std::optional<qint64> activityTimeMs(const QJsonValue& value)
+{
+    if (!value.isDouble())
+        return std::nullopt;
+    // Match the daemon's non-negative, JavaScript-safe millisecond values.
+    // Bounding both operands also makes their signed subtraction safe.
+    constexpr qint64 maxSafeInteger = 9007199254740991LL;
+    const qint64 ms = value.toInteger(-1);
+    if (ms < 0 || ms > maxSafeInteger
+        || value.toDouble() != static_cast<double>(ms))
+        return std::nullopt;
+    return ms;
+}
+
+} // namespace
+
 TmuxActivityPoller::TmuxActivityPoller(QObject* parent) : QObject(parent)
 {
     // Coarse: this is a five-second housekeeping poll feeding a sidebar badge,
@@ -96,14 +114,19 @@ void TmuxActivityPoller::pollNow()
                        if (!self->m_client
                            || self->m_clientGeneration != clientGeneration)
                            return;
-                       self->m_inFlight = false;
+                       // Keep the overlap guard through publication too: an
+                       // activity slot may run a nested event loop or pollNow(),
+                       // and a newer reply must not overtake this listing.
                        // A failure is not evidence about any pane: the panes
                        // simply keep whatever the monitor last knew, and the
                        // next tick asks again. Nothing here is ever surfaced to
                        // the user — a sidebar badge is not worth a toast.
-                       if (error)
-                           return;
-                       self->publishActivity(result.toObject(), clientGeneration);
+                       if (!error)
+                           self->publishActivity(result.toObject(), clientGeneration);
+                       // Publication can destroy or rebind the poller. An old
+                       // callback must not release a replacement's request.
+                       if (self && self->m_clientGeneration == clientGeneration)
+                           self->m_inFlight = false;
                    });
 }
 
@@ -116,10 +139,9 @@ void TmuxActivityPoller::publishActivity(const QJsonObject& result,
     // and an age computed across them would be wrong by the offset between them
     // — enough, on a host a few minutes out, to report every pane as either
     // permanently busy or permanently idle.
-    const QJsonValue nowValue = result.value(QStringLiteral("nowMs"));
-    if (!nowValue.isDouble())
-        return;  // no clock to measure against: the whole listing says nothing
-    const qint64 nowMs = nowValue.toInteger(0);
+    const auto nowMs = activityTimeMs(result.value(QStringLiteral("nowMs")));
+    if (!nowMs)
+        return;  // no usable clock: the whole listing says nothing
 
     const QJsonArray panes = result.value(QStringLiteral("panes")).toArray();
     QPointer<TmuxActivityPoller> self(this);
@@ -144,11 +166,11 @@ void TmuxActivityPoller::publishActivity(const QJsonObject& result,
         // would be a silent lie in one direction or the other: 0 dates the pane
         // to 1970 and makes it permanently idle, `nowMs` makes it permanently
         // busy.
-        const QJsonValue activity = pane.value(QStringLiteral("lastActivityMs"));
-        if (!activity.isDouble())
+        const auto activity =
+            activityTimeMs(pane.value(QStringLiteral("lastActivityMs")));
+        if (!activity)
             continue;
-        emit activityObserved(devSessionId, terminalId,
-                              nowMs - activity.toInteger(0),
+        emit activityObserved(devSessionId, terminalId, *nowMs - *activity,
                               pane.value(QStringLiteral("alive")).toBool(false));
     }
 }

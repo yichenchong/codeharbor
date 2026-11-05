@@ -373,7 +373,7 @@ Smoke-test the services without a build:
 # JSON-RPC over stdio
 echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts rpc --stdio
 
-# Agent-status bridge (listens on $XDG_RUNTIME_DIR/codeharbor.sock)
+# Agent-status bridge (explicit CODEHARBOR_AGENT_SOCKET, otherwise XDG/HOME defaults)
 node src/bridge.ts
 ```
 
@@ -392,11 +392,22 @@ belong in `remote/sql/indexes.sql`, which is applied on every open rather than o
 on migration.
 
 The RPC schema is separate and IS the compatibility gate: `RPC_SCHEMA_VERSION` in
-`remote/src/codeharbord.ts` (currently 8 — 6 → 7 added the agent viewer control
-channel, SPEC 6.8; 7 → 8 added `tmux.paneActivity`, the per-pane last-output time
-that keeps a detached pane's sidebar status honest, SPEC 6.6) against
-`AppController::kMinimumServerSchemaVersion`. A client refuses a server whose RPC
-schema is older than it needs, which is the "Server too old" path.
+`remote/src/codeharbord.ts` is currently **10**. Schema 7 added agent viewer
+control, 8 added `tmux.paneActivity`, 9 added atomic `workspace.ensureInitialLayout`,
+and 10 requires `server.info.agentSocket` so tmux-created shells receive the
+service's actual event endpoint. `AppController::kMinimumServerSchemaVersion` is
+10; an older service is incompatible rather than a reason to guess that endpoint.
+The workspace database remains at schema 5. Separate initial-terminal creation
+and default-tree saving is still not a safe fallback for atomic initialization.
+
+**Native JSON-depth constraint.** Server layout storage is opaque byte-bounded
+JSON, and Node's stack-safe encoder can return values that the native Qt client
+cannot consume. Qt's `QJsonDocument` accepts 1024 nested containers including the
+RPC envelope and rejects 1025; an unsupported frame fails pending native calls
+and retires the transport rather than silently truncating the value. A deep value
+stored/read through Node must be normalized or removed with a compatible client
+before the native client can load it. Node-only deep-layout regressions do not
+prove native Qt compatibility; see SPEC 10.3 and 11.1.
 
 ## Mobile clients (Android / iOS)
 
@@ -714,15 +725,48 @@ External images or stylesheets, DTDs/entities, CSS resource imports or escapes,
 nested SVG image payloads (even labelled as PNG), and compressed SVG are refused
 before QtSvg parses the image.
 
+Native raster-image viewing accepts sources up to **64 Mi pixels**. Decoded output
+is bounded to **16 Mi pixels** and **8192 pixels per axis**, scaling down while
+preserving the source dimensions and orientation metadata. Larger source images
+are reported unsupported rather than decoded without a bound.
+
 The PDF page uses native page images and selection/link models rather than a
 component that opens URI annotations through the operating system. External URI
 annotations are inactive; internal page links, multipage scrolling, text
 selection, and zoom stay inside the viewer.
+Remote PDF files are limited to **8 MiB**. Each rasterized PDF page is bounded to
+**16 Mi pixels** and **8192 pixels per axis**, independently of zoom, device-pixel
+ratio or page aspect ratio.
 
-The optional HTTP(S) web viewer checks the initial URL and stops disallowed
-navigations when loading starts. QtWebView does not expose a pre-request
-interceptor here, so that stop hook is not a guarantee that navigation was
-prevented before starting.
+The native PDF backend needs the complete document in a per-service rendering
+spool: a `QTemporaryDir` matching
+`QStandardPaths::CacheLocation/pdf-spool-XXXXXX`, with files named by the remote
+path's SHA-256 hash. Android/iOS put it inside the app sandbox. Directory mode 0700
+is checked; `QSaveFile` publishes only complete files, with checked mode 0600 before
+writing document bytes and no direct-write fallback. A failure refuses the PDF.
+Nothing is shared, exported or handed to another app. Bytes remain while the pane
+is open; pane release removes its file, and peer loss/change or client/service
+destruction removes only that service's directory. No constructor sweeps another
+service's cache and no orphan reclamation is promised. Crash/forced kill or failed
+removal can leave the document until OS eviction; this is not secure erase or a
+guaranteed crash cleanup. The narrow no-local-project-files exception is in SPEC 11.2.
+
+The optional HTTP(S) viewer waits for native navigation protection before loading
+an untrusted address. `MobileWebViewPolicy` identifies this view by a unique
+app-created `about:blank` marker, installs Android/Darwin navigation and new-window
+guards, and releases the remote URL only after the guard reports ready. Installation
+is bounded to 10 seconds; an active guard is checked every 250 ms. A missing,
+failed or lost guard produces a visible refusal, never an unguarded fallback.
+
+Native policy blocks non-HTTP(S) navigation before Qt's external-URL handlers;
+allowed new-window HTTP(S) targets stay in the same view. File/content resource
+access is blocked while safe inline data/blob subresources remain usable. Public
+file-access settings are disabled as well. Darwin accepts only the supported Qt
+backend shape; unknown backends and unsupported desktop-host policy refuse
+browsing. The bootstrap marker may remain as an initial blocked history entry.
+The Android manifest and Apple ATS policy are not relaxed, so plaintext HTTP may
+still be refused by the platform. Portable tests do not establish device-level
+enforcement or Apple compilation/runtime compatibility.
 
 Two viewer backends are optional, discovered at configure time exactly as
 libssh and QtDBus are, and reported as `CH_HAVE_QTPDF` / `CH_HAVE_QTWEBVIEW`
@@ -860,11 +904,15 @@ does the same job for tmux. Both skip cleanly when the binary is absent. Prefer
 one of these over another fixture-fed unit test whenever the thing that could be
 wrong is an assumption about an external program's interface.
 
-`-L desktop` currently holds one target, `tst_notifierlive`, which delivers a real
-notification through `org.freedesktop.Notifications`. It needs a session bus AND a
-running notification daemon; without them it reports **Skipped**, never Passed, and
-says so loudly — so a green run can never be mistaken for "notifications proven".
-It is deliberately NOT in `-L live`, whose prerequisite is the SSH fixture instead.
+`-L desktop` currently holds one target, `tst_notifierlive`. It waits for the
+freedesktop notification daemon's replies and verifies a nonzero notification id
+and an acknowledged replacement using that same id. This proves daemon
+acknowledgement, **not visual display by the compositor**. It needs QtDBus, a
+session bus and a running or D-Bus-activatable `org.freedesktop.Notifications`
+service; without that backend it reports **Skipped**, never Passed.
+This is normally a Linux desktop capability; there is no native Windows, macOS
+or mobile notification backend. It is deliberately NOT in `-L live`, whose
+prerequisite is the SSH fixture instead.
 
 ### Live gates
 
@@ -891,20 +939,39 @@ Environment contract:
 Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
 
 ```bash
-tests/live/generate-fixture.sh                  # keys + sshd_config in tests/live/.fixture/
-D=tests/live/.fixture
-/usr/sbin/sshd -D -e -f $PWD/$D/sshd_config &   # unprivileged; logs to stderr
-ssh-agent -a $PWD/$D/agent.sock &
-SSH_AUTH_SOCK=$PWD/$D/agent.sock ssh-add $D/id
+D=$(mktemp -d /tmp/ch-live.XXXXXX)              # short, private disposable root
+tests/live/generate-fixture.sh "$D"            # keys, private runtime + sshd_config
+/usr/sbin/sshd -D -e -f "$D/sshd_config" &      # unprivileged; logs to stderr
+ssh-agent -a "$D/agent.sock" &
+SSH_AUTH_SOCK="$D/agent.sock" ssh-add "$D/id"
 ```
 
-The generator is committed; its output is git-ignored, because it holds real
-private keys. Re-running it is safe, and it is also the repair for a fixture whose
-config has gone stale — it rewrites `sshd_config` in place, so restart the fixture
-`sshd` afterwards.
+The generator is committed; generated fixtures hold real private keys, so keep
+their directory private and disposable. **A refresh deletes its workspace database and SQLite
+sidecars**, while retaining private keys/runtime/data/tmux contents and rewriting `sshd_config`.
+Stop the live tests and **only this fixture's own `sshd`, daemon, bridge and private
+tmux master** before refreshing; restart its owned `sshd` with the new config afterwards.
+Do not stop an ordinary GUI's services or delete shared user sockets to make a
+fixture start. Use a dedicated disposable fixture directory, never a workspace
+directory you want to keep.
 
-**Why a generator rather than a recipe to copy.** The config it writes contains
-`SetEnv CODEHARBOR_DB=<fixture>/workspace.sqlite`, and that line is load-bearing.
+Use a short absolute root such as the private temporary directory above, or a
+directory you own under `/run/user/<uid>/`. The complete path through
+`runtime/codeharbor-control-<16 hex digits>.sock` must fit **103 UTF-8 bytes** for
+portable Unix sockets. The generator rejects longer paths before changing files;
+non-ASCII characters count by bytes, not characters. Moving the runtime elsewhere
+is not a workaround: it must remain `<database-directory>/runtime` for isolation.
+After stopping the fixture's owned processes, remove its disposable directory
+when no longer needed.
+
+**Why a generator rather than a recipe to copy.** The config uses one directive
+with all five quoted assignments:
+
+```text
+SetEnv "CODEHARBOR_DB=<fixture>/workspace.sqlite" "XDG_RUNTIME_DIR=<fixture>/runtime" "XDG_DATA_HOME=<fixture>/data" "HISTFILE=/dev/null" "TMUX_TMPDIR=<fixture>/tmux"
+```
+
+Keep all five settings on the same `SetEnv` directive, not separate repeated directives.
 The live gates run a REAL `codeharbord` as you, and its workspace database
 defaults to `~/.local/share/codeharbor/codeharbor.sqlite` — the same file the
 server INSTALLED on this machine uses, which is to say your own workspace.
@@ -916,14 +983,39 @@ the `printf` that generates the config; the line was twice omitted while copying
 it by hand, and real workspace rows had to be removed afterwards. A recipe that
 quietly damages real data when mistyped is a fault in the recipe.
 
+Database isolation alone does not isolate the agent bridge and hooks. The same
+directive sets `XDG_RUNTIME_DIR` to `<fixture>/runtime`, owned by the fixture
+account with mode 0700. The generator refuses a redirected, non-directory or
+unowned runtime path before mutation. This keeps the bridge,
+hook and viewer-control sockets away from an ordinary GUI or another fixture.
+Existing runtime contents are retained; refreshing is not permission to unlink
+another service's socket.
+
+The same directive sets `XDG_DATA_HOME=<fixture>/data` so `server.info.recoveryDir`
+and editor recovery snapshots stay in the fixture's private data directory, not
+the account's real recovery area. The generator validates and creates this
+directory owner-only (0700), retaining its contents on refresh. `HISTFILE=/dev/null`
+suppresses ordinary Bash history writes. `HOME` deliberately remains the real
+account home for shell semantics and real-database alias checks: this is **not a
+shell sandbox**, and startup files/commands can still have their normal side effects.
+
+`TMUX_TMPDIR=<fixture>/tmux` gives the fixture a separate, owned mode-0700 tmux
+master namespace. Without it, a pre-existing user-default master can supply its
+old XDG/history environment even to a newly created fixture shell. The generator
+validates that private directory before mutation and retains its contents.
+Only stop the master in this known fixture namespace when refreshing, never the
+user-default/global master or unknown sessions/sockets. This fixture isolation is
+separate from the product's explicit `CODEHARBOR_AGENT_SOCKET` routing fix (SPEC 6.3).
+
 Two guards now stand in front of it:
 
 - `tst_live_fixture_isolation` is a CTest SETUP fixture that every `live` target
-  requires. It opens a session through the fixture and asks which
-  `CODEHARBOR_DB` the daemon will actually see — not merely whether a line
-  appears in a file — and fails with repair instructions when the answer is empty
-  or points at the real database. Because it is a setup fixture, a failure means
-  the live targets do not run at all rather than running against your workspace.
+  requires. It verifies the real session's effective `CODEHARBOR_DB`,
+  `XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `HISTFILE` and `TMUX_TMPDIR`, not merely config
+  lines. The database must not alias the real workspace; runtime/data/tmux must
+  canonicalize to the corresponding `<database-directory>/{runtime,data,tmux}`
+  directories, owned by the account with mode 0700, and `HISTFILE` must be
+  `/dev/null`. Failed setup prevents live targets from using those shared resources.
   With `CH_LIVE_SSH` unset it passes quietly and needs no SSH server.
 - The four targets that create workspace rows (`tst_sessionlayouts`,
   `tst_liveshell`, `tst_coldstart`, `tst_terminalpage`) delete exactly the ids
@@ -950,9 +1042,9 @@ their documented fallback paths when they are unset.
 ```bash
 export CH_LIVE_SSH=1
 export CH_LIVE_HOST=127.0.0.1 CH_LIVE_PORT=2222 CH_LIVE_USER=$(whoami)
-export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD CH_LIVE_IDENTITY=$PWD/$D/id
-export SSH_AUTH_SOCK=$PWD/tests/live/.fixture/agent.sock
-export CH_LIVE_KNOWN_HOSTS=$(mktemp -u /tmp/ch_kh_XXXX)
+export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD CH_LIVE_IDENTITY="$D/id"
+export SSH_AUTH_SOCK="$D/agent.sock"
+export CH_LIVE_KNOWN_HOSTS="$D/known_hosts"
 ctest --preset dev -L live --output-on-failure
 ```
 
@@ -984,8 +1076,9 @@ and runs anywhere Node 23.6+ is installed, so it is packaged once.
 ### Release pipeline
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds all
-targets on GitHub-hosted runners. Trigger it by pushing a tag (`git tag v0.1.0 &&
-git push --tags`) or via the **Run workflow** button (manual `workflow_dispatch`).
+targets on GitHub-hosted runners. A `v*` tag push triggers publication; the
+**Run workflow** button (`workflow_dispatch`) runs without publishing. Follow
+the release drill below to run the dry run and local preflight before tagging.
 
 | Job | Runner | Output artifact | Deploy tool |
 |---|---|---|---|
@@ -1005,8 +1098,8 @@ invalid"*. v0.4.0 shipped exactly that - a 72 MB asset nobody could install -
 because the workflow checked that assets were present, named and checksummed,
 and never that one could be installed.
 
-Signing needs four repository secrets (**Settings -> Secrets and variables ->
-Actions**):
+Signing needs three required repository secrets and one optional secret
+(**Settings -> Secrets and variables -> Actions**):
 
 | Secret | Contents |
 |---|---|
@@ -1049,7 +1142,7 @@ The `publish` job zips the Windows directory into `codeharbor-windows.zip`, then
 refuses to publish unless **every** expected asset is present exactly once and
 every versioned filename carries exactly the tag's version. Those names are
 stamped from `project(CodeHarbor VERSION …)` in the top-level `CMakeLists.txt`
-(one parser, `.github/scripts/release-version.sh`, shared by all five build
+(one parser, `.github/scripts/release-version.sh`, shared by all build
 jobs), so that second check is what stops a `v0.2.0` tag on an un-bumped tree
 from publishing an installer that calls itself 0.1.8.
 
@@ -1065,10 +1158,11 @@ other version lands, because vcpkg's registry port is the unusable 0.12.0.
 
 1. **Dispatch `release.yml` on `main`** ("Run workflow"). `publish` is gated on
    `github.event_name == 'push'` **and** `refs/tags/v*`, so this is a genuine
-   dry run: it exercises all five builders — three desktop, Android, iOS
-   simulator — and publishes nothing. Signing secrets ARE available to a
-   dispatch, so the Android packages get really signed here; that is the point,
-   because a wrong keystore password should surface before a tag exists.
+   dry run: it exercises the three desktop builders, the remote-service builder,
+   Android and the iOS simulator, and publishes nothing. When signing secrets are
+   configured, Android packages are really signed here; a wrong keystore password
+   should surface before a tag exists. Without them, the dry run produces explicitly
+   unsigned Android build proofs instead, not a signing or installation proof.
 
    Dispatch on `main`, **never** `--ref <a tag>`. GitHub runs the workflow file
    *as defined at the ref you dispatch*, so aiming a dispatch at an old tag
@@ -1127,16 +1221,21 @@ libssh: `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake` (or se
 
 ### What a maintainer needs to provide
 
-- **Nothing to get unsigned artifacts.** GitHub-hosted runners cover all three
-  OSes; a public repo runs the matrix for free. Just enable Actions and push a
-  tag.
-- **Code signing (optional, for distribution):** not wired up. macOS needs an
-  Apple Developer ID cert + notarization; Windows needs an Authenticode cert.
-  Both are added later as encrypted repo secrets consumed by extra deploy steps.
-  Unsigned artifacts run fine for internal/dev use (with an OS "unidentified
-  developer" prompt).
-- **Self-hosted runners:** only needed if you cannot use GitHub-hosted runners
-  (e.g. Apple Silicon-specific builds); otherwise not required.
+- **No signing credentials are needed for a manual dry run.** GitHub-hosted
+  runners build the desktop clients, remote service and iOS simulator artifact;
+  without Android signing secrets, the Android artifacts are explicitly named
+  `-unsigned` and cannot be installed. Use **Run workflow**, not a tag push, for
+  this path.
+- **Publishing a tagged release requires Android signing secrets** (§ *Android
+  signing* above). The publish job depends on the Android job; missing required
+  secrets prevent the whole release from publishing, not just the Android assets.
+- **Desktop code signing is optional and not wired up.** macOS needs an Apple
+  Developer ID cert + notarization; Windows needs an Authenticode cert. Unsigned
+  desktop artifacts run for internal/dev use with the platform's security warning.
+  The iOS artifact is simulator-only; device distribution needs Apple's signing
+  and provisioning credentials separately.
+- **Self-hosted runners:** only needed if GitHub-hosted runners do not meet your
+  requirements; the current release matrix uses GitHub-hosted runners.
 
 ### Local cross-OS (non-WebEngine parts only)
 

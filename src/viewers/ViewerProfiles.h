@@ -36,8 +36,8 @@ public:
                             QObject *parent = nullptr);
     ~ViewerProfiles() override;
 
-    // Register the codeharbor-internal scheme with WebEngine. Idempotent within
-    // a process and safe to call before QtWebEngine init; a no-op afterwards.
+    // Register the codeharbor-internal scheme before QtWebEngine init.
+    // Subsequent calls are no-ops; a first call after init is too late.
     static void registerUrlScheme();
 
     // Lazily created; the same object is returned on repeated calls. These are

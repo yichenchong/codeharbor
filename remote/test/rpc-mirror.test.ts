@@ -16,7 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch as watchDirectory, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,10 +47,12 @@ import {
     createWatchNotificationRelay,
     dispatch,
     handleLine,
+    type RpcResponse,
 } from "../src/codeharbord.ts";
 import { WORKSPACE_METHODS } from "../src/workspace.ts";
 import { fileMethods } from "../src/files.ts";
 import { TMUX_METHODS } from "../src/tmux.ts";
+import { AGENT_SOCKET_ENV } from "../src/events.ts";
 
 const headerPath = fileURLToPath(
     new URL("../../src/remote/RpcTypes.h", import.meta.url),
@@ -719,17 +721,26 @@ test("the daemon CLI runs when invoked through a symlink", { timeout: 10000 }, a
     }
 });
 
-test("the bridge CLI binds and shuts down when invoked through a symlink", { timeout: 10000 }, async () => {
+test("the bridge CLI subscribes and shuts down when invoked through a symlink", { timeout: 10000 }, async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "ch-bridge-symlink-"));
     const script = path.join(dir, "bridge.ts");
     symlinkSync(fileURLToPath(new URL("../src/bridge.ts", import.meta.url)), script);
     const child = spawn(process.execPath, [script], {
-        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite") },
+        env: {
+            ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: path.join(dir, "workspace.sqlite"),
+            CODEHARBOR_BRIDGE_RELAY_IDLE_MS: "1000",
+        },
         stdio: ["ignore", "pipe", "pipe"],
     });
     let errors = "";
     const ready = Promise.withResolvers<void>();
     const exited = Promise.withResolvers<number | null>();
+    const relayClosed = Promise.withResolvers<void>();
+    const socketPath = path.join(dir, "codeharbor.sock");
+    let subscribed = false;
+    const directoryWatch = watchDirectory(dir, () => {
+        if (subscribed && !existsSync(socketPath) && !existsSync(`${socketPath}.lock`)) relayClosed.resolve();
+    });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => {
         errors += chunk;
@@ -741,10 +752,144 @@ test("the bridge CLI binds and shuts down when invoked through a symlink", { tim
     child.once("close", exited.resolve);
     try {
         await ready.promise;
+        subscribed = true;
         assert.equal(child.kill("SIGTERM"), true);
         assert.equal(await exited.promise, 0, errors);
+        await relayClosed.promise;
     } finally {
         child.kill();
+        directoryWatch.close();
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test("deep stored layouts survive set and get over the real RPC wire", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-rpc-deep-"));
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url)), "rpc", "--stdio",
+    ], {
+        env: { ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: ":memory:" },
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    let errors = "";
+    let nextId = 0;
+    let pending: PromiseWithResolvers<RpcResponse> | undefined;
+    const exited = Promise.withResolvers<number | null>();
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { errors += chunk; });
+    child.once("error", (err) => {
+        pending?.reject(err);
+        exited.reject(err);
+    });
+    child.once("close", (code) => {
+        pending?.reject(new Error(`daemon closed before replying: ${errors}`));
+        exited.resolve(code);
+    });
+    child.stdout.on("data", createLineFramer((line) => {
+        try {
+            pending?.resolve(JSON.parse(line) as RpcResponse);
+        } catch (err) {
+            pending?.reject(err);
+        }
+    }, () => pending?.reject(new Error("daemon emitted an oversized response"))));
+
+    const request = async (
+        method: string,
+        params: Record<string, unknown>,
+        treeJson?: string,
+    ): Promise<Record<string, unknown>> => {
+        const id = ++nextId;
+        pending = Promise.withResolvers<RpcResponse>();
+        const encoded = JSON.stringify(params);
+        // Do not stringify the nested request in the test: native stringify is
+        // exactly the recursion limit this wire regression must not impose.
+        const encodedParams = treeJson === undefined
+            ? encoded
+            : `${encoded.slice(0, -1)},"tree":${treeJson}}`;
+        child.stdin.write(`{"jsonrpc":"2.0","id":${id},"method":${JSON.stringify(method)},"params":${encodedParams}}\n`);
+        const response = await pending.promise;
+        pending = undefined;
+        assert.equal(response.id, id);
+        assert.ok("result" in response);
+        assert.ok(typeof response.result === "object" && response.result !== null);
+        return response.result as Record<string, unknown>;
+    };
+
+    const depth = 12_000;
+    const assertTree = (layout: Record<string, unknown>): void => {
+        let node = layout.tree;
+        for (let i = 0; i < depth; i += 1) {
+            assert.ok(typeof node === "object" && node !== null);
+            node = (node as Record<string, unknown>).metadata;
+        }
+        assert.equal(node, true);
+    };
+    try {
+        const group = await request("workspace.createGroup", { serverId: "wire-deep", name: "G" });
+        const session = await request("workspace.createSession", {
+            serverId: "wire-deep", groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        const treeJson = '{"metadata":'.repeat(depth) + "true" + "}".repeat(depth);
+        const saved = await request("workspace.setLayout", {
+            serverId: "wire-deep", devSessionId: session.id, region: "viewer",
+        }, treeJson);
+        assertTree(saved);
+        const loaded = await request("workspace.getLayout", {
+            devSessionId: session.id, region: "viewer",
+        });
+        assertTree(loaded);
+        child.stdin.end();
+        assert.equal(await exited.promise, 0, errors);
+    } finally {
+        child.kill();
+        await exited.promise;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("server.info advertises the actual agent route and refuses invalid explicit routes",
+    { timeout: 15000 }, async () => {
+        const dir = mkdtempSync(path.join(os.tmpdir(), "ch-rpc-agent-route-"));
+        const actual = path.join(dir, "advertised-events.sock");
+        try {
+            for (const override of [undefined, actual, "relative-events.sock", ""]) {
+                const env: NodeJS.ProcessEnv = {
+                    ...process.env, XDG_RUNTIME_DIR: dir, CODEHARBOR_DB: ":memory:",
+                };
+                delete env[AGENT_SOCKET_ENV];
+                if (override !== undefined) env[AGENT_SOCKET_ENV] = override;
+                const child = spawn(process.execPath, [
+                    fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url)), "rpc", "--stdio",
+                ], { env, stdio: ["pipe", "pipe", "pipe"] });
+                let output = "";
+                let errors = "";
+                const exited = Promise.withResolvers<number | null>();
+                child.stdout.setEncoding("utf8");
+                child.stdout.on("data", (chunk: string) => { output += chunk; });
+                child.stderr.setEncoding("utf8");
+                child.stderr.on("data", (chunk: string) => { errors += chunk; });
+                child.once("error", exited.reject);
+                child.once("close", exited.resolve);
+                try {
+                    child.stdin.end('{"jsonrpc":"2.0","id":1,"method":"server.info"}\n');
+                    assert.equal(await exited.promise, 0, errors);
+                    const response = JSON.parse(output.trim()) as RpcResponse;
+                    assert.equal(response.id, 1);
+                    if (override === undefined || override === actual) {
+                        assert.ok("result" in response);
+                        const info = response.result as Record<string, unknown>;
+                        assert.equal(info.agentSocket, override ?? path.join(dir, "codeharbor.sock"));
+                        assert.equal(info.schemaVersion, RPC_SCHEMA_VERSION);
+                    } else {
+                        assert.ok("error" in response);
+                        assert.match(response.error.message, /CODEHARBOR_AGENT_SOCKET/);
+                    }
+                } finally {
+                    child.kill();
+                    await exited.promise;
+                }
+            }
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });

@@ -137,6 +137,9 @@ function parseResponse(line: string): ControlResponse {
  * One connection per request, closed by the server after its single reply —
  * which is what lets a refusal be delivered on the same socket without any
  * correlation state on this side.
+ *
+ * Cancellation closes this producer's connection and stops waiting. It cannot
+ * undo a viewer operation the desktop has already received.
  */
 export function sendControlRequest(
     op: ControlOp,
@@ -144,7 +147,11 @@ export function sendControlRequest(
     env: NodeJS.ProcessEnv = process.env,
     socketPath: string | null = readControlSocketPath(env),
     timeoutMs: number = CONTROL_CLIENT_TIMEOUT_MS,
+    signal?: AbortSignal,
 ): Promise<ControlResponse> {
+    if (signal?.aborted) {
+        return Promise.resolve(refusal("failed", "the viewer command was cancelled"));
+    }
     const coordinates = readCoordinates(env);
     if (!coordinates) {
         return Promise.resolve(refusal("bad_request", MISSING_COORDINATES_MESSAGE));
@@ -179,8 +186,12 @@ export function sendControlRequest(
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
             socket.destroy();
             resolve(response);
+        };
+        const abort = (): void => {
+            finish(refusal("failed", "the viewer command was cancelled"));
         };
 
         const timer = setTimeout(() => {
@@ -191,6 +202,11 @@ export function sendControlRequest(
                 ),
             );
         }, timeoutMs);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) {
+            abort();
+            return;
+        }
 
         socket.setEncoding("utf8");
 

@@ -169,6 +169,10 @@ private slots:
 
     void loadWithoutPersistedLayoutSeedsTheRegionDefaults();
     void terminalDefaultIsTwoStackedPanesAndIsPersisted();
+    void initializerPublishesTheServerWinner_data();
+    void initializerPublishesTheServerWinner();
+    void supersededInitializerCannotPublishItsWinner();
+    void initializerFailureKeepsTheRegionUnavailable();
     void splitSerializesExactSetLayoutParams();
     void splitPersistsAndReloadsByteIdentical();
     void closeCollapsesBranchIntoSurvivor();
@@ -179,6 +183,10 @@ private slots:
     void paneTitlePersistsAndKeepsTerminalIdentity();
     void staleLoadReplyIsDropped();
     void rapidSwitchQueuesCurrentWritesAndDropsStaleWrites();
+    void selectionObserversCannotEditThePreviousSessionsTrees_data();
+    void selectionObserversCannotEditThePreviousSessionsTrees();
+    void serverSwitchObserversSeeTheNewServerKey();
+    void aReentrantDeselectionStillNotifiesBothClearedRegions();
     void structuralPublicationMaySwitchSessions_data();
     void structuralPublicationMaySwitchSessions();
     void queuedReplayMaySwitchSessions();
@@ -188,6 +196,7 @@ private slots:
     void rpcErrorSurfacesWithoutCorruptingTree();
     void fullTreeSaveSupersedesQueuedEdits();
     void staleLayoutWriteErrorsAreDropped();
+    void reconnectRefreshRetiresRequestsWithoutResettingPaneIdentity();
     void sameSessionReloadFailureClearsTheStaleRegion();
     void aFailedReloadNeverBlanksARegionTheUserJustEdited();
     void invalidSavedTreeIsRejected();
@@ -200,6 +209,8 @@ private slots:
     void paneNumberingIsPerDevSessionAndSurvivesRestart();
     void legacyTerminalLeafIsBackfilledOnceAndPersisted();
     void saveTreeReconcilesTerminalLegacyMarkersBeforePublishing();
+    void legacyResolutionCannotBindAFreshPendingLeaf();
+    void sameTreeReloadPublishesChangedLegacyPermission();
     void anAbsurdPaneCounterCannotHandOutALabelAlreadyOnScreen();
     void paneLabelCeilingRefusesASecondDuplicate();
     void splittingAtTheDepthLimitPreservesTheLayout();
@@ -222,9 +233,7 @@ private:
     // writes to the server).
     bool noMoreRequests();
     // Drive load(sessionId) to completion, answering both getLayout requests
-    // AND the workspace.setLayout seed each region answered with null then
-    // writes back (see applyLoadedTree), so every case starts from a quiet
-    // socket.
+    // and any ensureInitialLayout requested for an absent region.
     void completeLoad(SessionLayouts& layouts, const QString& sessionId,
                       const QJsonValue& viewerTree,
                       const QJsonValue& terminalTree);
@@ -374,46 +383,22 @@ void TstSessionLayouts::completeLoad(SessionLayouts& layouts,
 
     respondResult(first.value(QStringLiteral("id")).toInt(), viewerTree);
     respondResult(second.value(QStringLiteral("id")).toInt(), terminalTree);
-    QTRY_COMPARE(loadedSpy.count(), 1);
-    QCOMPARE(loadedSpy.at(0).at(0).toString(), sessionId);
-
-    // A region the server had no row for is SEEDED: applyLoadedTree adopts the
-    // region default and persists it, so two stacked terminals survive a restart
-    // instead of being re-derived until something else saves a tree. Answer
-    // those writes here; the case that asserts on them is
-    // terminalDefaultIsTwoStackedPanesAndIsPersisted().
     if (viewerTree.isNull()) {
-        const QJsonObject seed = nextRequest();
-        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
-                 QStringLiteral("workspace.setLayout"));
-        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
-        respondResult(seed.value(QStringLiteral("id")).toInt(),
-                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+        const QJsonObject initial = nextRequest();
+        QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.ensureInitialLayout"));
+        respondResult(initial.value(QStringLiteral("id")).toInt(),
+                      layoutRow(leaf(QStringLiteral("viewer-1"))));
     }
     if (terminalTree.isNull()) {
-        // Both leaves of the seeded terminal default are BRAND NEW panes, so
-        // each mints its own terminal_panes row first. The layout write is held
-        // back until the last id lands: an id-less terminal leaf on the server
-        // is indistinguishable from a pre-migration one, and must never be
-        // written.
-        for (const QString& label :
-             {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
-            const QJsonObject mint = nextRequest();
-            QCOMPARE(mint.value(QStringLiteral("method")).toString(),
-                     QStringLiteral("workspace.createTerminalPane"));
-            QCOMPARE(mint.value(QStringLiteral("params")).toObject()
-                         .value(QStringLiteral("name")).toString(),
-                     label);
-            respondResult(mint.value(QStringLiteral("id")).toInt(),
-                          terminalPaneRow(label));
-        }
-        const QJsonObject seed = nextRequest();
-        QCOMPARE(seed.value(QStringLiteral("method")).toString(),
-                 QStringLiteral("workspace.setLayout"));
-        const QJsonObject params = seed.value(QStringLiteral("params")).toObject();
-        respondResult(seed.value(QStringLiteral("id")).toInt(),
-                      layoutRow(params.value(QStringLiteral("tree")).toObject()));
+        const QJsonObject initial = nextRequest();
+        QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.ensureInitialLayout"));
+        respondResult(initial.value(QStringLiteral("id")).toInt(),
+                      layoutRow(seededTerminalTree()));
     }
+    QTRY_COMPARE(loadedSpy.count(), 1);
+    QCOMPARE(loadedSpy.at(0).at(0).toString(), sessionId);
 }
 
 void TstSessionLayouts::loadWithoutPersistedLayoutSeedsTheRegionDefaults()
@@ -442,11 +427,10 @@ void TstSessionLayouts::loadWithoutPersistedLayoutSeedsTheRegionDefaults()
     QCOMPARE(compact(asObject(layouts.terminalTree())),
              compact(seededTerminalTree()));
     QCOMPARE(viewerSpy.count(), 1);
-    // Once for the default itself, then once per row id written into it.
-    QCOMPARE(terminalSpy.count(), 3);
+    // The atomic initializer publishes once, with both identities already set.
+    QCOMPARE(terminalSpy.count(), 1);
 
-    // completeLoad() already consumed one seed write per region; nothing else
-    // reaches the server on a plain selection.
+    // completeLoad consumed one atomic initializer per absent region.
     QVERIFY(noMoreRequests());
 }
 
@@ -463,8 +447,7 @@ void TstSessionLayouts::terminalDefaultIsTwoStackedPanesAndIsPersisted()
     QSignalSpy loadedSpy(&layouts, &SessionLayouts::loaded);
     QSignalSpy errorSpy(&layouts, &SessionLayouts::error);
 
-    // Driven by hand rather than through completeLoad(), because the seed writes
-    // ARE what this case is about.
+    // Drive initialization manually to inspect the requests and winning ids.
     layouts.load(QStringLiteral("s1"));
     const QJsonObject viewerGet = nextRequest();
     const QJsonObject terminalGet = nextRequest();
@@ -472,71 +455,28 @@ void TstSessionLayouts::terminalDefaultIsTwoStackedPanesAndIsPersisted()
                   QJsonValue(QJsonValue::Null));
     respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
                   QJsonValue(QJsonValue::Null));
-    QTRY_COMPARE(loadedSpy.count(), 1);
-
-    // "vertical" stacks children top to bottom, so terminal-1 is the upper pane.
-    // Published immediately, with no row ids yet: the panes are on screen while
-    // their identities are still on the wire.
-    const QJsonObject stacked = split(QStringLiteral("vertical"),
-                                      {leaf(QStringLiteral("terminal-1")),
-                                       leaf(QStringLiteral("terminal-2"))},
-                                      {1, 1});
-    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(stacked));
-
-    // The viewer default is written straight away. The terminal default is NOT:
-    // both its leaves are brand new panes with no `terminal_panes` row yet, and
-    // an id-less terminal leaf on the server is indistinguishable from one
-    // written before layouts carried ids - which a later load would then resolve
-    // by its recyclable label. So the mints go first.
-    const QJsonObject viewerSeed = nextRequest();
-    QCOMPARE(viewerSeed.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
-    const QJsonObject viewerParams =
-        viewerSeed.value(QStringLiteral("params")).toObject();
-    QCOMPARE(viewerParams.value(QStringLiteral("region")).toString(),
-             QStringLiteral("viewer"));
-    respondResult(viewerSeed.value(QStringLiteral("id")).toInt(),
-                  layoutRow(viewerParams.value(QStringLiteral("tree")).toObject()));
-
-    for (const QString& label :
-         {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
-        const QJsonObject mint = nextRequest();
-        QCOMPARE(mint.value(QStringLiteral("method")).toString(),
-                 QStringLiteral("workspace.createTerminalPane"));
-        const QJsonObject mintParams =
-            mint.value(QStringLiteral("params")).toObject();
-        QCOMPARE(mintParams.value(QStringLiteral("serverId")).toString(),
+    const QJsonObject viewerInitial = nextRequest();
+    const QJsonObject terminalInitial = nextRequest();
+    for (const QJsonObject& request : {viewerInitial, terminalInitial}) {
+        QCOMPARE(request.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.ensureInitialLayout"));
+        const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
                  QStringLiteral("srv-1"));
-        QCOMPARE(mintParams.value(QStringLiteral("devSessionId")).toString(),
+        QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
                  QStringLiteral("s1"));
-        QCOMPARE(mintParams.value(QStringLiteral("name")).toString(), label);
-        // Every minted pane is `generic`: SPEC 6.6 derives its state from what
-        // the terminal prints, and a row stored without a harness leaves the
-        // activity clock switched off, so the sidebar could only say Idle.
-        QCOMPARE(mintParams.value(QStringLiteral("harness")).toString(),
-                 QStringLiteral("generic"));
-        respondResult(mint.value(QStringLiteral("id")).toInt(),
-                      terminalPaneRow(label));
     }
-
-    // Only once BOTH ids are in does the terminal default reach the server, and
-    // it reaches it with those ids in the tree.
-    const QJsonObject terminalSeedReq = nextRequest();
-    QCOMPARE(terminalSeedReq.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
-    const QJsonObject terminalParams =
-        terminalSeedReq.value(QStringLiteral("params")).toObject();
-    QCOMPARE(terminalParams.value(QStringLiteral("serverId")).toString(),
-             QStringLiteral("srv-1"));
-    QCOMPARE(terminalParams.value(QStringLiteral("devSessionId")).toString(),
-             QStringLiteral("s1"));
-    QCOMPARE(terminalParams.value(QStringLiteral("region")).toString(),
-             QStringLiteral("terminal"));
-    const QJsonObject terminalSeed =
-        terminalParams.value(QStringLiteral("tree")).toObject();
-    QCOMPARE(compact(terminalSeed), compact(seededTerminalTree()));
-    respondResult(terminalSeedReq.value(QStringLiteral("id")).toInt(),
-                  layoutRow(terminalSeed));
+    // No pending local panes are exposed and no independent row mint can race
+    // a peer's initializer. The server returns both permanent identities.
+    QVERIFY(layouts.viewerTree().isNull());
+    QVERIFY(layouts.terminalTree().isNull());
+    QCOMPARE(loadedSpy.count(), 0);
+    respondResult(viewerInitial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
+    respondResult(terminalInitial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(seededTerminalTree()));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+    QCOMPARE(compact(asObject(layouts.terminalTree())), compact(seededTerminalTree()));
     QCOMPARE(errorSpy.count(), 0);
     QVERIFY(noMoreRequests());
 
@@ -1218,6 +1158,98 @@ void TstSessionLayouts::queuedReplayMaySwitchSessions()
     QVERIFY(noMoreRequests()); // s1's queued URL was not replayed into s2.
 }
 
+void TstSessionLayouts::initializerPublishesTheServerWinner_data()
+{
+    QTest::addColumn<QString>("region");
+    QTest::addColumn<bool>("empty");
+    QTest::newRow("viewer-peer-winner") << QStringLiteral("viewer") << false;
+    QTest::newRow("terminal-peer-winner") << QStringLiteral("terminal") << false;
+    QTest::newRow("explicit-empty-winner") << QStringLiteral("terminal") << true;
+}
+
+void TstSessionLayouts::initializerPublishesTheServerWinner()
+{
+    QFETCH(QString, region);
+    QFETCH(bool, empty);
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    QSignalSpy errors(&layouts, &SessionLayouts::error);
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewer = nextRequest();
+    const QJsonObject terminal = nextRequest();
+    const bool targetViewer = region == QStringLiteral("viewer");
+    respondResult(viewer.value(QStringLiteral("id")).toInt(),
+                  targetViewer ? QJsonValue(QJsonValue::Null)
+                               : QJsonValue(layoutRow(leaf(QStringLiteral("viewer-existing")))));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(),
+                  targetViewer ? QJsonValue(layoutRow(terminalLeaf(
+                                     QStringLiteral("terminal-existing"),
+                                     QStringLiteral("existing-id"))))
+                               : QJsonValue(QJsonValue::Null));
+    const QJsonObject initial = nextRequest();
+    QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.ensureInitialLayout"));
+    layouts.splitPane(region, region + QStringLiteral("-1"), QStringLiteral("horizontal"));
+    const QJsonObject winner = empty ? leaf(QString())
+        : targetViewer ? leaf(QStringLiteral("viewer-peer"))
+                       : terminalLeaf(QStringLiteral("terminal-peer"),
+                                      QStringLiteral("peer-row-id"));
+    respondResult(initial.value(QStringLiteral("id")).toInt(), layoutRow(winner));
+    QTRY_COMPARE(loaded.count(), 1);
+    QCOMPARE(asObject(targetViewer ? layouts.viewerTree() : layouts.terminalTree()), winner);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(noMoreRequests()); // no local default overwrite or independent row mint
+}
+
+void TstSessionLayouts::supersededInitializerCannotPublishItsWinner()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewer = nextRequest();
+    const QJsonObject terminal = nextRequest();
+    respondResult(viewer.value(QStringLiteral("id")).toInt(), QJsonValue(QJsonValue::Null));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(),
+                  layoutRow(terminalLeaf(QStringLiteral("old-terminal"), QStringLiteral("old-id"))));
+    const QJsonObject initial = nextRequest();
+    completeLoad(layouts, QStringLiteral("s2"),
+                 layoutRow(leaf(QStringLiteral("new-viewer"))),
+                 layoutRow(terminalLeaf(QStringLiteral("new-terminal"), QStringLiteral("new-id"))));
+    respondResult(initial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("old-winner"))));
+    QVERIFY(noMoreRequests());
+    QCOMPARE(layouts.devSessionId(), QStringLiteral("s2"));
+    QCOMPARE(asObject(layouts.viewerTree()), leaf(QStringLiteral("new-viewer")));
+}
+
+void TstSessionLayouts::initializerFailureKeepsTheRegionUnavailable()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    QSignalSpy errors(&layouts, &SessionLayouts::error);
+    layouts.load(QStringLiteral("s1"));
+    const QJsonObject viewer = nextRequest();
+    const QJsonObject terminal = nextRequest();
+    respondResult(viewer.value(QStringLiteral("id")).toInt(), QJsonValue(QJsonValue::Null));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(),
+                  layoutRow(terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-id"))));
+    const QJsonObject initial = nextRequest();
+    layouts.splitPane(QStringLiteral("viewer"), QStringLiteral("viewer-1"),
+                       QStringLiteral("horizontal"));
+    respondError(initial.value(QStringLiteral("id")).toInt(), -32000,
+                 QStringLiteral("initialization refused"));
+    QTRY_COMPARE(loaded.count(), 1);
+    QVERIFY(layouts.viewerTree().isNull());
+    QVERIFY(!layouts.terminalTree().isNull());
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(noMoreRequests());
+}
+
 void TstSessionLayouts::defaultPublicationMaySwitchSessions()
 {
     makePair();
@@ -1236,6 +1268,11 @@ void TstSessionLayouts::defaultPublicationMaySwitchSessions()
     QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
     respondResult(oldViewer.value(QStringLiteral("id")).toInt(),
                   QJsonValue(QJsonValue::Null));
+    const QJsonObject initial = nextRequest();
+    QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.ensureInitialLayout"));
+    respondResult(initial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(leaf(QStringLiteral("viewer-1"))));
     const QJsonObject newViewer = nextRequest();
     const QJsonObject newTerminal = nextRequest();
     QVERIFY(switched);
@@ -1370,31 +1407,18 @@ void TstSessionLayouts::aSeedingLoadReplyNeverOverwritesASavedTree()
                   QJsonValue(QJsonValue::Null));
     respondResult(terminalGet.value(QStringLiteral("id")).toInt(),
                   QJsonValue(QJsonValue::Null));
-    QTRY_COMPARE(loadedSpy.count(), 1);
-
-    QCOMPARE(compact(asObject(layouts.viewerTree())), compact(authored));
-
-    // The terminal region WAS seeded, so its two brand new panes mint their
-    // rows before its layout may be written.
-    for (const QString& label :
-         {QStringLiteral("terminal-1"), QStringLiteral("terminal-2")}) {
-        const QJsonObject mint = nextRequest();
-        QCOMPARE(mint.value(QStringLiteral("method")).toString(),
-                 QStringLiteral("workspace.createTerminalPane"));
-        respondResult(mint.value(QStringLiteral("id")).toInt(),
-                      terminalPaneRow(label));
-    }
-
-    // Exactly one further write reaches the server, and it is the TERMINAL
-    // default: the viewer region was never seeded over.
-    const QJsonObject seed = nextRequest();
-    const QJsonObject seedParams = seed.value(QStringLiteral("params")).toObject();
-    QCOMPARE(seed.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
-    QCOMPARE(seedParams.value(QStringLiteral("region")).toString(),
+    // Only the untouched terminal region may initialize. Its authoritative
+    // response already contains both permanent server identities.
+    const QJsonObject initial = nextRequest();
+    QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.ensureInitialLayout"));
+    QCOMPARE(initial.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("region")).toString(),
              QStringLiteral("terminal"));
-    respondResult(seed.value(QStringLiteral("id")).toInt(),
-                  layoutRow(seedParams.value(QStringLiteral("tree")).toObject()));
+    respondResult(initial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(seededTerminalTree()));
+    QTRY_COMPARE(loadedSpy.count(), 1);
+    QCOMPARE(compact(asObject(layouts.viewerTree())), compact(authored));
     QCOMPARE(errorSpy.count(), 0);
     QVERIFY(noMoreRequests());
 }
@@ -1470,6 +1494,70 @@ void TstSessionLayouts::staleLayoutWriteErrorsAreDropped()
     QCoreApplication::processEvents(QEventLoop::AllEvents);
     QCOMPARE(errorSpy.count(), 0);
     QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::reconnectRefreshRetiresRequestsWithoutResettingPaneIdentity()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const auto viewerTree = leaf(QStringLiteral("viewer-1"));
+    const auto terminalTree = terminalLeaf(QStringLiteral("terminal-1"),
+                                           QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerTree),
+                 layoutRow(terminalTree));
+    const quint64 oldGeneration = layouts.generation();
+    const quint64 paneGeneration = layouts.paneGeneration();
+    const QVariant publishedViewer = layouts.viewerTree();
+
+    // A mint from the lost wire must not bind into the refreshed context.
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")), QStringLiteral("terminal-2"));
+    const auto mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QSignalSpy viewers(&layouts, &SessionLayouts::viewerTreeChanged);
+    QSignalSpy panes(&layouts, &SessionLayouts::paneGenerationChanged);
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    QSignalSpy errors(&layouts, &SessionLayouts::error);
+    {
+        QObject observer;
+        connect(&layouts, &SessionLayouts::generationChanged, &observer, [&] {
+            QVERIFY(layouts.generation() > oldGeneration);
+            QCOMPARE(layouts.paneGeneration(), paneGeneration);
+            QCOMPARE(layouts.viewerTree(), publishedViewer);
+        });
+        layouts.refresh();
+    }
+    QCOMPARE(panes.count(), 0);
+    QCOMPARE(viewers.count(), 0);
+    const auto viewer = nextRequest();
+    const auto terminal = nextRequest();
+    QCOMPARE(viewer.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.getLayout"));
+    QCOMPARE(terminal.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.getLayout"));
+    layouts.closePaneForSession(QStringLiteral("s1"), oldGeneration,
+                                QStringLiteral("viewer"), QStringLiteral("viewer-1"));
+    QCOMPARE(layouts.viewerTree(), publishedViewer);
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-2")));
+    respondResult(viewer.value(QStringLiteral("id")).toInt(), layoutRow(viewerTree));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(), layoutRow(terminalTree));
+    QTRY_COMPARE(loaded.count(), 1);
+    QCOMPARE(layouts.viewerTree(), publishedViewer);
+    QCOMPARE(asObject(layouts.terminalTree()), terminalTree);
+    QCOMPARE(panes.count(), 0);
+    QCOMPARE(viewers.count(), 0);
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(noMoreRequests());
+
+    // A consented explicit reload remains a real pane/document reset even if
+    // the server returns exactly the same layout.
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerTree),
+                 layoutRow(terminalTree));
+    QVERIFY(layouts.paneGeneration() > paneGeneration);
+    QCOMPARE(panes.count(), 1);
 }
 
 void TstSessionLayouts::sameSessionReloadFailureClearsTheStaleRegion()
@@ -1590,16 +1678,18 @@ void TstSessionLayouts::rpcErrorSurfacesWithoutCorruptingTree()
                  QStringLiteral("no such dev session"));
     respondResult(terminalReq.value(QStringLiteral("id")).toInt(),
                   QJsonValue(QJsonValue::Null));
+    const QJsonObject initial = nextRequest();
+    QCOMPARE(initial.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.ensureInitialLayout"));
+    respondResult(initial.value(QStringLiteral("id")).toInt(),
+                  layoutRow(seededTerminalTree()));
     QTRY_COMPARE(loadedSpy.count(), 1); // the load still completes
     QCOMPARE(errorSpy.count(), 2);
     QCOMPARE(errorSpy.at(1).at(0).toString(),
              QStringLiteral("no such dev session"));
     QVERIFY(layouts.viewerTree().isNull());
     QCOMPARE(compact(asObject(layouts.terminalTree())),
-             compact(split(QStringLiteral("vertical"),
-                           {leaf(QStringLiteral("terminal-1")),
-                            leaf(QStringLiteral("terminal-2"))},
-                           {1, 1})));
+             compact(seededTerminalTree()));
 }
 
 // Two ways a PERSISTED layout can be unusable, neither of which this client
@@ -2327,6 +2417,192 @@ void TstSessionLayouts::legacyTerminalLeafIsBackfilledOnceAndPersisted()
     QVERIFY(noMoreRequests());
     QCOMPARE(errorSpy.count(), 0);
     QCOMPARE(compact(asObject(layouts.terminalTree())), compact(migrated));
+}
+
+void TstSessionLayouts::aReentrantDeselectionStillNotifiesBothClearedRegions()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                        QStringLiteral("row-1"))));
+    bool deselected = false;
+    QSignalSpy terminalChanged(&layouts, &SessionLayouts::terminalTreeChanged);
+    connect(&layouts, &SessionLayouts::viewerTreeChanged, &layouts, [&] {
+        if (!deselected && layouts.viewerTree().isNull()) {
+            deselected = true;
+            layouts.load(QString());
+        }
+    });
+    layouts.load(QStringLiteral("s2"));
+    QVERIFY(deselected);
+    QVERIFY(layouts.devSessionId().isEmpty());
+    QVERIFY(layouts.viewerTree().isNull());
+    QVERIFY(layouts.terminalTree().isNull());
+    QCOMPARE(terminalChanged.count(), 1);
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::selectionObserversCannotEditThePreviousSessionsTrees_data()
+{
+    QTest::addColumn<QString>("notification");
+    QTest::newRow("generation") << QStringLiteral("generation");
+    QTest::newRow("session") << QStringLiteral("session");
+    QTest::newRow("viewer-invalidation") << QStringLiteral("viewer");
+}
+
+void TstSessionLayouts::selectionObserversCannotEditThePreviousSessionsTrees()
+{
+    QFETCH(QString, notification);
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const QJsonObject viewer = leaf(QStringLiteral("viewer-1"));
+    const QJsonObject terminal =
+        terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-1"));
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewer), layoutRow(terminal));
+    bool edited = false;
+    const auto edit = [&] {
+        if (edited)
+            return;
+        edited = true;
+        layouts.setPaneUrl(QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+                           QStringLiteral("file:///queued-for-s2"));
+    };
+    if (notification == QStringLiteral("generation"))
+        connect(&layouts, &SessionLayouts::generationChanged, &layouts, edit);
+    else if (notification == QStringLiteral("session"))
+        connect(&layouts, &SessionLayouts::devSessionIdChanged, &layouts, edit);
+    else
+        connect(&layouts, &SessionLayouts::viewerTreeChanged, &layouts, edit);
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    layouts.load(QStringLiteral("s2"));
+    QVERIFY(edited);
+    const QJsonObject first = nextRequest();
+    const QJsonObject second = nextRequest();
+    QCOMPARE(first.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.getLayout"));
+    QCOMPARE(second.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.getLayout"));
+    QVERIFY(layouts.viewerTree().isNull());
+    QVERIFY(layouts.terminalTree().isNull());
+    respondResult(first.value(QStringLiteral("id")).toInt(), layoutRow(viewer));
+    respondResult(second.value(QStringLiteral("id")).toInt(), layoutRow(terminal));
+    const QJsonObject write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject params = write.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("s2"));
+    QCOMPARE(params.value(QStringLiteral("tree")).toObject()
+                 .value(QStringLiteral("url")).toString(),
+             QStringLiteral("file:///queued-for-s2"));
+    respondResult(write.value(QStringLiteral("id")).toInt(),
+                  layoutRow(params.value(QStringLiteral("tree")).toObject()));
+    QTRY_COMPARE(loaded.count(), 1);
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::serverSwitchObserversSeeTheNewServerKey()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                        QStringLiteral("row-1"))));
+    bool reselected = false;
+    connect(&layouts, &SessionLayouts::generationChanged, &layouts, [&] {
+        if (reselected)
+            return;
+        reselected = true;
+        QCOMPARE(layouts.serverId(), QStringLiteral("srv-2"));
+        layouts.load(QStringLiteral("s2"));
+    });
+    layouts.setServerId(QStringLiteral("srv-2"));
+    QVERIFY(reselected);
+    QCOMPARE(layouts.serverId(), QStringLiteral("srv-2"));
+    QCOMPARE(layouts.devSessionId(), QStringLiteral("s2"));
+    for (int index = 0; index < 2; ++index) {
+        const QJsonObject request = nextRequest();
+        QCOMPARE(request.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.getLayout"));
+        QCOMPARE(request.value(QStringLiteral("params")).toObject()
+                     .value(QStringLiteral("devSessionId")).toString(),
+                 QStringLiteral("s2"));
+        respondResult(request.value(QStringLiteral("id")).toInt(),
+                      layoutRow(leaf(QStringLiteral("viewer-1"))));
+    }
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::legacyResolutionCannotBindAFreshPendingLeaf()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                        QStringLiteral("existing-row"))));
+    const QString pending = layouts.splitPane(
+        QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+        QStringLiteral("horizontal"));
+    QVERIFY(!pending.isEmpty());
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+
+    layouts.bindTerminalPaneRow(QStringLiteral("s1"), pending,
+                                QStringLiteral("stale-legacy-row"));
+    const QJsonObject pendingLeaf =
+        asObject(layouts.terminalTree()).value(QStringLiteral("children"))
+            .toArray().at(1).toObject();
+    QVERIFY(pendingLeaf.value(QStringLiteral("terminalPaneId")).toString().isEmpty());
+    QVERIFY(noMoreRequests());
+
+    respondResult(mint.value(QStringLiteral("id")).toInt(), terminalPaneRow(pending));
+    const QJsonObject saved = nextRequest();
+    QCOMPARE(saved.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject bound =
+        asObject(layouts.terminalTree()).value(QStringLiteral("children"))
+            .toArray().at(1).toObject();
+    QCOMPARE(bound.value(QStringLiteral("terminalPaneId")).toString(), rowIdFor(pending));
+    respondResult(saved.value(QStringLiteral("id")).toInt(),
+                  layoutRow(saved.value(QStringLiteral("params")).toObject()
+                                .value(QStringLiteral("tree")).toObject()));
+}
+
+void TstSessionLayouts::sameTreeReloadPublishesChangedLegacyPermission()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))),
+                 layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                        QStringLiteral("existing-row"))));
+    const QString label = QStringLiteral("terminal-9");
+    layouts.saveTree(QStringLiteral("terminal"), leaf(label).toVariantMap());
+    const QJsonObject mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QVERIFY(!asObject(layouts.terminalTree()).contains(QStringLiteral("terminalLegacy")));
+    QSignalSpy published(&layouts, &SessionLayouts::terminalTreeChanged);
+
+    // A same-session reload retires the pending mint. The server's same-shaped
+    // id-less layout is legacy, so its permission must reach the pane as well.
+    completeLoad(layouts, QStringLiteral("s1"),
+                 layoutRow(leaf(QStringLiteral("viewer-1"))), layoutRow(leaf(label)));
+    QCOMPARE(published.count(), 1);
+    QVERIFY(asObject(layouts.terminalTree()).value(QStringLiteral("terminalLegacy")).toBool());
+    respondResult(mint.value(QStringLiteral("id")).toInt(), terminalPaneRow(label));
+    QVERIFY(noMoreRequests());
+    QVERIFY(asObject(layouts.terminalTree())
+                .value(QStringLiteral("terminalPaneId")).toString().isEmpty());
 }
 
 // A mint that fails must not leave a pane the user can never bring up, and must

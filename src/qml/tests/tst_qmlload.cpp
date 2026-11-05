@@ -38,7 +38,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QQmlError>
+#include <QQmlExpression>
 #include <QQuickItem>
+#include <QQuickWindow>
 #include <QSet>
 #include <QStandardPaths>
 #include <QString>
@@ -412,6 +414,7 @@ public:
     // codeharbord's notification does.
     ch::ViewerCommandService &viewerCommands() { return m_viewerCommands; }
     ch::CodeharbordClient &client() { return m_client; }
+    ch::AppController &controller() { return m_controller; }
 
     ShellFixture()
         : m_controller(&m_client)
@@ -569,6 +572,9 @@ private slots:
     void anAgentCommandForAnotherSessionIsRefused();
     void agentPathsBecomeAbsoluteRemoteFileUrls();
     void theAgentPaneInventoryReadsTheLayoutTree();
+    void workspaceExitRequiresExplicitDiscard();
+    void windowCloseKeepsDirtyEditorsAlive();
+    void connectionPromptsReplaceCoveringSheetsAndRetireOnStateChange();
 };
 
 void TstQmlLoad::init()
@@ -1270,6 +1276,186 @@ void TstQmlLoad::theAgentPaneInventoryReadsTheLayoutTree()
     // which would reach the agent as a missing JSON field.
     QCOMPARE(panes.at(1).toMap().value(QStringLiteral("url")).toString(), QString());
 
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::workspaceExitRequiresExplicitDiscard()
+{
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+    QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
+    QObject *dialog = findNamed(root, QStringLiteral("unsavedWorkspaceDialog"));
+    QVERIFY(region && dialog);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardWindow"), root);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardDialog"), dialog);
+    const auto run = [&](const QString &script) {
+        QQmlExpression expression(fixture.engine.rootContext(), root,
+                                 QStringLiteral("(function() { %1 })()").arg(script));
+        expression.evaluate();
+        return expression.hasError() ? expression.error().toString() : QString();
+    };
+    // The editor bridge is not involved in this shell test. Supply its existing
+    // cache contract, retaining all real panes so destruction stays observable.
+    QCOMPARE(run(QStringLiteral(
+        "guardRegion.paneCache['dirty-test'] = Qt.createQmlObject("
+        "'import QtQuick; Item { objectName: \"dirtyShellEditor\"; "
+        "property bool contentDirty: true }', guardRegion);"
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-B'; });")),
+        QString());
+    QObject *dirty = findNamed(root, QStringLiteral("dirtyShellEditor"));
+    QVERIFY(dirty);
+    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(root->property("title").toString() != QStringLiteral("target-B"));
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QVERIFY(window);
+    settle(80);
+    // Enter must choose Cancel, not discard; the dirty item remains alive.
+    QTest::keyClick(window, Qt::Key_Return);
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QVERIFY(root->property("title").toString() != QStringLiteral("target-B"));
+    QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+
+    // Exercise the real shell entry points, not just the shared helper. None
+    // may retire the workspace before this dialog's explicit discard choice.
+    const QStringList exits{
+        QStringLiteral("guardWindow.requestSessionActivation('other-session');"),
+        QStringLiteral("guardWindow.requestServerConnect('other-profile');"),
+        QStringLiteral("guardWindow.requestServerDisconnect();"),
+        QStringLiteral("guardWindow.requestServerUpgrade('other-profile');")};
+    for (const QString &exit : exits) {
+        QCOMPARE(run(exit), QString());
+        QVERIFY(dialog->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+        QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+    }
+    QObject *settings = findNamed(root, QStringLiteral("settingsWindow"));
+    QVERIFY(settings);
+    QVERIFY(QMetaObject::invokeMethod(settings, "connectRequested",
+                                     Q_ARG(QString, QStringLiteral("other-profile"))));
+    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QVERIFY(QMetaObject::invokeMethod(settings, "disconnectRequested"));
+    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QVERIFY(QMetaObject::invokeMethod(settings, "upgradeRequested",
+                                     Q_ARG(QString, QStringLiteral("other-profile"))));
+    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-B'; });"
+        // A second intent cannot replace the operation the dialog describes.
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-C'; });"
+        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked();")),
+        QString());
+    QCOMPARE(root->property("title").toString(), QStringLiteral("target-B"));
+    QVERIFY(!dialog->property("visible").toBool());
+
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'stale-target'; });"
+        "guardWindow.pendingWorkspaceSessionId = 'retired-session';"
+        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked();")),
+        QString());
+    QCOMPARE(root->property("title").toString(), QStringLiteral("target-B"));
+    QVERIFY(!dialog->property("visible").toBool());
+    QCOMPARE(run(QStringLiteral(
+        "if (guardWindow.pendingWorkspaceAction !== null) throw new Error('retained action');")),
+        QString());
+    QCOMPARE(run(QStringLiteral(
+        "guardRegion.paneCache['dirty-test'].destroy();"
+        "delete guardRegion.paneCache['dirty-test'];")), QString());
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'clean-target'; });")),
+        QString());
+    QCOMPARE(root->property("title").toString(), QStringLiteral("clean-target"));
+    QVERIFY(!dialog->property("visible").toBool());
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::windowCloseKeepsDirtyEditorsAlive()
+{
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
+    QObject *dialog = findNamed(root, QStringLiteral("unsavedWorkspaceDialog"));
+    QVERIFY(window && region && dialog);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardDialog"), dialog);
+    QQmlExpression inject(fixture.engine.rootContext(), root, QStringLiteral(
+        "guardRegion.paneCache['dirty-test'] = Qt.createQmlObject("
+        "'import QtQuick; Item { objectName: \"dirtyShellEditor\"; "
+        "property bool contentDirty: true }', guardRegion)"));
+    inject.evaluate();
+    QVERIFY2(!inject.hasError(), qPrintable(inject.error().toString()));
+    QVERIFY(!window->close());
+    QVERIFY(window->isVisible());
+    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(findNamed(root, QStringLiteral("dirtyShellEditor")));
+    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QVERIFY(window->isVisible());
+    QVERIFY(!window->close());
+    QQmlExpression discard(fixture.engine.rootContext(), root, QStringLiteral(
+        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked()"));
+    discard.evaluate();
+    QVERIFY2(!discard.hasError(), qPrintable(discard.error().toString()));
+    QVERIFY(!window->isVisible());
+    QVERIFY(!dialog->property("visible").toBool());
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::connectionPromptsReplaceCoveringSheetsAndRetireOnStateChange()
+{
+    ShellFixture fixture;
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    settle();
+    QObject *sheet = findNamed(root, QStringLiteral("connectSheet"));
+    QObject *settings = findNamed(root, QStringLiteral("settingsWindow"));
+    QObject *log = findNamed(root, QStringLiteral("logSheet"));
+    QVERIFY(sheet && settings && log);
+    settings->setProperty("selectedGroup", QStringLiteral("appearance"));
+    QVERIFY(QMetaObject::invokeMethod(sheet, "settingsRequested"));
+    QCOMPARE(settings->property("selectedGroup").toString(), QStringLiteral("server"));
+    QVERIFY(settings->property("shown").toBool());
+    log->setProperty("shown", true);
+    emit fixture.controller().hostKeyPrompt(QStringLiteral("ssh.example"), QStringLiteral("ed25519"),
+                                           QStringLiteral("SHA256:fixture"));
+    settle(80);
+    QVERIFY(!settings->property("shown").toBool());
+    QVERIFY(!log->property("shown").toBool());
+    QVERIFY(sheet->property("shown").toBool());
+    QObject *host = findNamed(root, QStringLiteral("hostKeyHost"));
+    QVERIFY(host);
+    QVERIFY(host->property("text").toString().contains(QStringLiteral("ssh.example")));
+    QVERIFY(sheet->property("promptActive").toBool());
+    // This real controller is disconnected; its notification retires the UI
+    // question exactly as a cancelled backend attempt does.
+    emit fixture.controller().connectionStateChanged();
+    QVERIFY(!sheet->property("promptActive").toBool());
+
+    settings->setProperty("shown", true);
+    log->setProperty("shown", true);
+    emit fixture.controller().credentialPrompt(QStringLiteral("user"), QStringLiteral("ssh.example"),
+                                               QStringLiteral("Password"), QStringLiteral("password"));
+    settle(80);
+    QVERIFY(!settings->property("shown").toBool());
+    QVERIFY(!log->property("shown").toBool());
+    QObject *field = findNamed(root, QStringLiteral("credentialField"));
+    QVERIFY(field);
+    field->setProperty("text", QStringLiteral("one-attempt-only"));
+    QVERIFY(sheet->property("promptActive").toBool());
+    emit fixture.controller().connectionStateChanged();
+    QVERIFY(!sheet->property("promptActive").toBool());
+    QCOMPARE(field->property("text").toString(), QString());
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }
 

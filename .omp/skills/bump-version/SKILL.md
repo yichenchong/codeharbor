@@ -111,8 +111,13 @@ What it does, in order:
    and if a write still fails part-way it puts back what it had already
    replaced. A malformed lock file therefore leaves the tree at the version it
    started from, never half-bumped. Each file is replaced by renaming a fresh
-   copy over it, and the original's file mode is carried across, so a version
-   file that is also an executable script keeps its executable bit.
+   copy over it from an atomically reserved private staging directory, so an
+   existing temporary-path symlink cannot redirect writes. The original's file
+   mode is carried across, so an executable version file keeps its executable bit.
+   Originals are staged too, so rollback renames them back rather than needing
+   another data write after a disk-full error. If the filesystem also refuses a
+   rollback rename, the tool reports that failure and retains the original at the
+   printed backup path for recovery.
 7. Re-checks that every file now agrees, then commits **only** those files.
 8. Verifies that the commit about to be tagged really carries the new version —
    see Safety.
@@ -155,14 +160,19 @@ usually what actually starts a release build.
   integration runs. In the ordinary path this can only fail if a rewrite did not
   take; the flag it really constrains is `--no-commit`, which tags HEAD as-is
   and otherwise could not tell a release commit from any other.
+* Aborts before creating the tag if a preflight command changed HEAD after its
+  version was checked. The tag names the verified commit explicitly; a successful
+  build cannot accidentally tag a different checkout.
 * `tests/bump_version_tag.sh` exercises the release and safety paths: a
   malformed lock file proving that a failed update leaves every version file
   byte-identical, an uncommitted edit and an already-existing tag both being
   refused before anything is rewritten, configured paths escaping the repository
   directly or through symlinks being rejected, ordinary dotted filenames being
   accepted, a wildcard workspace pattern being refused rather than guessed at,
-  a rewritten file keeping its mode, and a rejected branch push leaving no
-  remote release tag.
+  a rewritten file keeping its mode, a rejected branch push leaving no
+  remote release tag, preflight changing HEAD leaving no local or remote tag,
+  a pre-existing staging-path symlink leaving outside data untouched, and a
+  partial rename failure restoring original bytes and modes without data writes.
 
 ## The tool underneath
 

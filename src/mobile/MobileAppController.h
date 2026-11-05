@@ -306,8 +306,9 @@ private:
     // selectPane), so the list and the memory of what was picked from it can
     // never name different sessions.
     QString m_shownSessionId;
-    // Session ids alone do not distinguish a reload from a re-announcement.
-    quint64 m_shownLayoutGeneration = 0;
+    // Only a destructive load/context change replaces the shown pane. Automatic
+    // refresh request generations must not tear down its in-memory state.
+    quint64 m_shownPaneGeneration = 0;
     // Completion/errors can precede AppController::activeSessionChanged.
     quint64 m_lastCompletedLayoutGeneration = 0;
     quint64 m_layoutErrorGeneration = 0;

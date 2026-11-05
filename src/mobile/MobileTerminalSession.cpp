@@ -32,33 +32,43 @@ MobileTerminalSession::MobileTerminalSession(TerminalFactory *factory, QObject *
             m_controller->sendInput(bytes);
     });
 
-    // Parented to this session so the controller, its rolling buffer, its timers
-    // and its channel are released when the page that owns the session goes
-    // away. The factory's own create() does the parenting; a session built
-    // without a factory still has a controller so QML bindings on state and
-    // geometry stay valid on inert chrome.
-    m_controller = m_factory ? m_factory->create(this) : new TerminalController(this);
-
-    connect(m_controller, &TerminalController::flushReady,
-            this, &MobileTerminalSession::onFlushReady);
-    connect(m_controller, &TerminalController::stateChanged,
-            this, &MobileTerminalSession::onStateChanged);
-    connect(m_controller, &TerminalController::attachTimedOut, this, [this]() {
-        // The controller has already moved the pane to Error; it has no message
-        // channel of its own, so the sentence the user reads is written here —
-        // the same division of labour ch::TerminalFactory::error() has on the
-        // desktop.
-        setStatusText(tr("This terminal did not finish attaching. Tap Reattach to try again."));
-    });
+    createController();
 
     if (m_factory) {
         connect(m_factory, &TerminalFactory::targetResolved,
                 this, &MobileTerminalSession::onTargetResolved);
         connect(m_factory, &TerminalFactory::error,
                 this, &MobileTerminalSession::onFactoryError);
+        connect(m_factory, &TerminalFactory::workspaceReadyChanged, this, [this]() {
+            if (!m_factory->workspaceReady()) {
+                m_resolvingIdentity.clear();
+                m_tmuxTarget.clear();
+                m_attached = false;
+                m_factory->detach(m_controller);
+                if (m_openRequested)
+                    setStatusText(tr("Waiting for the server identity\u2026"));
+                return;
+            }
+            if (m_openRequested && m_controller->viewVisible() && m_factory->connected())
+                open(m_devSessionId, m_paneId, m_terminalPaneId, m_workingDir,
+                     m_columns, m_rows);
+        });
     } else {
         setStatusText(tr("No terminal service in this window."));
     }
+}
+
+void MobileTerminalSession::createController()
+{
+    // Each controller owns the buffers and channel of exactly one pane identity.
+    m_controller = m_factory ? m_factory->create(this) : new TerminalController(this);
+    connect(m_controller, &TerminalController::flushReady,
+            this, &MobileTerminalSession::onFlushReady);
+    connect(m_controller, &TerminalController::stateChanged,
+            this, &MobileTerminalSession::onStateChanged);
+    connect(m_controller, &TerminalController::attachTimedOut, this, [this]() {
+        setStatusText(tr("This terminal did not finish attaching. Tap Reattach to try again."));
+    });
 }
 
 VtScreen *MobileTerminalSession::screen() const
@@ -117,6 +127,11 @@ void MobileTerminalSession::open(const QString &devSessionId,
                                  int cols,
                                  int rows)
 {
+    // Do not mutate identity from a synchronous attach/detach state callback:
+    // its old result must not overwrite a different pane's bookkeeping.
+    if (m_attaching)
+        return;
+    m_openRequested = true;
     // A session is created per page, so in practice it is opened on ONE pane for
     // its whole life. Re-opening it on a different pane is still handled rather
     // than trusted: a remembered tmux target belongs to the pane it was resolved
@@ -126,6 +141,19 @@ void MobileTerminalSession::open(const QString &devSessionId,
         || paneId != m_paneId
         || terminalPaneId != m_terminalPaneId;
     if (identityChanged) {
+        if (!m_devSessionId.isEmpty() || !m_paneId.isEmpty()) {
+            m_attaching = true;
+            const bool visible = m_controller->viewVisible();
+            m_resolvingIdentity.clear();
+            if (m_factory)
+                m_factory->detach(m_controller);
+            delete m_controller;
+            createController();
+            m_controller->setViewVisible(visible);
+            m_screen->reset();
+            emit stateChanged();
+            m_attaching = false;
+        }
         m_tmuxTarget.clear();
         m_attached = false;
     }
@@ -144,6 +172,10 @@ void MobileTerminalSession::open(const QString &devSessionId,
 
     if (!m_factory) {
         setStatusText(tr("No terminal service in this window."));
+        return;
+    }
+    if (!m_factory->workspaceReady()) {
+        setStatusText(tr("Waiting for the server identity\u2026"));
         return;
     }
     if (m_attaching || m_attached)
@@ -224,6 +256,8 @@ void MobileTerminalSession::onFactoryError(TerminalController *controller,
 void MobileTerminalSession::attachNow()
 {
     if (!m_factory || !m_controller || m_attaching || m_attached || m_tmuxTarget.isEmpty())
+        return;
+    if (!m_factory->workspaceReady())
         return;
 
     m_attaching = true;
@@ -355,25 +389,29 @@ void MobileTerminalSession::setVisible(bool visible)
 {
     if (m_controller)
         m_controller->setViewVisible(visible);
+    if (visible && m_openRequested && m_factory && m_factory->workspaceReady()
+        && m_factory->connected()) {
+        open(m_devSessionId, m_paneId, m_terminalPaneId, m_workingDir,
+             m_columns, m_rows);
+    }
 }
 
 void MobileTerminalSession::close()
 {
+    m_openRequested = false;
     if (!m_controller)
         return;
     // Stop flushing first: detaching walks the controller's state machine, and
     // there is no reason to hand a final batch to a screen whose page is being
     // popped.
     m_controller->setViewVisible(false);
+    m_resolvingIdentity.clear();
     if (m_factory)
         m_factory->detach(m_controller);
     m_attached = false;
-    // An in-flight resolution is ABANDONED, not left to land. Its answer would
-    // otherwise reach attachNow() and open a fresh PTY channel behind a pane the
-    // user has just left, undoing the detach above with nothing on screen to say
-    // so. Nothing is lost by dropping it: a later open() re-asks, and the factory
-    // joins the flight already under way (or answers from its own cache).
-    m_resolvingIdentity.clear();
+    // Detach cancels this controller's pending resolution delivery. A later
+    // open() re-asks or receives the factory's cached target; no completion may
+    // reopen a channel behind the page that just closed.
 }
 
 void MobileTerminalSession::copyToClipboard(const QString &text)

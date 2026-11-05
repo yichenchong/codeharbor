@@ -102,6 +102,12 @@ private slots:
     void acknowledgementResultsRequireOkTrue_data();
     void acknowledgementResultsRequireOkTrue();
     void acknowledgementMethodsForwardServerErrors();
+    void recordMembersRejectWrongTypes_data();
+    void recordMembersRejectWrongTypes();
+    void ensureInitialLayoutUsesAuthoritativeTree_data();
+    void ensureInitialLayoutUsesAuthoritativeTree();
+    void ensureInitialLayoutRejectsInvalidInputWithoutSending();
+    void ensureInitialLayoutForwardsServerErrors();
     void liveCreateAndListOverProcess();
 
 private:
@@ -117,6 +123,248 @@ private:
 };
 
 int TstWorkspaceDb::s_seq = 0;
+
+void TstWorkspaceDb::ensureInitialLayoutUsesAuthoritativeTree_data()
+{
+    QTest::addColumn<QJsonValue>("result");
+    QTest::addColumn<bool>("accepted");
+    QTest::newRow("minted-terminal-identity")
+        << QJsonValue(QJsonObject{{"tree", QJsonObject{{"type", "leaf"},
+                              {"paneId", "terminal-1"}, {"terminalPaneId", "server-row"}}}})
+        << true;
+    QTest::newRow("concurrent-winner")
+        << QJsonValue(QJsonObject{{"tree", QJsonObject{{"type", "leaf"},
+                              {"paneId", "winning-pane"}}}})
+        << true;
+    QTest::newRow("existing-empty-layout")
+        << QJsonValue(QJsonObject{{"tree", QJsonObject{{"type", "leaf"}, {"paneId", ""}}}})
+        << true;
+    QTest::newRow("existing-null-tree")
+        << QJsonValue(QJsonObject{{"tree", QJsonValue(QJsonValue::Null)}}) << false;
+    QTest::newRow("missing-tree") << QJsonValue(QJsonObject{}) << false;
+    QTest::newRow("no-row-is-not-success") << QJsonValue(QJsonValue::Null) << false;
+    QTest::newRow("invalid-tree")
+        << QJsonValue(QJsonObject{{"tree", QJsonObject{{"type", "unrecognized"}}}})
+        << false;
+}
+
+void TstWorkspaceDb::ensureInitialLayoutUsesAuthoritativeTree()
+{
+    QFETCH(QJsonValue, result);
+    QFETCH(bool, accepted);
+    makePair();
+    SplitNode candidate;
+    candidate.paneId = QStringLiteral("proposed-pane");
+    int callbacks = 0;
+    std::optional<SplitNode> stored;
+    std::optional<RpcError> failure;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_db->ensureInitialLayout(ServerId{QStringLiteral("srv-1")},
+        ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Terminal, candidate,
+        [&](std::optional<SplitNode> tree, std::optional<RpcError> error) {
+            ++callbacks;
+            stored = std::move(tree);
+            failure = std::move(error);
+        });
+    const QJsonObject request = readRequest();
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QString::fromLatin1(ch::rpc::kMethodWorkspaceEnsureInitialLayout));
+    const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+    QCOMPARE(params.value(QStringLiteral("serverId")).toString(), QStringLiteral("srv-1"));
+    QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), QStringLiteral("s1"));
+    QCOMPARE(params.value(QStringLiteral("region")).toString(), QStringLiteral("terminal"));
+    QCOMPARE(params.value(QStringLiteral("tree")).toObject()
+                 .value(QStringLiteral("paneId")).toString(), candidate.paneId);
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                 {"id", request.value(QStringLiteral("id"))},
+                                 {"result", result}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(callbacks, 1);
+    QCOMPARE(stored.has_value(), accepted);
+    QCOMPARE(failure.has_value(), !accepted);
+    if (accepted) {
+        const auto expected = SplitNode::tryFromJson(
+            result.toObject().value(QStringLiteral("tree")).toObject());
+        QVERIFY(expected.has_value());
+        QCOMPARE(*stored, *expected);
+        QVERIFY(*stored != candidate);
+    } else {
+        QCOMPARE(failure->code, ch::rpc::kInternalError);
+        QVERIFY(failure->message.contains(
+            QString::fromLatin1(ch::rpc::kMethodWorkspaceEnsureInitialLayout)));
+    }
+}
+
+void TstWorkspaceDb::ensureInitialLayoutRejectsInvalidInputWithoutSending()
+{
+    makePair();
+    SplitNode leaf;
+    leaf.paneId = QStringLiteral("pane");
+    SplitNode invalid;
+    invalid.children = {leaf, leaf};
+    invalid.ratios = {1.0};
+    int callbacks = 0;
+    std::optional<SplitNode> stored;
+    std::optional<RpcError> failure;
+    m_db->ensureInitialLayout(ServerId{QStringLiteral("srv-1")},
+        ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer, invalid,
+        [&](std::optional<SplitNode> tree, std::optional<RpcError> error) {
+            ++callbacks;
+            stored = std::move(tree);
+            failure = std::move(error);
+        });
+    QCOMPARE(callbacks, 0);
+    QTRY_COMPARE(callbacks, 1);
+    QVERIFY(!stored.has_value());
+    QVERIFY(failure.has_value());
+    QCOMPARE(failure->code, -32602);
+    QVERIFY(failure->message.contains(
+        QString::fromLatin1(ch::rpc::kMethodWorkspaceEnsureInitialLayout)));
+    m_clientSide->flush();
+    QVERIFY(!m_serverSide->waitForReadyRead(100));
+    QCOMPARE(m_client->pendingCount(), 0);
+}
+
+void TstWorkspaceDb::ensureInitialLayoutForwardsServerErrors()
+{
+    makePair();
+    SplitNode candidate;
+    candidate.paneId = QStringLiteral("pane");
+    int callbacks = 0;
+    std::optional<RpcError> failure;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_db->ensureInitialLayout(ServerId{QStringLiteral("srv-1")},
+        ch::DevSessionId{QStringLiteral("s1")}, ch::Region::Viewer, candidate,
+        [&](std::optional<SplitNode> tree, std::optional<RpcError> error) {
+            QVERIFY(!tree.has_value());
+            failure = std::move(error);
+            ++callbacks;
+        });
+    const QJsonObject request = readRequest();
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                 {"id", request.value(QStringLiteral("id"))},
+                                 {"error", QJsonObject{{"code", ch::rpc::kDatabaseBusy},
+                                                       {"message", "workspace is busy"}}}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(callbacks, 1);
+    QVERIFY(failure.has_value());
+    QCOMPARE(failure->code, ch::rpc::kDatabaseBusy);
+    QCOMPARE(failure->message, QStringLiteral("workspace is busy"));
+}
+
+void TstWorkspaceDb::recordMembersRejectWrongTypes_data()
+{
+    QTest::addColumn<int>("kind");
+    QTest::addColumn<QString>("field");
+    QTest::addColumn<QJsonValue>("value");
+    QTest::addColumn<bool>("accepted");
+    QTest::newRow("group-collapsed-string")
+        << 0 << QStringLiteral("collapsed") << QJsonValue("false") << false;
+    QTest::newRow("group-server-null")
+        << 0 << QStringLiteral("serverId") << QJsonValue(QJsonValue::Null) << false;
+    QTest::newRow("group-position-fraction")
+        << 0 << QStringLiteral("position") << QJsonValue(0.5) << false;
+    QTest::newRow("group-position-overflow")
+        << 0 << QStringLiteral("position") << QJsonValue(1e12) << false;
+    QTest::newRow("group-false")
+        << 0 << QStringLiteral("collapsed") << QJsonValue(false) << true;
+    QTest::newRow("session-archived-number")
+        << 1 << QStringLiteral("archived") << QJsonValue(1) << false;
+    QTest::newRow("session-pinned-null")
+        << 1 << QStringLiteral("pinned") << QJsonValue(QJsonValue::Null) << false;
+    QTest::newRow("session-repository-bool")
+        << 1 << QStringLiteral("repositoryRoot") << QJsonValue(false) << false;
+    QTest::newRow("session-null-working-directory")
+        << 1 << QStringLiteral("defaultWorkingDirectory")
+        << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("session-null-description")
+        << 1 << QStringLiteral("taskDescription") << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("viewer-url-object")
+        << 2 << QStringLiteral("url") << QJsonValue(QJsonObject{}) << false;
+    QTest::newRow("viewer-handler-bool")
+        << 2 << QStringLiteral("handler") << QJsonValue(false) << false;
+    QTest::newRow("viewer-null-handler")
+        << 2 << QStringLiteral("handler") << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("viewer-null-title")
+        << 2 << QStringLiteral("title") << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("terminal-target-object")
+        << 3 << QStringLiteral("tmuxTarget") << QJsonValue(QJsonObject{}) << false;
+    QTest::newRow("terminal-directory-array")
+        << 3 << QStringLiteral("workingDirectory") << QJsonValue(QJsonArray{}) << false;
+    QTest::newRow("terminal-null-target")
+        << 3 << QStringLiteral("tmuxTarget") << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("terminal-null-command")
+        << 3 << QStringLiteral("startupCommand") << QJsonValue(QJsonValue::Null) << true;
+    QTest::newRow("terminal-null-harness")
+        << 3 << QStringLiteral("harness") << QJsonValue(QJsonValue::Null) << true;
+}
+
+void TstWorkspaceDb::recordMembersRejectWrongTypes()
+{
+    QFETCH(int, kind);
+    QFETCH(QString, field);
+    QFETCH(QJsonValue, value);
+    QFETCH(bool, accepted);
+    makePair();
+    QJsonObject row{{"id", "row"}, {"serverId", "srv-1"}, {"position", 0}};
+    int callbacks = 0;
+    bool hasRecord = false;
+    std::optional<RpcError> failure;
+    const auto callback = [&](auto record, std::optional<RpcError> error) {
+        ++callbacks;
+        hasRecord = record.has_value();
+        failure = std::move(error);
+    };
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    switch (kind) {
+    case 0:
+        row.insert(QStringLiteral("name"), "group");
+        row.insert(QStringLiteral("collapsed"), false);
+        m_db->updateGroup(
+            ch::UpdateGroupParams{.id = ch::GroupId{QStringLiteral("row")}}, callback);
+        break;
+    case 1:
+        row.insert(QStringLiteral("groupId"), "group");
+        row.insert(QStringLiteral("name"), "session");
+        row.insert(QStringLiteral("repositoryRoot"), "/repo");
+        row.insert(QStringLiteral("defaultWorkingDirectory"), "/repo");
+        row.insert(QStringLiteral("taskDescription"), "");
+        row.insert(QStringLiteral("archived"), false);
+        row.insert(QStringLiteral("pinned"), true);
+        m_db->updateSession(
+            ch::UpdateSessionParams{.id = ch::DevSessionId{QStringLiteral("row")}}, callback);
+        break;
+    case 2:
+        row.insert(QStringLiteral("devSessionId"), "session");
+        row.insert(QStringLiteral("url"), "https://example.com");
+        row.insert(QStringLiteral("handler"), "web");
+        row.insert(QStringLiteral("title"), "Page");
+        m_db->updateViewerPane(
+            ch::UpdateViewerPaneParams{.id = ch::ViewerPaneId{"row"}}, callback);
+        break;
+    case 3:
+        row.insert(QStringLiteral("devSessionId"), "session");
+        row.insert(QStringLiteral("name"), "terminal");
+        row.insert(QStringLiteral("workingDirectory"), "/repo");
+        row.insert(QStringLiteral("tmuxTarget"), "ch_target");
+        row.insert(QStringLiteral("startupCommand"), "");
+        row.insert(QStringLiteral("harness"), "");
+        m_db->updateTerminalPane(
+            ch::UpdateTerminalPaneParams{.id = ch::TerminalId{"row"}}, callback);
+        break;
+    }
+    row.insert(field, value);
+    const QJsonObject request = readRequest();
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                 {"id", request.value(QStringLiteral("id"))},
+                                 {"result", row}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(callbacks, 1);
+    QCOMPARE(hasRecord, accepted);
+    QCOMPARE(failure.has_value(), !accepted);
+    if (failure)
+        QCOMPARE(failure->code, ch::rpc::kInternalError);
+}
 
 void TstWorkspaceDb::init()
 {
@@ -787,6 +1035,7 @@ void TstWorkspaceDb::listSkipsNonObjectEntries()
     const char* kJson = R"([
       7,
       {},
+      { "id": "g-bad", "collapsed": "false" },
       {
         "id": "g1", "serverId": "srv-1", "name": "Alpha",
         "position": 0, "collapsed": false,
@@ -796,14 +1045,17 @@ void TstWorkspaceDb::listSkipsNonObjectEntries()
           {
             "id": "s-bad", "viewerPanes": {}, "terminalPanes": []
           },
+          { "id": "s-wrong-type", "pinned": "true" },
           {
             "id": "s1", "serverId": "srv-1", "groupId": "g1", "name": "S1",
             "repositoryRoot": "/r", "position": 0, "archived": false,
             "viewerPanes": ["nonsense", {},
+              { "id": "v-bad", "url": 7 },
               { "id": "v1", "serverId": "srv-1", "devSessionId": "s1",
                 "url": "http://x", "position": 0 }
             ],
             "terminalPanes": [[], {},
+              { "id": "t-bad", "tmuxTarget": {} },
               { "id": "t1", "serverId": "srv-1", "devSessionId": "s1",
                 "name": "term", "position": 0 }
             ],
@@ -813,7 +1065,6 @@ void TstWorkspaceDb::listSkipsNonObjectEntries()
       }
     ])";
     const QJsonArray result = QJsonDocument::fromJson(kJson).array();
-    QCOMPARE(result.size(), 3); // guard against a malformed canned fixture
 
     m_serverSide->write(jsonLine(
         {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}}));
@@ -1399,8 +1650,8 @@ void TstWorkspaceDb::resolveTerminalPaneWithNoAddressFailsWithoutAskingTheServer
 }
 
 // A tree the client cannot read back must not be written. Storing one loses the
-// user's layout silently: setLayout reports success, and the loss only shows up
-// on the next launch, when getLayout maps the unreadable tree to "no layout".
+// user's layout silently: the next launch would find an unreadable tree instead
+// of the layout the caller believed had been saved.
 // The refusal is local, so the bad bytes never reach the server at all.
 void TstWorkspaceDb::setLayoutRefusesATreeItCouldNotReadBack()
 {
@@ -1470,9 +1721,8 @@ void TstWorkspaceDb::workspaceDbCannotBeBuiltWithoutAClient()
 // split-tree validation is therefore a malformed reply, and handing the caller
 // (no tree, no error) would report the write as landed while giving it nothing
 // to adopt - the same blank-record trap every other method reports as -32603.
-// getLayout's opposite verdict (an unreadable tree means "no layout") is
-// deliberate and covered by getLayoutMalformedTreeDeliversNullopt; this pins the
-// boundary between the two.
+// getLayout also rejects unreadable stored trees; only a genuine null row means
+// the region has no persisted layout.
 void TstWorkspaceDb::setLayoutMalformedTreeDeliversRpcError()
 {
     makePair();

@@ -53,12 +53,11 @@ namespace ch {
 // fabricated single-pane layout would invite the user to edit it and overwrite
 // their real one.
 //
-// A region the server has NO row for is a different case from a failed one: the
-// region default (see defaultTree()) is adopted AND written back, so a brand
-// new Dev Session's layout - two stacked terminal panes and one viewer pane -
-// is in the database from the first time the session is opened rather than
-// re-derived on every load. That write is idempotent: it creates the row, so
-// the next load reads it and seeds nothing.
+// An absent region is initialized through workspace.ensureInitialLayout: the
+// server atomically chooses an existing winner or creates the default (one
+// viewer, two stacked terminals with fresh row identities). Only that returned
+// tree is published. A stale null GET therefore cannot overwrite a peer's
+// layout, and concurrent first opens cannot mint competing terminal identities.
 //
 // Signal discipline (matters: the QML regions rebuild their delegates, and
 // therefore destroy and recreate live panes, whenever the tree object changes):
@@ -81,6 +80,10 @@ class SessionLayouts : public QObject {
     // from the Dev Session id because a deliberate reload of the SAME session
     // also makes older queued gestures history.
     Q_PROPERTY(quint64 generation READ generation NOTIFY generationChanged)
+    // Pane/document identity resets on explicit loads, including a deliberate
+    // reload of the same session. Reconnect refresh advances only generation,
+    // so unchanged panes can keep their in-memory documents.
+    Q_PROPERTY(quint64 paneGeneration READ paneGeneration NOTIFY paneGenerationChanged)
     Q_PROPERTY(QVariant viewerTree READ viewerTree NOTIFY viewerTreeChanged)
     Q_PROPERTY(QVariant terminalTree READ terminalTree NOTIFY terminalTreeChanged)
 
@@ -102,8 +105,14 @@ public:
     // loaded would let the next edit persist the old session's tree under the
     // new server's key.
     void setServerId(QString serverId);
+    // AppController suspends I/O while a replacement wire's identity is
+    // unverified. Cached trees remain visible; accepted reconnect refreshes them.
+    // Standalone WorkspaceDb users have already chosen their trusted transport.
+    void setWorkspaceReady(bool ready) { m_workspaceReady = ready; }
+    bool workspaceReady() const { return m_workspaceReady; }
 
     quint64 generation() const { return m_generation; }
+    quint64 paneGeneration() const { return m_paneGeneration; }
 
     QVariant viewerTree() const;
     QVariant terminalTree() const;
@@ -113,10 +122,17 @@ public:
     // Concurrent/repeated calls are safe: each load is stamped with a monotonic
     // generation and only the newest one may touch the trees, so a late reply
     // for an abandoned Dev Session is dropped (errors are still surfaced).
-    // Synchronous signal handlers may also select another session or destroy
-    // this object. Loading, publishing and queued-edit replay stop at those
-    // boundaries rather than continuing work against the new selection.
+    // Both region states and the new selection are committed before any
+    // notification. Synchronous observers may edit, select another session or
+    // destroy this object. Superseded requests/replay stop; already committed
+    // null-tree invalidations still notify unless a newer tree was published.
     Q_INVOKABLE void load(QString devSessionId);
+
+    // Reread both regions of the current trusted context, retiring old replies,
+    // gestures and mints without resetting pane/document identity. Unchanged
+    // trees remain published throughout; changed authoritative trees retain the
+    // normal replacement policy. Empty or unverified contexts do nothing.
+    void refresh();
 
     // Every DELAYED gesture MUST come in through the stamped entry points
     // below. The session id and generation are captured when the gesture
@@ -237,9 +253,10 @@ public:
     // which matters because a label is recyclable and a row id is not.
     //
     // Silent and free in every other case: a different Dev Session, an unknown
-    // pane (it was closed while the lookup travelled), or a leaf that already
-    // carries this id. That last one is what makes it happen ONCE rather than
-    // on every attach.
+    // pane (it was closed while the lookup travelled), a fresh pending leaf,
+    // or a leaf that already carries an id. Only a currently legacy leaf may
+    // consume a label-resolution answer; a delayed answer cannot claim a leaf
+    // whose own row is being minted.
     //
     // Persisted through the same path every other edit uses, so it also retires
     // any getLayout still on the wire (RegionState::superseded): a backfill is
@@ -268,6 +285,7 @@ signals:
     void devSessionIdChanged();
     void serverIdChanged();
     void generationChanged();
+    void paneGenerationChanged();
     void viewerTreeChanged();
     void terminalTreeChanged();
     // Server-forwarded RPC message, verbatim (SPEC 10.3), or a locally detected
@@ -286,6 +304,11 @@ signals:
     // (or on generation()) rather than counting these, or it will wait for a
     // signal about a Dev Session nobody is opening any more.
     void loaded(QString devSessionId);
+
+    // A current server operation created/discovered terminal rows after the
+    // workspace snapshot was read. Consumers must reread that authoritative
+    // snapshot; a published layout alone cannot register sidebar identities.
+    void terminalRowsChanged(QString serverId, QString devSessionId, quint64 generation);
 
 private:
     // Region slots, indexed by kViewer/kTerminal.
@@ -333,8 +356,7 @@ private:
         // region the unusable-layout treatment, blanking a layout the user just
         // built and the server has already accepted. The error is still
         // reported; only the region is left alone.
-        // Cleared by load() (a deliberate reload must adopt the server's tree)
-        // and by clearTrees().
+        // Cleared by load() (a deliberate reload must adopt the server's tree).
         bool superseded = false;
     };
     // Return Drop for a stale session/generation stamp, Queue for a current
@@ -353,7 +375,6 @@ private:
                                quint64 generation);
     void queueWrite(int index, PendingWrite write);
     void flushPendingWrites(int index);
-    void clearPendingWrites();
     void saveTreeStamped(const QString& devSessionId, quint64 generation,
                          const QString& region, const QVariant& tree);
     void setRatiosStamped(const QString& devSessionId, quint64 generation,
@@ -393,6 +414,7 @@ private:
     // default panes), and a Dev Session created before this change keeps the
     // panes it already has (its layout row exists and is loaded verbatim).
     static SplitNode defaultTree(int index);
+    void loadImpl(QString devSessionId, bool preservePanes);
 
     void applyLoadedTree(quint64 generation, int index,
                          std::optional<SplitNode> tree,
@@ -412,7 +434,6 @@ private:
     // precisely so no caller has to hand the member back to us by value.
     void publishTree(int index);
     void publishTreeQuietly(int index);
-    void clearTrees();
     // Layout edits are only meaningful for a selected Dev Session on a known
     // server: setLayout needs both ids, and mutating the cache without being
     // able to persist would silently diverge from the authoritative tree. Emits
@@ -466,12 +487,6 @@ private:
     // terminal leaves would be PENDING with nothing on the wire to resolve
     // them, and persist() refuses for the rest of the session to write a region
     // that holds one (see hasPendingTerminalLeaf()).
-    //
-    // Also the mint funnel for the seeded region DEFAULT, which is a tree this
-    // client did not derive from the server either: its leaves need exactly the
-    // same rows, and its "brand new" is exactly as conditional (a reload that
-    // still finds no row on the server re-seeds a tree whose leaves were bound
-    // the first time round, and those must not be re-minted).
     void adoptAuthoredTerminalTree(quint64 generation);
     // Find the terminal leaf labelled `paneId` in the loaded terminal tree, or
     // nullptr. Terminal region only: a viewer leaf has no row to bind.
@@ -491,10 +506,12 @@ private:
     UiStateStore* m_uiState = nullptr;
     QString m_devSessionId;
     QString m_serverId;
+    bool m_workspaceReady = true;
     RegionState m_regions[kRegionCount];
     // Monotonic stamp so a reply from a superseded load() can never overwrite a
     // newer session's tree; see load().
     quint64 m_generation = 0;
+    quint64 m_paneGeneration = 0;
     // getLayout replies still outstanding for the current generation; `loaded`
     // fires when it reaches zero.
     int m_pendingLoads = 0;

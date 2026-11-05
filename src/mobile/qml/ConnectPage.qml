@@ -223,7 +223,8 @@ Page {
         if (!details || !details.name)
             return name
         var suffix = details.referenced ? qsTr("your file, referenced")
-                                        : qsTr("in memory, this session")
+                   : details.saved ? qsTr("saved on this device")
+                                   : qsTr("in memory, this session")
         if (details.encrypted)
             suffix += qsTr(", passphrase required")
         return name + " \u2014 " + suffix
@@ -312,6 +313,12 @@ Page {
         // client writes a key file for libssh to open.
         if (root.keys && !root.keys.applyIdentityForConnect(root.selectedKeyName))
             return
+        // Button activation need not move keyboard focus, so do not rely on
+        // editingFinished to transfer the passphrase before dialing.
+        if (root.keys && passphraseField.text.length > 0) {
+            root.keys.armPassphrase(root.selectedKeyName, passphraseField.text)
+            root.wipeSecretField(passphraseField)
+        }
         root.mobileController.connectToServer(root.formProfile())
         root.connected()
     }
@@ -346,6 +353,20 @@ Page {
     Connections {
         target: root.mobileController
         ignoreUnknownSignals: true
+
+        function onConnectionStateChanged() {
+            if (root.mobileController && root.mobileController.connectionState === "connecting")
+                return
+            // A rejected host key or another successful auth method can finish
+            // an attempt without ever consuming the pre-entered passphrase.
+            if (root.keys)
+                root.keys.forgetPassphrase()
+            root.wipeSecretField(passphraseField)
+            root.wipeSecretField(secretField)
+            root.credentialKind = ""
+            root.credentialPrompt = ""
+            secretDialog.close()
+        }
 
         function onCredentialPrompt(user, host, prompt, kind) {
             if (kind === "keyPassphrase" && root.keys
@@ -672,7 +693,7 @@ Page {
                 // while the handshake runs. wipeSecretField() rather than clear():
                 // clear() would leave every character in this item's undo history.
                 onEditingFinished: {
-                    if (root.keys)
+                    if (root.keys && text.length > 0)
                         root.keys.armPassphrase(root.selectedKeyName, text)
                     root.wipeSecretField(passphraseField)
                 }

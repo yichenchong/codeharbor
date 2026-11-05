@@ -28,6 +28,12 @@ The client provides only UI, rendering, input, and transport.
 - **Remote** (`remote/`): `codeharbord` RPC service, `codeharbor-bridge` agent
   event relay, and per-harness adapters. TypeScript/Node, zero runtime deps.
 
+There is also a native Qt Quick Android/iOS client (`src/mobile/`, `src/vt/`)
+over the same backend and remote service. It shows one selected pane at a time
+instead of the desktop's three-region layout; it does not use WebEngine.
+Native PDF rendering uses a bounded local app-cache spool; cleanup after a crash
+is not immediate. See [mobile development and platform constraints](docs/DEVELOPMENT.md#mobile-clients-android--ios).
+
 ## Repository layout
 
 ```text
@@ -43,6 +49,8 @@ src/            C++/QML client
   agent/        AgentStatusMonitor: coding-agent status over the bridge
   qml/          shared QML components
   web/          bundled web assets (terminal, editor, markdown)
+  mobile/       native single-pane mobile client and viewers
+  vt/           in-process mobile terminal emulator
 remote/         server-side service, agent bridge, viewer-control channel,
                 harness adapters, the codeharbor-mcp server and codeharbor-view CLI
 docs/           SPEC.md, PLAN.md, DEVELOPMENT.md, plus dated bug-hunt records
@@ -132,6 +140,12 @@ before rollback can finish.
 | Windows | `CodeHarbor-<version>-windows-x64-setup.exe` | Per-user installer, no admin rights. SmartScreen will warn (unsigned). |
 | Windows (portable) | `codeharbor-windows.zip` | Extract, run `codeharbor.exe`. Same files, no shortcuts or uninstaller. |
 
+Releases also contain a signed `CodeHarbor-<version>-android-arm64.apk` for
+Android devices and an Android App Bundle for distribution. The iOS ZIP contains
+an **iOS simulator** app, not an app that can be installed on an iPhone; a device
+build needs Apple's signing and provisioning credentials. See
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#mobile-clients-android--ios) for details.
+
 ### 3. Connect
 
 Launch it, add a server in the connect sheet, and fill in:
@@ -203,9 +217,11 @@ shortcuts SPEC 15 originally suggested, in [`docs/SPEC.md`](docs/SPEC.md) — is
 | `Ctrl+V` (`⌘V` on macOS) | Paste into the focused terminal. `Ctrl+Shift+V` does the same. Because `Ctrl+V` pastes, it no longer reaches the shell as `^V` (readline's literal-next); on macOS plain `Ctrl+V` still does |
 | `Ctrl+,` | Settings |
 
-Splitting and closing panes, killing a terminal's remote tmux session, disconnecting,
-marking agent output seen, renaming a terminal pane, pinning a Dev Session, and
-showing the log are palette commands or in-place controls with no key sequence.
+Splitting and closing panes, disconnecting, marking agent output seen, renaming
+a terminal pane, pinning a Dev Session, and showing the log are palette commands
+or in-place controls with no key sequence. Closing a terminal pane asks for
+confirmation and also kills that pane's remote tmux session; there is no separate
+kill command. Switching sessions, disconnecting, or closing the window does not kill it.
 There is no Dev Session switcher shortcut and no "focus next pane" shortcut.
 
 A few things worth knowing about the shipped client:
@@ -217,16 +233,26 @@ A few things worth knowing about the shipped client:
   of file — for example open `.md` in the editor instead of the renderer.
 - **Markdown files render**, with headings, tables, code blocks and task lists,
   themed to match the app. "Open as → Editor" gives you the source to edit.
-- **Split, close and kill are on each pane's own header**, so they act on the pane
-  you are looking at rather than on whichever pane the app thinks is focused. The
-  same commands remain in the palette for keyboard use. Killing a terminal asks
-  first, because it destroys running remote work.
+- **Split and close are on each pane's own header**, so they act on the pane you
+  are looking at rather than on whichever pane the app thinks is focused. The
+  same commands remain in the palette for keyboard use. A terminal's confirmed
+  **Close and Kill** destroys its remote tmux session and the work running inside it.
 - **Reopening a Dev Session puts the keyboard back where you left it.** If you were
   typing in a terminal, you can keep typing without clicking first.
 - **Viewer panes navigate like a browser**: Back, Forward, Reload and Home beside the
   address field, with a history per pane. The address field opens on Enter.
-  An editor with unsaved changes refuses navigation and reload; save it or close
-  the pane first. Opening another pane leaves the unsaved editor in place.
+  An editor with unsaved changes refuses navigation, but its **Reload** refreshes
+  the editor page while retaining the in-memory buffer and dirty/pending-save state;
+  it does not revert to the remote file. Save or explicitly close the editor before
+  navigating away. Opening another pane leaves the unsaved editor in place.
+- **Leaving a desktop workspace with unsaved editor work asks first.** A
+  user-initiated session switch or retry, archiving the active session, server
+  connect/disconnect/update, and closing the window offer **Discard** or **Cancel**,
+  with Cancel as the default. Save first if you want to keep the edits.
+  This does not add a confirmation to agent-driven `viewer_close`.
+  Automatic reconnect to the same server/session keeps the editor and unsaved
+  buffer alive when its authoritative pane layout is unchanged; this does not
+  protect panes removed by a remote layout change.
 - **The explorer can open a file with a specific viewer** ("Open as"), in place or in
   a new pane, and can hand it to a local application by `<appName>://` scheme.
 - **Terminal panes can be renamed** from their header, and the name travels with the
@@ -266,6 +292,12 @@ A few things worth knowing about the shipped client:
   printing?", which cannot tell finished from busy — an agent that redraws a spinner
   looks like work forever. The module does nothing when it is not running inside a
   CodeHarbor pane, so it is safe to leave enabled everywhere.
+  Status delivery also needs the right event endpoint. CodeHarbor exports the
+  validated `server.info.agentSocket` as `CODEHARBOR_AGENT_SOCKET` to new
+  tmux-created shells, even when the tmux master has different XDG settings.
+  Reattaching cannot rewrite a running shell's environment: if that shell points
+  at an old endpoint, create a new tmux shell/window/session. Restarting the agent
+  inside the old shell does not fix its inherited route.
 - **Dev Sessions can be pinned**, and the sidebar can be filtered to show only pinned
   ones. Pins live on the server; the filter is local to the machine.
 - **Dev Sessions can be archived** to get them out of the sidebar without losing
@@ -324,22 +356,28 @@ node remote/src/tools/viewctl.ts open --url README.md --new-pane
 node remote/src/tools/viewctl.ts close --pane viewer-2
 ```
 
-Three things to know:
+Things to know:
 
 - **It only drives the Dev Session you are looking at.** A command from a pane of
   another session is refused by name rather than applied to the wrong layout.
-- **Closing a pane does not ask about unsaved editor changes**, the same as the
-  command palette's Close Pane. The shipped skills tell the agent to ask you first.
-- **It needs a pane CodeHarbor created.** Three variables are exported into each
-  pane's tmux session: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` say which pane
-  this is, and `CODEHARBOR_CONTROL_SOCKET` says which window owns it. A shell that
-  was already running before CodeHarbor attached has none of them, and an agent
-  without the socket is told so rather than being routed to another window.
-  `echo "$CODEHARBOR_CONTROL_SOCKET"` says which case you are in.
+- **Agent-driven closing does not ask about unsaved editor changes.** Unlike a
+  user-facing close, `viewer_close` applies directly. The shipped skills tell the
+  agent to ask you first.
+- **It needs CodeHarbor's pane coordinates and endpoints.** New tmux-created
+  shells receive `OMP_DEV_SESSION_ID`, `OMP_TERMINAL_ID`,
+  `CODEHARBOR_AGENT_SOCKET` (shared status relay) and `CODEHARBOR_CONTROL_SOCKET`
+  (this window's viewer control). Existing shells retain their earlier environment;
+  even a newly launched agent inside one inherits that old route. A producer
+  without the control socket is refused rather than routed to another window.
+  `echo "$CODEHARBOR_CONTROL_SOCKET"` shows the value in the current shell.
+  Missing values are suppressed instead of inherited from an old tmux master;
+  if either pane-coordinate ID is missing, both IDs and both routing variables
+  are suppressed together.
 - **Several windows work independently.** Each CodeHarbor window has its own socket,
   so an agent drives the window whose pane it runs in. The one exception is a
-  terminal pane you have open in two windows at once — that is one shell shown
-  twice, and the window that attached most recently owns agents started after it.
+  terminal pane open in two windows at once — one shell shown twice. Last attach
+  selects the control endpoint for future tmux-created children, not existing
+  shells or new programs forked from them.
 
 ## Build
 
@@ -410,10 +448,12 @@ were trusted silently, and one where presenting a different key ALGORITHM downgr
 a hard refusal into a friendly "trust this new host?" prompt.
 
 The corrections note in [`docs/PLAN.md`](docs/PLAN.md) records each one, along with
-the remaining gaps: reconnect cannot prompt for a newly-unknown host key, and a
-connect briefly blocks the GUI thread. Groups can be renamed from their sidebar
-context menu or with F2 while the group is selected. Crash-recovery snapshots
-offer an explicit Restore or Discard choice when the file is reopened.
+the remaining gaps: reconnect cannot prompt for a newly-unknown host key, and
+synchronous SSH handshake/channel operations can block the GUI thread. Groups
+can be renamed from their sidebar context menu or with F2 while the group is
+selected. Crash-recovery snapshots offer **Restore** or **Not now** when the file
+is reopened. **Not now** dismisses the offer without deleting the retained copy;
+it does not promise a permanent history or prevent newer edits from replacing it.
 
 **Building requires Node** — the Monaco, xterm.js and Markdown bundles are build
 artifacts embedded as Qt resources, and CMake builds them at configure time (it

@@ -95,11 +95,10 @@ namespace ch {
 // implementation detail of QSettings' merge is not resting it on anything.
 //
 // So the WHOLE sequence — re-read, merge, write, flush — is serialised across
-// processes by a QLockFile, taken on `<settings file>.merge-lock` (the plain
-// `.lock` suffix beside it belongs to QSettings' own sync and taking it here
-// would deadlock against Qt). It sits next to the settings file, derived from
-// that file's own path, so it is always on the same filesystem — a lock on a
-// different mount, or on NFS with a broken flock, is not a lock.
+// processes by a QLockFile. File-backed stores use `<settings file>.merge-lock`;
+// the plain `.lock` suffix belongs to QSettings' own sync and would deadlock.
+// Windows registry-backed stores instead share a per-user lock beneath
+// GenericConfigLocation/CodeHarbor/profile-locks, keyed by the registry path.
 //
 // Acquisition is bounded (a couple of seconds): this runs on the UI thread and
 // a wedged peer must not freeze the window. A holder that died mid-write leaves
@@ -117,6 +116,9 @@ namespace ch {
 // quietly: AppController turns that signal into the shell's toast, worded as a
 // saved-but-unprotected notice, so the guarantee below degrades to best effort
 // only in a case the user is actually told about.
+// A failed read or durable write emits saveFailed() instead, never a notice
+// claiming the profile was saved. The in-memory edits remain available for
+// connection and retry, but persistence is not promised until a save succeeds.
 //
 // So, precisely: as long as every writer is a ServerProfiles that gets the lock,
 // no write can destroy a profile it did not know about, and LAST WRITE WINS
@@ -196,6 +198,10 @@ signals:
     // Emitted after the write and after the lock is released, so a handler may
     // safely mutate the store again.
     void saveDegraded(QString reason);
+    // Persistence failed. The in-memory list is still usable, but these edits
+    // have not been confirmed on disk. Emitted after releasing the merge lock;
+    // `reason` is a cause clause including the store path.
+    void saveFailed(QString reason);
 
 private:
     // Index into m_profiles, or -1.
@@ -212,14 +218,14 @@ private:
     // Write one profile's keys at the given list position.
     void writeEntry(const QVariantMap& fields, int ordinal);
     // Save: take the interprocess lock, merge, write, flush (see CONCURRENT
-    // WRITERS above). Emits saveDegraded() and writes anyway when the lock
-    // cannot be had.
+    // WRITERS above). Emits saveDegraded() for a successful unlocked write, or
+    // saveFailed() if the read or write failed.
     void persist();
     // The merge itself, under the lock: re-read the file, keep what is neither
     // ours nor deleted, rewrite the whole `servers` group — so removals leave no
     // orphan `servers/<id>/*` keys and the ordinals always match the list order
-    // — and flush.
-    void mergeAndWrite();
+    // — and flush. Returns an empty string on success, otherwise a cause clause.
+    QString mergeAndWrite();
     // Narrow the on-disk store to owner-only. No secret is stored here, but the
     // record of which hosts you reach — and, where the umask leaves the file
     // group-writable, the ability to REDIRECT one — is not other accounts'

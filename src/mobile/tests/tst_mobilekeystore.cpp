@@ -94,19 +94,137 @@ QByteArray keyNeedle()
     return QByteArrayLiteral("yJVYwReUfMX8ggNcUEsjAAAAB2NoLXRlc3Q");
 }
 
-// A legacy PEM key, in the shape libssh still loads. The body is not a real key:
-// nothing in describeKeyText() parses a PEM body — the format carries no public
-// half in the clear, which is exactly why it reports no key type and no
-// fingerprint — so what is under test here is the container, the RFC 1421 headers
-// and the refusal to invent a fingerprint.
+// Disposable 1024-bit RSA fixtures generated with OpenSSL, never authorized on a
+// server. Keep real keys here: a base64 block is not necessarily a private key.
 constexpr auto kPemBody =
-    "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n"
-    "KUpRKfFLfRYC9AIKjbQnQLpuVFXQ7QnaJfSCAwEAAQJAX6uzFTVKMEAvL0Pmqzho\n";
+    "MIICXAIBAAKBgQDhwW6hW+PU6JPZvQ5UBxW6GTH9aCqn9F71gM/+/KzzjJ4kqGdi\n"
+    "xrGVKoiykxEdiClYPLyrW659kadjU11cBI6T2efbwQxXckd1lLqk23j7wL+lT4Dx\n"
+    "792hDmVbmCdkiiyVT/0P/FW4l29aWrn8VrjYkSk89J7Q/UhaimhoupiCQQIDAQAB\n"
+    "AoGAJYs4rccNXbQMGpLxVhITj+5uvNjc9y+Rtzxj2uEElkBVcH09LFUk5Uy8jQ4e\n"
+    "M44Yah83tTu7ChD2CHOtvAbZ+vatnEZIMG1Fx1aQzDq3OrjY1gH6Oo/dC3tFeUYZ\n"
+    "VOpZ7FaRX0A4DfYoymw778342K2+0UAeRd+XMQQAuR7WlJECQQD3FErLC6hr76nG\n"
+    "kAnTz5d5VtfU+35rt8gQ+kOnJ8fwC4jXXuFbr5K8TapXN1QM5eqALVkpARQVJElx\n"
+    "gSBrL7GtAkEA6egMmzuNbO94RcQhax/PVlW7xdHMoQY5YPyXYD+wDtK+5qTzeEnt\n"
+    "nqeg0O5x2Cv7jurEUotwzr+XumpwUjwtZQJAWTUcY/8Lihz34Vc0FSOIfyjZuG4t\n"
+    "ENtEAs05C+sTBxpDB++b0iysAAzSibbSQ+3nIuw8ms9m3tNBKRgECm8n6QJAIPI1\n"
+    "bFwMBI8KYtFIX71gR+nVg/yUFQ46YMXTUJRH6R6YEwai4IuRM6qqxSMA2BEB4tSA\n"
+    "iJvpbMWhynkZjwu43QJBANwITmt7F1DW1xCMHKYmK6pw0vbZa0VEVApVSTHO0DbA\n"
+    "N3+BTUc/WOe2X1QaPJ6bY/SS4O2tbzldUfLqA8sU9tU=\n";
+
+constexpr auto kEncryptedPemBody =
+    "AU7sz4KSN25vYjFN7kIdN4BfBkZ9L52tefffE9Rjt+vsAv2Qm+WD3wQIjEz+ttOe\n"
+    "o95q8B8PQOXbW/h7oPijDFCdyCrlLRj98pP7/v/Bm6j7Z/pP0QqIxjowWjSIEAyH\n"
+    "weDo5DQSnXur0AEjJTzhK1bg3JCyTgJkANPxgR5cN9zHuSwNJ8k2Sjm2gr9dr0vb\n"
+    "kQ0SammcaReSLyO05VusgW0R4fjfz7Fers7GqzSL3PJ3GGfdvjRvVcOFlBDgBfg+\n"
+    "OsKlLha8VL9DGipguwEVoKwuPIxGBcPbcWSA2P1EmSOTueY7tpAwGMquUac8DFAG\n"
+    "fDC1SSc81SZKDaAiXF/JfT50ljOQbr8MAQBvIvyFg0bvdst5Fv5tL266UyPvAiPg\n"
+    "C8UNWLiatzSiWVLeC5O9+0sxoHyxhu4oHvw3I9VSqt3LkQjZ5GiRoek/2Jd+SQJB\n"
+    "AwqoGOEflCTZCSWySldrynBfVjHOyem7EEVf68R9F2RqRg/NJsp6V8tP5G9HsVzp\n"
+    "FBHAQwhdsIaBml2N5lFd8BLPm1vJKaNtNjKe6Mt94HtTjQlX4Kr8cx+49Y1yfQPU\n"
+    "VaxwBEY7PVj455OP9Db/0JIK2AfDVIJE4OFtVEnL+PMhLNnXtl7+SygaCc2gI0zi\n"
+    "wDKFonS2/qPT2DlAD1aNEWTwqRlV3eZvs5l3CNLQ1Fyrd2F/auDoNDsEx6KNx679\n"
+    "Kj3zSzu8CVpFKLfFSNMdCUYsw4vylgUmTQ/eFSMCuuOKbr3orViQPOtVSdzye7V5\n"
+    "0HXXqi4yu2sFbIAWCiOBYMo0j9K4BGr7Cd/kbSZE3DC088GABvXk5TF5yeANYPwf\n";
+
+// OpenSSL pkcs8 -topk8 -v2 aes-256-cbc -iter 2048, password hunter2.
+// A real disposable encrypted key, not an invented ASN.1/ciphertext envelope.
+constexpr auto kEncryptedPkcs8 = R"(-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIIC5TBfBgkqhkiG9w0BBQ0wUjAxBgkqhkiG9w0BBQwwJAQQLmInhI54Abeq9hr8
+JNLyKwICCAAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEGXs/IOm6jGqQZ+P
+iRgxjgwEggKAkkvUJjxPq9prW4DfwyvAyk/AcLyUeoMKpa8w5sUIRKqz1X90oSvP
+oni6pseZ4iKCGpVQXes8vheMeZgWDl5OuSQt61Jmm6WFKQGtVq3xmfU99vral1Zm
+PKbvl083Ob7anOCsm3AtMWbdp2lM8kmKK/FdNQ+2u7ktIK/7njr7Vv0WeC7I63ZE
+oS9I46pSYS22/azP2qOd2+YJRsa80tDqQxw+6V4G3kZjDZAzMX26RbEDx/ofnfFA
+Vonom/Wf2TVtdDRsMJWefDQEtlyYc9RcY1U7y/sJ8nvd2ga2WgEw4YUac5f5Y4Sj
+AaaIOn/8N24RlFoTYMqsZvcwwgVGggNNtxgacimz35EALahu9Zp3Y2glGwyqLbOz
+tCmjIHbKReDR3hqiUdAnwPnY6kdukyUWrjdUCdC9qHv02gCA6qLOfRYRkr8ehPyx
+m4REueK7/oMYQauVaM6eGGtYYsydFHF7RTxfohicey75eeOLCcoAYTJVSe7dVHeN
+14f0nj0nhBCtsH077+UYrpMxQnlLIHVToF+/9pqbnbtUfKYT0Sj6Ol32HXMP2ERB
+l6j/BzviH56ud4OOAW551vuqokVbR8vz+ocQs0JGFw/fldHfR5e+fqT/HLH+fAxg
+062M23ZEcw3hAvs5l/rO7WdZvc8LOPKtmozJUqIYmCQMGfu5/4oZSt4g+jTRedHX
+kjkA54pOnXDBAEJTvfUfuaotLtln3pveBn8vPamjdEXsutf4IGPyNV0q7sQIL8YC
+JmpYAOQ2rvH1oecvcjE9w31fJ0JlGU+9PpTP4v0Ua/S6m5TCKg/2SO3bvO3+h4I0
+j1RyFf9DVsYdPtSmKj0pTm1n/bmGxFGH6A==
+-----END ENCRYPTED PRIVATE KEY-----
+)";
+
+// OpenSSL pkcs8 -topk8 -scrypt, generated from disposable RSA-2048 material.
+constexpr auto kEncryptedScrypt = R"(-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIIFLTBXBgkqhkiG9w0BBQ0wSjApBgkrBgEEAdpHBAswHAQQXa8yFGCZXcPky1/g
+1ixCLQICQAACAQgCAQEwHQYJYIZIAWUDBAEqBBAKZBkIKoKvbbF7SYax25N5BIIE
+0KAcGs3sCRHBL+ZSrbabmiKm711mgC8zjqd0Z5Ef0xCdTlwvGWF8Pmn28Qa1UTm8
+3iWlXWmYX8Qo0OgQ/ycGTmxJRkdj5bnINMhR3OxJyj/Stz9mNvkna9eMpo5OTW69
+bnTELQCi2YdupJ7+8sLomOTHy14tgQXZdokku/yMkwTbirUaF+XqMTX8oI+eZkAU
+VpiJbMV6VcRcsE93JQE6EzENi3Zgc+rC+XCO+lHEMC18AUQGRUbrsAuBRZDWao34
+52XNrQS6RTqRtJh/2oIk6AMvswRj1xE52uOFFVqaqSB3Gd1FVdP1f6lkrXO58bCn
+yiO8Uw268/HjauZHv4G3tWX8WfCHgWdQI1cuOcEzHMyQMhlPdrLI+sU94K+x3HZA
+kLqSeC2qI6xM8k7PSQVqrc3jwS/4ecqnF2v0IFnH1/4zg60gY5JUQmxl0DQ4SaOv
+zSrF8M5lHYUyzhxufNktrANFWk0tzAXUXDHITVkOwCY4LHktCqFEL0a8lyd7bhLK
+FiyG8L2N9+73QEaUhMwW0oqQZBAsodjjQuf1OeQR6gyyvDbD9PLODH/GKfCFr4Tx
+B4Vce2xPTLtPkD9V60sd62I65X3I+Vb1uRkXM0pVncULgNWaIS5ePSjPLVE0p7KP
+r+K47zM4faC0k9yh+HEAYpT+HzpJ+KRpLvxDqOPjw36E1vAPxkuqxY9CFvLy8Zy3
+RoEep3cy3o1qhh8/46EPdq6pL85HGnqJDo9DOm1e8k0RXWicqcqHsF6GDti5sc9J
+T3QWZcs0636UXY/dw+G0W5dTXf08RSbXHP5uopxhkCfHKCiddlciyZT/wZXP0i3z
++780c13zdWCB4bN43m+XwhfegK9/j9BxlLXMcK5nkC4DIzQfM+TlwDr1CYCilEq+
+Y+8czyVmuNnhRXyCzW+8idAsnnjABnThjBpRTpaijl7iXdzw5Vp/q18wAdTgdVfd
+OeMf05F4ku2Q4W6spu91QzgunB9s2zo1xW+26ehhSqjWdNMKaRZK/QzMbcwJOdIS
+jNMX/iwqKmN/qpkN7kO6K9cdZUX6iE2EuLEZ6wE38ys0oonMryrJcBY0VHZbqGTk
+rbcldZVyNzsEJ0RXW0yUr6yI1qGq3MEtujVFB1RImlF/Ho79WOwtrm8gwNWsOksE
+LSE205wyUJw1NZ6X4bzO4dv858vLrrYX/vmgyALLaei/qdsIXsY/IzsvAFHLKAhu
+u+JraExwuZK3IZPCspyQUtpngpLDOOt+r6Fzd17i+yQRGRdN5JDWbGqDh7BL+fWz
+zIQfC1r5OHkuBTPTS0TNVVqaHXCMg2ABPKHnJxae/SG3alCCfEB7q+6JnmdcUDGZ
+kz/CXjBmXvKru4OWRO/+tYqh1lMJBjEuEea8ARdln8YQEhabze1G/9drU9nvNulg
+H4CP119sGZRnjqNgLARm4Mv/rBrZYPBWy6fYLKzkAWLZfiV2Sa1QAf0skBjOiUq/
+NjVl2wFF8RWMUooblh6JGY5bBXb1uIYLPIXZYf4Z4GPxS1Rz9us7eqzxAFEbbfur
+ZYdO/w8rKa4YlW6h0P3XYsysPFhwpzdmZcdYNZTBURNM2JqnH6sMFakdThC2Rb6z
+akG9sNhPuqsJYF2P9EEN1jUwbGYdFsKMyL/WUOnm0rYC
+-----END ENCRYPTED PRIVATE KEY-----
+)";
+
+// OpenSSL-generated legacy PBES1 MD5/DES and PKCS#12 SHA1/3DES containers.
+// Password hunter2; fixtures are never authorized on a server.
+constexpr auto kEncryptedPbes1 = R"(-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIICoTAbBgkqhkiG9w0BBQMwDgQIHhrAcmqINV8CAggABIICgCwAaJGZev6oanhu
+DNs7JW8S6mKpdjr7OPpBoHBZlcyPEr3WN2QaOA/5RKHdoTUB8cBWgf8QVPrv7Taa
+MZgg4WaOswTjHdxre2BUCy/nCa+Lx4Y9u+MAqjmQtlh5rVj+5iKey4zhmnFhzcck
+RCO91Mb5PrnsLketCe6swvBF073NSPeVMU7pU27QBfidBF1lYinAFDZM1+8D32C5
+089dZu/gY7l3CWuI91YEtmPD3ilTjgA7CsyqeImKELkePU4AhX8xSoaz2evaZuRA
+uCKzoL/yX8ktg38CdOZO2hdopdCXXhU0rWxZnDWvtk/fgFpyK0H9ZWibmzKL668L
+56GB6feqxf7NHXXHrP14mSNGvzPfp2zbMk6lllA+/bl94k+AYz+OZYs91LgScalj
+Uk+v7EP43QbHyrrMHJSwyhQud9daQDFdMnx9gkSlh92syXdHA8Jm/ZSfYmsXttNR
+92aluLTqoS7QQsOLTm/PaQ1rkPvNXUIty1YjU8fsCNZM9j0AEdSulzTkSgtBvxDt
+sQOuI1A7zT/1aS8cWxeqeoifuQTTcZJnEvfe+IjmI7jMFs8TZYEGx1OxpMM3XykO
+g0kVOOSI1TAfddBBclbzl2fSmIiNEfN+wgNl53jxQlhJxD/9M4z2lnnx58cIlrR6
+ASJsag67F/uZBbyqurXcRu1nFB8/qs9rAtlR5onRa9NGUr7wyFMuPKTR6WaUpPos
+od6Y3lg/RqQyOKCVWbUla0f4iN1eZLPfO3/8foDVyknt9YkvCh3+/7WNKVeC/I/Y
+DGBbcOKcMT2gkwlTaSHEJUinWdCNo55CBGj/BLXAMPEh/TZ8fHhpgJ74lEihqCOO
+HgQ2NDQ=
+-----END ENCRYPTED PRIVATE KEY-----
+)";
+
+constexpr auto kEncryptedPkcs12Pbe = R"(-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIICojAcBgoqhkiG9w0BDAEDMA4ECEsvrOgGU9czAgIIAASCAoD3Y7qsIhCAec8l
+MFPg+UKIc8DA4ZpGBsXFyjgvIIA+LlZfmZXHRBk7+z3qELo2JE+8WKO9ZaNWqdIb
+w+7q9vjgu7OIUJ3r5HxEBrJPtKxoV7VuZKsW+hxd6Xk2Fni5ii6kE/AnaZG5b311
+cGt440/kVpgWcbrutKkdXs9DgInl/9g/PN/KKXWk8hqvOENuJNAkXd+cTGTqhul5
+NT/L2jTCTAOJ0dyf+Nby2kMvJi+xl7sSsomnXXF6PcZzCwp/040/T6iuYYZcKKou
+e9hvHR+G3H42DsBrWshF0TH3qXNGC6eo+bf8PKumrY62ak9nBKV5+VhGmqdjhGly
+fKx0JOSiEPY/2C1mK26KqyiT7UMUJN1CzGh8Sa3aiLO8wiXjy0BqZnlXQdlqWkFR
+BonA0wf67T7l5eCexwVX8owJmYItbAmT7JzD3gIWfxuB8b593y+tX7m4aSGcwQRU
+Reu6m8Ajeig2YE76HQiZ49c/l6hREcAGO9unCos2Ra1roEJ0hN0BrdPvqdNIJ3me
+JA44YZNqhfrjLnTEvx0b+TMapxp1GXV7tAJO2pbyNAS+fwJ8Yi6SJAkD5gRCufbF
+GmNVUJMuhRo/w4UcOIf+0kFvbhBCI4HjQ48pX88TJv328r2WFnkH+Sj2LAbQ3zOV
+4TjeLnT1x9t9vMrps0uCA/3oZMVQoC8ml/nDGl+7hnoD/OFd65eE9ifT+RJoRzp2
+3OlRxhefMLW/P7cX95HQ9ZG8wXs9qVQMniy7x8+lJQ3hfIkcsJ3+/Bujjhg/YsYu
+fBQ+UswpvVd4qmJwKteHwfug1t/BG220fxsL3nFeQGSyrG243VauyULdcItsz+iT
+b/hscQGl
+-----END ENCRYPTED PRIVATE KEY-----
+)";
 
 QString legacyPemKey(const QString &headers = QString())
 {
     return QStringLiteral("-----BEGIN RSA PRIVATE KEY-----\n") + headers
-           + QString::fromLatin1(kPemBody)
+           + QString::fromLatin1(headers.isEmpty() ? kPemBody : kEncryptedPemBody)
            + QStringLiteral("-----END RSA PRIVATE KEY-----\n");
 }
 
@@ -264,7 +382,15 @@ private slots:
     // Formats and damaged input.
     void describesALegacyPemKey();
     void reportsAnEncryptedLegacyPemKey();
-    void treatsDekInfoAloneAsEncrypted();
+    void describesARealEncryptedPkcs8Key();
+    void rejectsMalformedEncryptedPemContainers();
+    void rejectsMalformedPbkdf2Parameters();
+    void rejectsMalformedOrUnsupportedPbeEnvelopes();
+    void rejectsMalformedScryptParameters();
+    void rejectsInconsistentOpenSshEncryptionParameters();
+    void rejectsIncompletePemEncryptionHeaders();
+    void rejectsInvalidClearPrivateKeys();
+    void refusesOversizePastedText();
     void normalisesCrlfAndSurroundingText();
     void rejectsAnAlteredBase64Body();
     void acceptsAFileExactlyAtTheSizeCap();
@@ -338,6 +464,8 @@ void TestMobileKeyStore::init()
 
 void TestMobileKeyStore::describesAnOpensshKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     const auto description =
         MobileKeyStore::describeKeyText(QString::fromLatin1(kPlainKey));
     QVERIFY(description.valid);
@@ -355,6 +483,8 @@ void TestMobileKeyStore::describesAnOpensshKey()
 
 void TestMobileKeyStore::describesAnEncryptedKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     const auto description =
         MobileKeyStore::describeKeyText(QString::fromLatin1(kEncryptedKey));
     QVERIFY(description.valid);
@@ -456,6 +586,8 @@ void TestMobileKeyStore::refusesATruncatedOpenSshPrivateSection()
 
 void TestMobileKeyStore::importsAuthenticatedCipherKeys()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // Real ssh-keygen -t ed25519 -N mc-regression -Z <cipher> keys. OpenSSH
     // successfully decrypted each fixture; these are throwaway test identities.
     const char *keys[] = {
@@ -517,6 +649,8 @@ B110slVf6dCaidJpml/hFbfOs9vz3h2h3h5NrPXO0hD9EEwbpEgUR1RPURqYHc
 
 void TestMobileKeyStore::importsAKeyWithoutTouchingDisk()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     MobileKeyStore store(root());
     const QStringList before = filesUnder(root());
 
@@ -537,6 +671,8 @@ void TestMobileKeyStore::importsAKeyWithoutTouchingDisk()
 
 void TestMobileKeyStore::refusesADuplicateName()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     MobileKeyStore store(root());
     QVERIFY(store.importKeyFromText(QStringLiteral("dup"),
                                     QString::fromLatin1(kPlainKey)));
@@ -551,6 +687,8 @@ void TestMobileKeyStore::refusesADuplicateName()
 
 void TestMobileKeyStore::reportsAnEncryptedKeyAsSuch()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // An encrypted key must import: the UI needs it in hand to know a
     // passphrase is required, rather than discovering that at handshake time.
     MobileKeyStore store(root());
@@ -569,6 +707,8 @@ void TestMobileKeyStore::reportsAnEncryptedKeyAsSuch()
 
 void TestMobileKeyStore::referenceForAnInMemoryKeyIsEmpty()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // referenceFor() is the only value that leaves this class for persistence.
     // A pasted key has nothing durable to record, and an empty string is what
     // keeps key material out of the profile.
@@ -580,6 +720,8 @@ void TestMobileKeyStore::referenceForAnInMemoryKeyIsEmpty()
 
 void TestMobileKeyStore::forgetsAnImportedKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     MobileKeyStore store(root());
     QVERIFY(store.importKeyFromText(QStringLiteral("pasted"),
                                     QString::fromLatin1(kPlainKey)));
@@ -597,6 +739,8 @@ void TestMobileKeyStore::forgetsAnImportedKey()
 
 void TestMobileKeyStore::referencesAUserManagedFileWithoutCopyingIt()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     MobileKeyStore store(root());
     const QStringList before = filesUnder(root());
 
@@ -621,6 +765,8 @@ void TestMobileKeyStore::referencesAUserManagedFileWithoutCopyingIt()
 
 void TestMobileKeyStore::reAdoptsAReferenceFromAProfile()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // A remembered server still offers its key after a relaunch, which is the
     // whole reason the durable path exists.
     MobileKeyStore store(root());
@@ -650,6 +796,8 @@ void TestMobileKeyStore::refusesAReferenceThisDeviceCannotResolve()
 
 void TestMobileKeyStore::referencedKeyMaterialIsReadOnDemandOnly()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The reference is read once at pick time to report an unusable key early,
     // then dropped: deleting the user's file must make the credential
     // unavailable rather than silently using a cached copy.
@@ -669,6 +817,8 @@ void TestMobileKeyStore::referencedKeyMaterialIsReadOnDemandOnly()
 
 void TestMobileKeyStore::installsAnInMemoryIdentityOnThePool()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     ch::SshConnectionPool pool;
     MobileKeyStore store(root());
     store.setConnectionPool(&pool);
@@ -682,6 +832,8 @@ void TestMobileKeyStore::installsAnInMemoryIdentityOnThePool()
 
 void TestMobileKeyStore::changingPoolsDisarmsThePreviousIdentity()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     SshConnectionPool first;
     SshConnectionPool second;
     MobileKeyStore store(root());
@@ -704,6 +856,8 @@ void TestMobileKeyStore::changingPoolsDisarmsThePreviousIdentity()
 
 void TestMobileKeyStore::installsAReferencedIdentityOnThePool()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     ch::SshConnectionPool pool;
     MobileKeyStore store(root());
     store.setConnectionPool(&pool);
@@ -720,6 +874,8 @@ void TestMobileKeyStore::installsAReferencedIdentityOnThePool()
 
 void TestMobileKeyStore::anEmptyNameClearsThePoolIdentity()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // Switching to password auth must not leave the previous attempt's key
     // installed, or a connection aimed at one credential would be made with
     // another.
@@ -738,6 +894,8 @@ void TestMobileKeyStore::anEmptyNameClearsThePoolIdentity()
 
 void TestMobileKeyStore::removingTheInstalledKeyDisarmsThePool()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // "Remove" tells the user CodeHarbor will forget the key. The pool holds its
     // own copy of whatever was last installed, so forgetting has to reach in
     // there too — otherwise the bytes stay live for the rest of the run and
@@ -766,6 +924,8 @@ void TestMobileKeyStore::removingTheInstalledKeyDisarmsThePool()
 
 void TestMobileKeyStore::forgetSessionDropsEveryStoredSecret()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     ch::SshConnectionPool pool;
     MobileKeyStore store(root());
     store.setConnectionPool(&pool);
@@ -849,8 +1009,6 @@ void TestMobileKeyStore::takingAPassphraseErasesIt()
     // SPEC 12.1: one secret, one attempt. A retry has to ask again by
     // construction, not by whoever writes the retry remembering to.
     MobileKeyStore store(root());
-    QVERIFY(store.importKeyFromText(QStringLiteral("locked"),
-                                    QString::fromLatin1(kEncryptedKey)));
 
     store.armPassphrase(QStringLiteral("locked"),
                         QString::fromLatin1(kPassphrase));
@@ -865,8 +1023,6 @@ void TestMobileKeyStore::takingAPassphraseErasesIt()
 void TestMobileKeyStore::forgetPassphraseDropsItUnused()
 {
     MobileKeyStore store(root());
-    QVERIFY(store.importKeyFromText(QStringLiteral("locked"),
-                                    QString::fromLatin1(kEncryptedKey)));
     store.armPassphrase(QStringLiteral("locked"),
                         QString::fromLatin1(kPassphrase));
     store.forgetPassphrase();
@@ -876,15 +1032,10 @@ void TestMobileKeyStore::forgetPassphraseDropsItUnused()
 
 void TestMobileKeyStore::noPassphraseEverReachesDisk()
 {
-    ch::SshConnectionPool pool;
     MobileKeyStore store(root());
-    store.setConnectionPool(&pool);
 
-    QVERIFY(store.importKeyFromText(QStringLiteral("locked"),
-                                    QString::fromLatin1(kEncryptedKey)));
     store.armPassphrase(QStringLiteral("locked"),
                         QString::fromLatin1(kPassphrase));
-    QVERIFY(store.applyIdentityForConnect(QStringLiteral("locked")));
     QCOMPARE(store.takePassphrase(QStringLiteral("locked")),
              QString::fromLatin1(kPassphrase));
     store.forgetSession();
@@ -898,6 +1049,8 @@ void TestMobileKeyStore::noPassphraseEverReachesDisk()
 
 void TestMobileKeyStore::describesALegacyPemKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // libssh still loads these, so the client must too — and must be honest that
     // it cannot show a fingerprint for one: the format carries no public half in
     // the clear, so there is nothing to digest without parsing the private key.
@@ -917,7 +1070,7 @@ void TestMobileKeyStore::reportsAnEncryptedLegacyPemKey()
     // SURVIVE normalisation: libssh needs it to find the body at all.
     const auto description = MobileKeyStore::describeKeyText(
         legacyPemKey(QStringLiteral("Proc-Type: 4,ENCRYPTED\n"
-                                    "DEK-Info: AES-128-CBC,0123456789ABCDEF\n"
+                                    "DEK-Info: AES-128-CBC,44E66F5602241BEE4639C0EAAD722FE4\n"
                                     "\n")));
     QVERIFY2(description.valid, qPrintable(description.error));
     QVERIFY(description.encrypted);
@@ -926,22 +1079,298 @@ void TestMobileKeyStore::reportsAnEncryptedLegacyPemKey()
     QVERIFY(description.normalized.contains("\n\n"));
 }
 
-void TestMobileKeyStore::treatsDekInfoAloneAsEncrypted()
+void TestMobileKeyStore::describesARealEncryptedPkcs8Key()
 {
-    // A DEK-Info without its Proc-Type is malformed, but the header exists only to
-    // describe an encryption. Reporting such a key as unencrypted would hide the
-    // connect page's passphrase field and cost the user a failed authentication
-    // round before the ladder asked for a passphrase.
-    const auto description = MobileKeyStore::describeKeyText(
-        legacyPemKey(QStringLiteral("DEK-Info: AES-256-CBC,0123456789ABCDEF\n"
-                                    "\n")));
-    QVERIFY2(description.valid, qPrintable(description.error));
-    QVERIFY(description.encrypted);
-    QCOMPARE(description.kdf, QStringLiteral("AES-256-CBC"));
+    for (const char *key :
+         {kEncryptedPkcs8, kEncryptedScrypt, kEncryptedPbes1, kEncryptedPkcs12Pbe}) {
+        const auto description =
+            MobileKeyStore::describeKeyText(QString::fromLatin1(key));
+        QVERIFY2(description.valid, qPrintable(description.error));
+        QVERIFY(description.encrypted);
+        QCOMPARE(description.kdf, QStringLiteral("pkcs8"));
+    }
+}
+
+void TestMobileKeyStore::rejectsMalformedEncryptedPemContainers()
+{
+    MobileKeyStore store(root());
+    const QString header = QStringLiteral(
+        "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n");
+    const QString footer = QStringLiteral("-----END RSA PRIVATE KEY-----\n");
+    for (const QString &text : {
+             header + QStringLiteral("DEK-Info: AES-128-CBC,not-an-IV\n\n")
+                 + QString::fromLatin1(kEncryptedPemBody) + footer,
+             header + QStringLiteral("DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n")
+                 + QString::fromLatin1(kEncryptedPemBody) + footer,
+             header + QStringLiteral(
+                 "DEK-Info: AES-128-CBC,44E66F5602241BEE4639C0EAAD722FE4\n\nAAAA\n")
+                 + footer,
+             QStringLiteral("-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n"
+                            "-----END ENCRYPTED PRIVATE KEY-----\n")}) {
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), text));
+        QVERIFY(!store.lastError().isEmpty());
+    }
+
+    QByteArray encoded;
+    for (const QByteArray &line : QByteArray(kEncryptedPkcs8).split('\n')) {
+        if (!line.startsWith("-----"))
+            encoded += line.trimmed();
+    }
+    const QByteArray container = QByteArray::fromBase64(encoded);
+    QByteArray wrongAlgorithm = container;
+    const qsizetype oid = wrongAlgorithm.indexOf(
+        QByteArray::fromHex("06092a864886f70d01050d"));
+    QVERIFY(oid >= 0);
+    wrongAlgorithm[oid] = '\x04'; // An OCTET STRING is not an algorithm OID.
+    for (const QByteArray &damaged : {container.chopped(1),
+             container + QByteArrayLiteral("trailing bytes"), wrongAlgorithm}) {
+        const QString text = QStringLiteral("-----BEGIN ENCRYPTED PRIVATE KEY-----\n")
+            + QString::fromLatin1(damaged.toBase64())
+            + QStringLiteral("\n-----END ENCRYPTED PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), text));
+    }
+    QVERIFY(store.allKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::rejectsMalformedPbkdf2Parameters()
+{
+    // Deliberately invalid public envelopes, never positive fake-key fixtures.
+    const auto der = [](char tag, const QByteArray &body) {
+        return QByteArray(1, tag) + QByteArray(1, char(body.size())) + body;
+    };
+    const QByteArray salt = der('\x04', QByteArrayLiteral("salt"));
+    const QByteArray iteration = der('\x02', QByteArray(1, '\x01'));
+    const QByteArray cipher = der('\x30',
+        QByteArray::fromHex("060960864801650304012a")
+            + der('\x04', QByteArray(16, 'i')));
+    MobileKeyStore store(root());
+    for (const QByteArray &parameters : {
+             QByteArray(), salt, iteration,
+             salt + der('\x02', QByteArray(1, '\0')),
+             salt + der('\x02', QByteArray(1, '\xff')),
+             salt + iteration + der('\x02', QByteArray(1, '\0')),
+             salt + iteration + der('\x30', QByteArray())}) {
+        const QByteArray kdf = der('\x30',
+            QByteArray::fromHex("06092a864886f70d01050c") + der('\x30', parameters));
+        const QByteArray algorithm = der('\x30',
+            QByteArray::fromHex("06092a864886f70d01050d") + der('\x30', kdf + cipher));
+        const QByteArray blob = der('\x30', algorithm + der('\x04', QByteArray(16, 'c')));
+        const QString text = QStringLiteral("-----BEGIN ENCRYPTED PRIVATE KEY-----\n")
+            + QString::fromLatin1(blob.toBase64())
+            + QStringLiteral("\n-----END ENCRYPTED PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), text));
+    }
+    QVERIFY(store.allKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::rejectsMalformedOrUnsupportedPbeEnvelopes()
+{
+    const auto der = [](char tag, const QByteArray &body) {
+        return QByteArray(1, tag) + QByteArray(1, char(body.size())) + body;
+    };
+    const auto armor = [](const QByteArray &blob) {
+        return QStringLiteral("-----BEGIN ENCRYPTED PRIVATE KEY-----\n")
+            + QString::fromLatin1(blob.toBase64())
+            + QStringLiteral("\n-----END ENCRYPTED PRIVATE KEY-----\n");
+    };
+    const QByteArray salt = der('\x04', QByteArrayLiteral("12345678"));
+    const QByteArray iteration = der('\x02', QByteArray(1, '\x01'));
+    const QByteArray pbes1 = QByteArray::fromHex("06092a864886f70d010503");
+    const QByteArray pkcs12 = QByteArray::fromHex("060a2a864886f70d010c0103");
+    MobileKeyStore store(root());
+    for (const QByteArray &parameters : {
+             QByteArray(), salt,
+             der('\x04', QByteArrayLiteral("short")) + iteration,
+             salt + der('\x02', QByteArray(1, '\0')),
+             salt + iteration + der('\x05', QByteArray())}) {
+        const QByteArray algorithm = der('\x30', pbes1 + der('\x30', parameters));
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"),
+            armor(der('\x30', algorithm + der('\x04', QByteArray(16, 'c'))))));
+    }
+    QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), armor(der('\x30',
+        der('\x30', pkcs12 + der('\x30', QByteArray()))
+            + der('\x04', QByteArray(16, 'c'))))));
+
+    const QByteArray unknown = QByteArray::fromHex("06032a0304");
+    const QByteArray pbkdf2 = QByteArray::fromHex("06092a864886f70d01050c");
+    const QByteArray pbes2 = QByteArray::fromHex("06092a864886f70d01050d");
+    const QByteArray cipher = der('\x30',
+        QByteArray::fromHex("060960864801650304012a") + der('\x04', QByteArray(16, 'i')));
+    const QByteArray kdf = der('\x30', pbkdf2 + der('\x30', salt + iteration));
+    for (const QByteArray &algorithm : {
+             der('\x30', unknown + der('\x30', QByteArray())),
+             der('\x30', pbes2 + der('\x30',
+                 der('\x30', unknown + der('\x30', salt + iteration)) + cipher)),
+             der('\x30', pbes2 + der('\x30',
+                 kdf + der('\x30', unknown + der('\x04', QByteArray(16, 'i'))))),
+             der('\x30', pbes2 + der('\x30',
+                 der('\x30', pbkdf2 + der('\x30', salt + iteration
+                     + der('\x30', unknown + der('\x05', QByteArray())))) + cipher))}) {
+        QVERIFY(!store.importKeyFromText(QStringLiteral("unsupported"),
+            armor(der('\x30', algorithm + der('\x04', QByteArray(16, 'c'))))));
+        QVERIFY(store.lastError().contains(QStringLiteral("unsupported"), Qt::CaseInsensitive));
+    }
+    QVERIFY(!store.importKeyFromText(QStringLiteral("unsupported"),
+        legacyPemKey(QStringLiteral("Proc-Type: 4,ENCRYPTED\n"
+            "DEK-Info: FUTURE-CIPHER,44E66F5602241BEE4639C0EAAD722FE4\n\n"))));
+    QVERIFY(store.lastError().contains(QStringLiteral("unsupported"), Qt::CaseInsensitive));
+    QVERIFY(store.allKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::rejectsMalformedScryptParameters()
+{
+    const auto der = [](char tag, const QByteArray &body) {
+        return QByteArray(1, tag) + QByteArray(1, char(body.size())) + body;
+    };
+    const QByteArray salt = der('\x04', QByteArrayLiteral("salt"));
+    const QByteArray zero = der('\x02', QByteArray(1, '\0'));
+    const QByteArray one = der('\x02', QByteArray(1, '\x01'));
+    const QByteArray two = der('\x02', QByteArray(1, '\x02'));
+    const QByteArray negative = der('\x02', QByteArray(1, '\xff'));
+    const QByteArray limit = der('\x02', QByteArray::fromHex("40000000"));
+    const QByteArray oversized = der('\x02', QByteArray::fromHex("010000000000000000"));
+    const QByteArray tooMuchCost = der('\x02', QByteArray::fromHex("010000"));
+    const QByteArray cipher = der('\x30',
+        QByteArray::fromHex("060960864801650304012a")
+            + der('\x04', QByteArray(16, 'i')));
+    MobileKeyStore store(root());
+    for (const QByteArray &parameters : {
+             QByteArray(), salt, salt + two + one,
+             salt + zero + one + one, salt + one + one + one,
+             salt + der('\x02', QByteArray(1, '\x03')) + one + one,
+             salt + negative + one + one, salt + oversized + one + one,
+             salt + two + zero + one, salt + two + one + zero,
+             salt + two + limit + one, salt + two + one + limit,
+             salt + tooMuchCost + one + one,
+             salt + two + one + one + zero,
+             salt + two + one + one + negative,
+             salt + two + one + one + one + one,
+             der('\x05', QByteArray()) + two + one + one}) {
+        const QByteArray kdf = der('\x30',
+            QByteArray::fromHex("06092b06010401da47040b") + der('\x30', parameters));
+        const QByteArray algorithm = der('\x30',
+            QByteArray::fromHex("06092a864886f70d01050d") + der('\x30', kdf + cipher));
+        const QByteArray container = der('\x30',
+            algorithm + der('\x04', QByteArray(16, 'c')));
+        const QString text = QStringLiteral("-----BEGIN ENCRYPTED PRIVATE KEY-----\n")
+            + QString::fromLatin1(container.toBase64())
+            + QStringLiteral("\n-----END ENCRYPTED PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), text));
+    }
+    QVERIFY(store.allKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::rejectsInconsistentOpenSshEncryptionParameters()
+{
+    QByteArray encoded;
+    for (const QByteArray &line : QByteArray(kEncryptedKey).split('\n')) {
+        if (!line.startsWith("-----"))
+            encoded += line.trimmed();
+    }
+    const QByteArray container = QByteArray::fromBase64(encoded);
+    qsizetype offset = QByteArrayLiteral("openssh-key-v1").size() + 1;
+    const qsizetype cipherStart = offset + 4;
+    offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    const qsizetype kdfLengthOffset = offset;
+    const qsizetype kdfStart = offset + 4;
+    const quint32 kdfLength = qFromBigEndian<quint32>(container.constData() + offset);
+    offset += 4 + kdfLength;
+    const qsizetype optionsStart = offset + 4;
+    offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    offset += 4; // key count
+    offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    const qsizetype privateLengthOffset = offset;
+    const quint32 privateLength = qFromBigEndian<quint32>(container.constData() + offset);
+
+    QByteArray noKdf = container;
+    noKdf.replace(kdfStart, kdfLength, QByteArrayLiteral("none"));
+    qToBigEndian<quint32>(4, noKdf.data() + kdfLengthOffset);
+    QByteArray emptySalt = container;
+    qToBigEndian<quint32>(0, emptySalt.data() + optionsStart);
+    QByteArray zeroRounds = container;
+    const quint32 saltLength =
+        qFromBigEndian<quint32>(container.constData() + optionsStart);
+    qToBigEndian<quint32>(0, zeroRounds.data() + optionsStart + 4 + saltLength);
+    QByteArray unknownCipher = container;
+    unknownCipher.replace(cipherStart, 3, QByteArrayLiteral("bad"));
+    QByteArray partialBlock = container.chopped(1);
+    qToBigEndian<quint32>(privateLength - 1, partialBlock.data() + privateLengthOffset);
+    MobileKeyStore store(root());
+    for (const QByteArray &damaged :
+         {noKdf, emptySalt, zeroRounds, unknownCipher, partialBlock}) {
+        const QString text = QStringLiteral("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+            + QString::fromLatin1(damaged.toBase64())
+            + QStringLiteral("\n-----END OPENSSH PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken"), text));
+    }
+    QVERIFY(store.allKeyNames().isEmpty());
+}
+
+void TestMobileKeyStore::rejectsIncompletePemEncryptionHeaders()
+{
+    for (const QString &headers :
+         {QStringLiteral("DEK-Info: AES-128-CBC,44E66F5602241BEE4639C0EAAD722FE4\n\n"),
+          QStringLiteral("Proc-Type: 4,ENCRYPTED\n\n")}) {
+        const auto description = MobileKeyStore::describeKeyText(legacyPemKey(headers));
+        QVERIFY(!description.valid);
+        QVERIFY(!description.error.isEmpty());
+        QVERIFY(description.normalized.isEmpty());
+    }
+}
+
+void TestMobileKeyStore::rejectsInvalidClearPrivateKeys()
+{
+    MobileKeyStore store(root());
+    // Well-framed base64 containing a truncated RSA DER sequence is not a key.
+    const QString truncatedPem = QStringLiteral(
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n"
+        "-----END RSA PRIVATE KEY-----\n");
+    QVERIFY(!store.importKeyFromText(QStringLiteral("broken-pem"), truncatedPem));
+
+    QByteArray encoded;
+    for (const QByteArray &line : QByteArray(kPlainKey).split('\n')) {
+        if (!line.startsWith("-----"))
+            encoded += line.trimmed();
+    }
+    QByteArray container = QByteArray::fromBase64(encoded);
+    qsizetype offset = QByteArrayLiteral("openssh-key-v1").size() + 1;
+    for (int field = 0; field < 3; ++field)
+        offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    offset += 4;
+    offset += 4 + qFromBigEndian<quint32>(container.constData() + offset);
+    QByteArray wrongPublicKey = container;
+    // Still a valid ed25519 public blob, but it does not belong to this secret.
+    wrongPublicKey[offset - 1] = char(wrongPublicKey.at(offset - 1) ^ 1);
+    offset += 4; // private section length
+    // Break the paired check integers without changing any container lengths.
+    container[offset] = char(container.at(offset) ^ 1);
+    for (const QByteArray &damaged : {container, wrongPublicKey}) {
+        const QString brokenOpenSsh =
+            QStringLiteral("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+            + QString::fromLatin1(damaged.toBase64())
+            + QStringLiteral("\n-----END OPENSSH PRIVATE KEY-----\n");
+        QVERIFY(!store.importKeyFromText(QStringLiteral("broken-openssh"), brokenOpenSsh));
+    }
+    QVERIFY(store.allKeyNames().isEmpty());
+    QVERIFY(!store.lastError().isEmpty());
+    assertNoFileContains(root(), keyNeedle(), "a rejected private key");
+}
+
+void TestMobileKeyStore::refusesOversizePastedText()
+{
+    MobileKeyStore store(root());
+    QString text = QString::fromLatin1(kPlainKey);
+    text += QString(MobileKeyStore::kMaxKeyBytes, u'\n');
+    QVERIFY(!store.importKeyFromText(QStringLiteral("oversize"), text));
+    QVERIFY(store.allKeyNames().isEmpty());
+    QVERIFY(!store.lastError().isEmpty());
 }
 
 void TestMobileKeyStore::normalisesCrlfAndSurroundingText()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // What a user actually pastes: a key that came through a mail client, with
     // CRLF line endings, an indented first line and a signature after the end
     // marker. All of it has to come out as the exact bytes libssh is handed.
@@ -978,6 +1407,8 @@ void TestMobileKeyStore::rejectsAnAlteredBase64Body()
 
 void TestMobileKeyStore::acceptsAFileExactlyAtTheSizeCap()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The bound is inclusive, and it is enforced on what was READ rather than on
     // what the file claims: exactly kMaxKeyBytes goes through, one byte more does
     // not. Padding after the END marker is dropped by normalisation, which is what
@@ -1051,11 +1482,14 @@ void TestMobileKeyStore::registerReferenceRepairsAnUnusableName()
     QVERIFY2(MobileKeyStore::isUsableKeyName(name), qPrintable(name));
     QCOMPARE(store.referenceNames(), QStringList{name});
     QCOMPARE(store.referenceFor(name), m_userKeyPath);
-    QCOMPARE(store.keyFingerprint(name), QString::fromLatin1(kPlainFingerprint));
+    if (CH_HAVE_LIBSSH)
+        QCOMPARE(store.keyFingerprint(name), QString::fromLatin1(kPlainFingerprint));
 }
 
 void TestMobileKeyStore::registerReferenceDoesNotShadowASavedKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     QTemporaryDir appData;
     QVERIFY(appData.isValid());
     {
@@ -1083,14 +1517,28 @@ void TestMobileKeyStore::registerReferenceDoesNotShadowASavedKey()
 
 void TestMobileKeyStore::registerReferenceSuffixFitsAMaximumLengthName()
 {
-    MobileKeyStore store(root());
+    const QString secondPath = m_userStorage.filePath(QStringLiteral("second-key"));
+    QVERIFY(QFile::copy(m_userKeyPath, secondPath));
     const QString name(64, QLatin1Char('k'));
-    QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
-    const QString adopted = store.registerReference(m_userKeyPath, name);
-    QCOMPARE(adopted, name.left(62) + QStringLiteral("-2"));
-    QVERIFY(MobileKeyStore::isUsableKeyName(adopted));
-    QCOMPARE(store.referenceFor(adopted), m_userKeyPath);
-    QCOMPARE(store.keyNames(), QStringList{name});
+    for (bool inMemory : {false, true}) {
+        if (inMemory && !CH_HAVE_LIBSSH)
+            continue; // The reference-only collision needs no native parser.
+        MobileKeyStore store(root());
+        if (inMemory) {
+            QVERIFY(store.importKeyFromText(name, QString::fromLatin1(kPlainKey)));
+        } else {
+            QCOMPARE(store.registerReference(m_userKeyPath, name), name);
+        }
+        const QString adopted = store.registerReference(secondPath, name);
+        QCOMPARE(adopted, name.left(62) + QStringLiteral("-2"));
+        QVERIFY(MobileKeyStore::isUsableKeyName(adopted));
+        QCOMPARE(store.referenceFor(adopted), secondPath);
+        QVERIFY(store.referenceNames().contains(adopted));
+        if (inMemory)
+            QCOMPARE(store.keyNames(), QStringList{name});
+        else
+            QVERIFY(store.referenceNames().contains(name));
+    }
 }
 
 void TestMobileKeyStore::registerReferenceRefusesAnEmptyReference()
@@ -1109,6 +1557,8 @@ void TestMobileKeyStore::registerReferenceRefusesAnEmptyReference()
 
 void TestMobileKeyStore::refusesAReferenceWhoseFileStoppedBeingAKey()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The resolvable check at pick time and the read at connect time are separated
     // by however long the user's session lasts, and the file belongs to the user:
     // it can be replaced with anything in between. The read validates again rather
@@ -1145,9 +1595,11 @@ void TestMobileKeyStore::describeTextNeverReturnsKeyBytes()
     MobileKeyStore store(root());
     const QVariantMap described =
         store.describeText(QString::fromLatin1(kPlainKey));
-    QCOMPARE(described.value(QStringLiteral("valid")).toBool(), true);
-    QCOMPARE(described.value(QStringLiteral("fingerprint")).toString(),
-             QString::fromLatin1(kPlainFingerprint));
+    QCOMPARE(described.value(QStringLiteral("valid")).toBool(), CH_HAVE_LIBSSH != 0);
+    if (CH_HAVE_LIBSSH) {
+        QCOMPARE(described.value(QStringLiteral("fingerprint")).toString(),
+                 QString::fromLatin1(kPlainFingerprint));
+    }
     for (auto it = described.cbegin(); it != described.cend(); ++it) {
         QVERIFY2(!it.value().toString().toLatin1().contains(keyNeedle()),
                  qPrintable(it.key()));
@@ -1193,14 +1645,18 @@ void TestMobileKeyStore::sessionOnlyFallbackIsOfferedOnlyForADurabilityFailure()
 
     // A durable reference to a plain path always succeeds on this platform, so the
     // flag stays false after a SUCCESS too — it describes a failure, not a state.
-    QCOMPARE(store.addReferenceFromFile(QUrl::fromLocalFile(m_userKeyPath),
-                                        QStringLiteral("mine")),
-             QStringLiteral("mine"));
-    QVERIFY(!store.lastFailureAllowsSessionOnly());
+    if (CH_HAVE_LIBSSH) {
+        QCOMPARE(store.addReferenceFromFile(QUrl::fromLocalFile(m_userKeyPath),
+                                            QStringLiteral("mine")),
+                 QStringLiteral("mine"));
+        QVERIFY(!store.lastFailureAllowsSessionOnly());
+    }
 }
 
 void TestMobileKeyStore::nothingReachesThePerAppSandboxEither()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The leak checks elsewhere walk the store's own rootDirectory, which proves
     // nothing about an implementation that derived a keys directory from
     // QStandardPaths instead — the one place a mobile app would naturally put it.
@@ -1235,6 +1691,8 @@ void TestMobileKeyStore::nothingReachesThePerAppSandboxEither()
 
 void TestMobileKeyStore::savesAPastedKeyForTheNextLaunch()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The whole point of the third path: a key that was PASTED once is offered
     // again by a store built from scratch over the same app-data directory —
     // which is what a relaunch is — and can still authenticate.
@@ -1287,6 +1745,8 @@ void TestMobileKeyStore::savesAPastedKeyForTheNextLaunch()
 
 void TestMobileKeyStore::aSavedKeyIsOwnerOnlyAndSoIsItsFolder()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
 #ifndef Q_OS_UNIX
     QSKIP("POSIX modes only: QFile::permissions() synthesises these bits from an "
           "ACL on Windows, so the same assertion would describe nothing real.");
@@ -1326,6 +1786,8 @@ void TestMobileKeyStore::aSavedKeyIsOwnerOnlyAndSoIsItsFolder()
 
 void TestMobileKeyStore::savingIsNeverImplicit()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // SPEC 11.2 admits the copy only for a key the user explicitly asked to keep.
     // So an ordinary import — the default path, and the one nearly every user
     // takes — must leave the device with no keys directory at all, never mind a
@@ -1365,8 +1827,10 @@ void TestMobileKeyStore::refusesToSaveAKeyItWouldHaveToBuildAPathFor()
     QTemporaryDir appData;
     QVERIFY(appData.isValid());
     MobileKeyStore store(appData.path());
-    QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
-                                    QString::fromLatin1(kPlainKey)));
+    if (CH_HAVE_LIBSSH) {
+        QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                       QString::fromLatin1(kPlainKey)));
+    }
 
     for (const QString &name : {QStringLiteral("../evil"),
                                 QStringLiteral("../../evil"),
@@ -1389,8 +1853,10 @@ void TestMobileKeyStore::refusesToSaveAKeyItWouldHaveToBuildAPathFor()
 
     // The refusal is about the NAME, not about the key: the same store still
     // saves the key it does have.
-    QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
-             qPrintable(store.lastError()));
+    if (CH_HAVE_LIBSSH) {
+        QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+                 qPrintable(store.lastError()));
+    }
 }
 
 void TestMobileKeyStore::refusesToSaveAReferencedKey()
@@ -1402,8 +1868,7 @@ void TestMobileKeyStore::refusesToSaveAReferencedKey()
     QTemporaryDir appData;
     QVERIFY(appData.isValid());
     MobileKeyStore store(appData.path());
-    QCOMPARE(store.addReferenceFromFile(QUrl::fromLocalFile(m_userKeyPath),
-                                        QStringLiteral("mine")),
+    QCOMPARE(store.registerReference(m_userKeyPath, QStringLiteral("mine")),
              QStringLiteral("mine"));
 
     QVERIFY(!store.saveKeyOnDevice(QStringLiteral("mine")));
@@ -1417,6 +1882,8 @@ void TestMobileKeyStore::refusesToSaveAReferencedKey()
 
 void TestMobileKeyStore::forgetSessionKeepsASavedKeyAndWipesTheSessionOne()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // "Disconnect" is not "delete my key". A saved key survives it — that is what
     // saving means — while the session-only key beside it is wiped, which is what
     // NOT saving means.
@@ -1461,6 +1928,8 @@ void TestMobileKeyStore::forgetSessionKeepsASavedKeyAndWipesTheSessionOne()
 
 void TestMobileKeyStore::forgetSavedKeyDeletesTheFileFromDisk()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // The surface that offers to keep a key also offers to delete it, and
     // "delete" has to mean the file is gone — not merely dropped from a list that
     // the next launch's directory scan would repopulate.
@@ -1508,6 +1977,8 @@ void TestMobileKeyStore::forgetSavedKeyDeletesTheFileFromDisk()
 
 void TestMobileKeyStore::removeKeyDeletesTheSavedFileToo()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // removeKey() is the general "forget this key". Leaving the saved file behind
     // would resurrect at the next launch exactly the credential the user just
     // removed, which is the worst possible reading of "forget".
@@ -1532,6 +2003,8 @@ void TestMobileKeyStore::removeKeyDeletesTheSavedFileToo()
 
 void TestMobileKeyStore::savingAKeyPutsNothingInQSettings()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     // SPEC 11.2 permits the copy in ONE place: a file in app-private storage that
     // the user asked for. A profile still carries a reference or nothing, and no
     // key byte may reach the settings store, a cache or a stray temporary. So the
@@ -1582,6 +2055,8 @@ void TestMobileKeyStore::savingAKeyPutsNothingInQSettings()
 
 void TestMobileKeyStore::aFailedSavedKeyDeletionCanBeRetried()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     for (bool remove : {false, true}) {
         QTemporaryDir data;
         QVERIFY(data.isValid());
@@ -1616,6 +2091,8 @@ void TestMobileKeyStore::aFailedSavedKeyDeletionCanBeRetried()
 
 void TestMobileKeyStore::forgettingAnAlreadyRemovedSavedKeySucceeds()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
     QTemporaryDir data;
     QVERIFY(data.isValid());
     MobileKeyStore store(data.path());
@@ -1630,6 +2107,8 @@ void TestMobileKeyStore::forgettingAnAlreadyRemovedSavedKeySucceeds()
 
 void TestMobileKeyStore::anUnsearchableSavedKeyDirectoryDoesNotImplyDeletion()
 {
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
 #ifndef Q_OS_UNIX
     QSKIP("POSIX directory search permissions are required.");
 #else

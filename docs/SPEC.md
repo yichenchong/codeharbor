@@ -21,13 +21,23 @@ Each workspace, called a **Dev Session**, normally corresponds to one repository
 - optional agent-status integration;
 - persistent session metadata and UI state.
 
-The application uses a fixed three-region layout:
+The desktop application uses a fixed three-region layout:
 
 1. **Sessions sidebar**
 2. **Viewer region**
 3. **Terminal region**
 
 All development files, commands, processes, repositories, terminals, tmux sessions, and authoritative session state live on a configured SSH server. The client machine provides only the user interface, rendering, input handling, and transport.
+
+**Presentation scope.** Unless a section explicitly says otherwise, the three-region
+layout, xterm.js, Monaco, WebEngine profiles and desktop shortcuts below describe
+the desktop client. The Android/iOS client shares the same remote service and C++
+backend, but presents one selected viewer or terminal at a time from the saved
+layout trees. It uses native Qt Quick viewers/editor and an in-process terminal
+emulator (`src/mobile`, `src/vt`), not WebEngine. The server-side identity,
+persistence, file and security contracts apply to both clients. Mobile build,
+capability and navigation constraints are documented in
+[`DEVELOPMENT.md`](DEVELOPMENT.md#mobile-clients-android--ios).
 
 ---
 
@@ -69,7 +79,7 @@ Persistence is provided by tmux on the remote SSH server.
 
 ### 2.3 Fixed outer layout
 
-The application always contains the same three outer regions:
+The desktop application always contains the same three outer regions:
 
 ```text
 ┌────────────────┬──────────────────────────────┬──────────────────────────┐
@@ -186,13 +196,20 @@ Because a viewer pane is a browser, it carries the four controls a browser has: 
 **Reload** and **Home**, beside the address field. Each pane keeps its OWN history of what it has shown;
 splitting produces a pane with an empty one. Navigating somewhere new truncates whatever was ahead, exactly as
 a browser does, and Back/Forward are disabled at the ends of the history rather than silently doing nothing.
-Reload re-fetches the resource currently shown for EVERY handler kind, not only for web pages: a handler with
-no reload primitive of its own (an image, a directory listing, a binary preview) is recreated, so stale content
-cannot survive a reload. Home goes to the active Dev Session's repository root and is disabled when there is no
-active session. There is no separate "open this address" button — the address field navigates on Enter.
+Reload refreshes the currently shown handler, not only web pages. A handler without
+its own reload primitive is recreated; an editor's RAM-preserving page reload
+instead retains its buffer, revision and dirty/pending-save state (§8.1), rather
+than rereading the remote file. Home goes to the active Dev Session's repository
+root and is disabled when there is no active session. There is no separate "open
+this address" button — the address field navigates on Enter.
 
 History is per pane and in memory. It is deliberately NOT persisted to the workspace: where a pane has BEEN is
 not workspace state, and a second client has no use for it.
+
+An empty viewer region may show a placeholder without a persisted pane identity.
+Entering an address or using its "Open as" action materializes a real viewer leaf
+with a nonempty persisted pane id before saving its target, so the file reopens
+after a session switch or relaunch rather than existing only in the placeholder.
 
 ### 3.4 Terminal Pane
 
@@ -411,17 +428,13 @@ Possible operations:
 - **Reconnect:** reattach to the same tmux target.
 
 **Pane controls belong to the PANE.** Splitting and closing are offered on each
-pane's own header, and each acts on the pane whose header was used. They are
-deliberately not region-level controls acting on "the focused pane": with
-several panes open, the pane a region-level button would act on is a guess, and a
-wrong guess splits or closes something the user was not looking at. Because
-closing a terminal pane is now irreversible, that guess would destroy running
-remote work, so there is no palette command to kill a terminal at all: the
-palette's "Close Focused Terminal Pane" removes the pane and leaves its session
-running, and of the terminal region's own controls only the pane's own button —
-which names itself — kills. Closing a
-terminal pane is confirmed before it happens; closing a viewer pane is not,
-because it destroys nothing on the server.
+pane's header so the action names that pane, not a remembered focus guess. The
+palette's **Close and Kill Focused Terminal Pane** resolves the focused pane and
+uses the same confirmed close-and-kill path; there is no separate standalone kill
+command. Closing a terminal destroys its remote tmux session only after that
+confirmation. User-facing viewer close also asks before discarding modified,
+saving or conflicted editor work; a clean viewer closes directly. The agent
+viewer-control close is a deliberately direct operation (§6.8).
 
 ### 4.5 Split Trees
 
@@ -443,6 +456,14 @@ it belongs to plus a monotonic load generation. A write stamped for a session th
 discarded silently — replaying it would corrupt the tree the user is now looking at, and it is not an error the
 user did anything about. A write stamped for the CURRENT session that arrives before its tree does is queued and
 applied when the tree lands. A region whose layout genuinely cannot be loaded still reports that, as before.
+
+Missing layouts are initialized through `workspace.ensureInitialLayout`, not a
+client-side sequence of terminal creation and layout replacement. The daemon
+creates initial terminal rows and their layout in one transaction, and returns an
+already-stored region unchanged if another client initialized it first. An
+explicitly stored empty or null tree is still an existing layout, not permission
+to reseed it. Clients adopt the returned authoritative tree and identities. This
+operation is part of the current required RPC schema 10 (§10.3); the workspace database remains schema 5.
 
 **The pane the user was last working in is remembered per Dev Session**, and
 restored when that session is opened again, so reopening a session puts the
@@ -590,11 +611,17 @@ tmux new-session -A \
   -c '/remote/working/directory' \
   -e 'OMP_DEV_SESSION_ID=<dev-session-uuid>' \
   -e 'OMP_TERMINAL_ID=<terminal-uuid>' \
+  -e 'CODEHARBOR_CONTROL_SOCKET=<window-control-socket>' \
+  -e 'CODEHARBOR_AGENT_SOCKET=<accepted-agent-socket>' \
   \; set-option -t '=ch_<dev-session-uuid>_<terminal-uuid>:' mouse on \
   \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
       OMP_DEV_SESSION_ID '<dev-session-uuid>' \
   \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
-      OMP_TERMINAL_ID '<terminal-uuid>'
+      OMP_TERMINAL_ID '<terminal-uuid>' \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      CODEHARBOR_CONTROL_SOCKET '<window-control-socket>' \
+  \; set-environment -t '=ch_<dev-session-uuid>_<terminal-uuid>:' \
+      CODEHARBOR_AGENT_SOCKET '<accepted-agent-socket>'
 ```
 
 Stable IDs should be used for tmux names rather than user-facing display names.
@@ -603,17 +630,27 @@ PANE IDENTITY IN THE ENVIRONMENT. The two `OMP_*` variables are how an agent hoo
 says which pane it is in: `remote/src/hooks/oh-my-pi-hook.ts` reads exactly these
 two names, and an event that arrives without them names no pane and is dropped.
 They are passed to the command builder as values, never parsed back out of the
-tmux target — the target is a formatted name, not a data source. Both are
-exported or neither is: a hook needs both halves.
+tmux target — the target is a formatted name, not a data source. A nonempty
+provenance pair requires both IDs; if either is missing, both IDs and both route
+variables are suppressed rather than borrowing another pane's identity.
+The required `server.info.agentSocket` supplies the accepted producer endpoint as
+`CODEHARBOR_AGENT_SOCKET` for both new-session `-e` and session `set-environment`.
+The client does not overwrite user HOME/XDG settings or the global tmux environment.
 
-This does NOT retrofit a pane that is already running. `new-session -e` applies
-at session creation, and the command uses `-A`, so an attach to a session that
-already exists ignores every `-e`; the `set-environment` commands correct that
-session's environment, but a variable set now reaches only processes started
-afterwards, never the shell tmux is already running or an agent already running
-in it. Both limits verified on tmux 3.6. So the variables reach newly created
-sessions, new windows and panes, and agents started after the attach — an
-already-live agent keeps whatever environment it was forked with.
+All four managed variables are passed with `new-session -e` before the first
+shell can fork. An unavailable value is explicitly `NAME=`, not an omitted `-e`,
+so a stale tmux-master value cannot leak into that initial shell. For later
+tmux-created children, the session receives each exact available value or
+`set-environment -r NAME` for a missing one. Plain `-u` is not sufficient because
+it would reveal a stale master/global fallback. No global environment is changed.
+
+This does NOT retrofit running processes. `new-session -e` applies at creation;
+with `-A`, attaching to an existing session ignores those `-e` options. Session
+`set-environment` updates only future children spawned by tmux. A new program
+forked by an already-running shell still inherits that shell's old environment,
+even if the program itself was started after reattachment. A mismatched old shell
+therefore needs a new tmux-created shell, window or session; restarting the agent
+inside that same old shell is not a repair. Already-running agents are unchanged.
 
 The server owns the target string. Terminal targets supplied through the
 workspace RPC are accepted only when they are 1–200 characters from
@@ -881,16 +918,37 @@ which the harness treats as "block this tool call".
 
 ### 6.3 Remote Agent Bridge
 
-A small remote helper should receive harness events and forward them to the Qt client.
+A shared remote relay receives harness events over one per-user Unix socket.
+Each connected CodeHarbor window runs its own `codeharbor-bridge` stdout proxy;
+the proxy subscribes to that relay and SSH forwards its JSONL stream to the
+window's AgentStatusMonitor.
 
 ```text
 Oh My Pi extension ───────┐
-Pi extension ─────────────┼── Unix socket ── codeharbor-bridge
-Claude Code hooks ────────┘                       │
-                                                 │ JSONL over SSH
-                                                 ▼
-                                      AgentStatusMonitor
+Pi extension ─────────────┼── Unix socket ── shared event relay
+Claude Code hooks ────────┘                       ├── bridge proxy ── SSH ── window A
+                                                 └── bridge proxy ── SSH ── window B
 ```
+
+The first proxy starts the relay if necessary; concurrent starts elect one socket
+owner. The relay is independent of that first window's SSH channel. Closing or
+losing one proxy does not close another reader, its producer connections, or the
+shared socket. After its last reader leaves, the relay shuts down after a bounded
+idle timeout; producer traffic alone does not keep a readerless relay alive.
+
+Every reader receives subsequent validated events and applies its existing
+workspace filtering. There is no event history or replay guarantee. Reader queues
+are bounded, and a slow or failed reader is retired independently rather than
+blocking all windows. The event schema is unchanged; opening another window does
+not require restarting an already-correctly-routed producer or changing its
+environment.
+
+Reader subscription uses a separate versioned handshake and acknowledgement,
+not a producer event. A still-running older single-output bridge cannot serve
+new subscribers: connection fails with an explicit upgrade/restart diagnostic
+rather than claiming healthy delivery. Upgrade or restart that older owning
+connection; never remove its live socket or terminate an unrelated process to
+make another window connect.
 
 Suggested socket:
 
@@ -903,6 +961,19 @@ Fallback:
 ```text
 ~/.cache/codeharbor/events.sock
 ```
+
+The required `server.info.agentSocket` reports the actual shared relay endpoint,
+using the same production resolver as the bridge. A current accepted server must
+supply a nonempty absolute pathname without NUL; missing or invalid metadata is
+incompatible. No endpoint is guessed from a control socket, recovery directory or
+profile. Accepted endpoint metadata is cleared on retirement before readiness can
+reopen, and TerminalFactory propagates it as `CODEHARBOR_AGENT_SOCKET`.
+
+Resolution first honors a valid explicit `CODEHARBOR_AGENT_SOCKET`; only when it
+is absent do the XDG/HOME defaults above apply. A present invalid override fails
+without falling back to another socket. This is a shared producer route, not the
+per-window viewer-control socket (§6.8), and needs no new event-schema version.
+The running-shell inheritance limits in §5.2 still apply.
 
 ### 6.4 Internal Event Schema
 
@@ -933,6 +1004,14 @@ that exact key — the shared `pi-family.ts` mapping handles the Pi and Oh My Pi
 adapters' `tool` field, and `claude-code.ts` renames the harness's `tool_name`
 to it. An adapter that picks a different key compiles, validates and relays
 fine, and the client simply never sees a tool name.
+
+Bridge output is bounded to a 1 MiB JSON payload (excluding its newline) and
+1024 nested containers, counting the event envelope, to match the Qt consumer's
+JSON parser. If optional decoration exceeds either bound, the relay removes
+`metadata` first, then `summary`, preserving the core state event where possible.
+An unencodable event or one still over the bounds without optional fields is
+dropped rather than sent as an unreadable frame. This is an agent-bridge output
+compatibility limit, not a new nesting limit on workspace, RPC or viewer control.
 
 Supported states:
 
@@ -1080,6 +1159,15 @@ an event created it has never been registered from the tree, so registering it �
 as `generic` first, and as the observed adapter once the write lands — must not
 discard what the wire already said about it.
 
+Newly minted or rediscovered terminal rows must reach the creating client's
+sidebar/agent registrations without a reconnect. After a current-session ordinary
+mint, atomic initial-layout winner, or legacy-row discovery succeeds,
+`SessionLayouts::terminalRowsChanged` triggers an authoritative workspace-metadata
+reread. The controller does not invent a local row: registration reconciles early
+and late adapter observations against the server's row and harness metadata.
+This refresh does not reload the layout, advance pane ownership/reset generation,
+or replace live panes just to update their sidebar state.
+
 `generic` is the ONLY value an observation may overwrite. A NULL or empty harness
 is the user's "plain shell" — they have said this pane is not an agent, so
 nothing may relabel it on their behalf. That governs where the pane's state may
@@ -1130,12 +1218,17 @@ agent tool (codeharbor-mcp / codeharbor-view)
   -> the Unix socket named by $CODEHARBOR_CONTROL_SOCKET in the pane, which is
      $XDG_RUNTIME_DIR/codeharbor-control-<token>.sock (or, with no runtime
      directory, ~/.cache/codeharbor/codeharbor-control-<token>.sock), bound by
-     THIS window's codeharbord at 0600 under a 0700 directory
+     THIS window's codeharbord with socket permissions enforced as 0600
   -> `viewer.command` id-less JSON-RPC notification on the RPC channel
   -> ch::ViewerCommandService -> Main.qml -> ViewerRegion / SessionLayouts
   -> `viewer.commandResult` request back to codeharbord
   -> the answer on the agent's still-open socket connection
 ```
+
+New socket directories are requested with mode 0700, but an existing runtime or
+cache directory is not made private by recursive directory creation. The listener
+therefore refuses startup if it cannot enforce 0600 on the socket itself.
+The daemon can continue serving file and terminal operations without viewer control.
 
 The bridge channel (6.3) is deliberately NOT used: it is a one-way status relay whose stdin
 is a lifetime watchdog, so nothing can travel client -> server on it, and a pane command
@@ -1152,6 +1245,11 @@ close   { pane? }                              -> { paneId }
 focus   { pane? }                              -> { paneId }
 reload  { pane? }                              -> { paneId }
 ```
+
+The agent `close` operation removes the pane directly, without the user-facing
+unsaved-editor confirmation. Agent skills must ask before closing a pane that may
+hold the user's unsaved work; using the same layout mutation does not imply the
+same confirmation step.
 
 `url` accepts an `http(s)://` address, a `file://` URL naming a file on the SERVER (2.4), or
 a remote path — relative paths resolve against the Dev Session's repository root (7.1), and
@@ -1195,10 +1293,12 @@ Five rules bound what an agent can do:
 
 ONE CASE IS INHERENTLY AMBIGUOUS, and is documented rather than papered over. A tmux target
 is server-minted and may be attached by two windows at once (5.2), which is the same terminal
-pane shown twice. tmux's environment is per SESSION, so the window that attached LAST owns
-`$CODEHARBOR_CONTROL_SOCKET` for agents started after it, and an agent started earlier keeps
-the socket it was given. There is no "own window" for such a pane — both windows are showing
-it — so last-attach-wins is the rule, not a defect. What the per-window socket does remove is
+pane shown twice. tmux's environment is per SESSION, so the last attaching window
+sets `$CODEHARBOR_CONTROL_SOCKET` for future tmux-created children. Existing
+shells and agents retain their own environment; launching another agent from an
+old shell does not update that socket. There is no unique "own window" when both
+show the same terminal; last-attach-wins governs new tmux children, not retroactive
+changes to running processes. What the per-window socket does remove is
 the case that IS a defect: a pane belonging to one window's own session reaching another
 window. A deterministic answer for the shared case would need per-client tmux targets, which
 would give up the shared-session behaviour 5.2 exists for.
@@ -1361,7 +1461,7 @@ Text-based remote files should be editable in an embedded editor, preferably Mon
 ```text
 Qt WebEngine
     ↕ Qt WebChannel
-RemoteEditorBridge
+Document-scoped EditorBridge adapter
     ↕
 CodeHarbor Remote File Service
     ↕
@@ -1369,6 +1469,40 @@ Server filesystem
 ```
 
 Monaco should provide syntax highlighting, find and replace, multiple cursors, folding, bracket matching, minimap, and future diagnostics integration.
+
+Each trusted Monaco document receives a fresh `EditorPageBridge` adapter from its
+controller, registered under a unique object name before opening or navigating.
+The bundle URL names that adapter with `bridge=<id>`; there is no shared `"editor"`
+alias. Retiring a document permanently disconnects its adapter's signals and
+actions, so delayed callbacks cannot save to or receive contents from a replacement
+file. Native editor callers continue to use the controller directly.
+A fresh WebChannel is created for each replacement document, with its adapter
+registered before binding the channel to the view. The old channel and its
+document adapter are retired together.
+
+A host-initiated renderer-page reload captures BOM/EOL-preserving buffer text in
+memory before retiring the old page. It creates a fresh adapter without reopening
+the remote file; readiness restores the buffer against the controller's current
+baseline, revision and pending-save state, including saves settled during navigation.
+The JavaScript-result boundary carries JSON-encoded capture text, decoded by the
+host before restoration; returning raw text there can lose its leading BOM in
+Qt's string conversion.
+An asynchronous capture is admitted only while its recovery-context revision
+still matches; a scope change during the capture cannot supply text to a new scope.
+The retained RAM buffer survives failed, stopped or interrupted replacement pages;
+delivery of a restoration signal alone does not consume it. A retry may reuse that
+buffer without another DOM capture or reopening the remote file. It is released
+only when known clean/saved, explicitly retargeted or content-reloaded, or destroyed.
+This renderer-page restoration is distinct from choosing the conflict notice's
+remote-file Reload action.
+
+The pane toolbar may invoke reload while dirty only when the actual handler has a
+`reload` function and `reloadPreservesDirtyContent === true`. `EditorPaneView`
+explicitly opts in to this RAM-preserving path. Ordinary navigation, handler
+replacement, non-preserving reload and destructive fallback paths retain their
+existing guards; closing or explicitly reverting work retains its existing
+confirmation/user-choice policy. This exception does not turn Reload into a
+save, remote-file revert or permission to discard an unsaved buffer.
 
 ### 8.2 File States
 
@@ -1386,6 +1520,22 @@ Read-only
 Error
 Disconnected
 ```
+
+**Leaving unsaved work.** User-initiated desktop actions that replace or retire
+the current workspace — session switching or retry, archiving the active session,
+server connect/disconnect/update and window close — ask before discarding modified,
+saving or conflicted editor buffers. The dialog offers Discard and Cancel, with
+Cancel as the default; saving remains an explicit action the user can take first.
+The deferred action is bound to the original session and layout generation, so
+accepting an old dialog cannot act on a replacement workspace. This is distinct
+from automatic reconnect and from the direct agent viewer-close operation (§6.8).
+
+Automatic reconnect to the same server and Dev Session refreshes layout requests
+without resetting pane ownership. When the authoritative trees are unchanged,
+the existing editor pane and its dirty RAM buffer remain alive. This does not
+promise to preserve a pane removed by an authoritative remote layout, or buffers
+when the server/session actually changes. An explicit, consented same-session
+load still performs its normal pane reset.
 
 Unsaved-file state should appear both in the pane header and in the Dev Session row.
 
@@ -1461,16 +1611,26 @@ Saving should be atomic:
 1. verify the expected revision;
 2. create a temporary file in the same directory;
 3. write the new contents;
-4. flush the file;
-5. preserve mode and relevant metadata;
-6. rename the temporary file over the original;
+4. preserve mode and relevant metadata;
+5. flush the file and its metadata;
+6. publish atomically: rename over an existing file, or use a no-clobber hard link for a create-only save;
 7. return the new revision.
 
 The returned revision belongs to the file actually written. The service keeps
-that file open across the rename and reads its metadata through the open handle,
+that file open across publication and reads its metadata through the open handle,
 not through a fresh lookup of the requested path. A concurrent path replacement
 or symlink change must not supply another file's revision and allow a later save
 to overwrite content the editor never loaded.
+
+A create-only save (`expectedRevision: ""`) publishes the flushed temporary inode
+with a same-directory hard link and then removes the temporary name. A competing
+creation produces a revision mismatch rather than being overwritten. This requires
+a filesystem that supports hard links; unsupported filesystems fail visibly rather
+than falling back to a clobbering rename.
+
+Existing-file replacement still uses a final revision check followed by rename.
+Those two operations are not an atomic compare-and-replace against unrelated
+external writers; the check narrows, but cannot eliminate, that last race window.
 
 ### 8.6 Conflict Handling
 
@@ -1493,17 +1653,16 @@ CodeHarbor must never silently overwrite a changed remote file.
 
 ### 8.7 Remote File Watching
 
-File watching should run on the server.
+File watching runs on the server, with polling as a fallback.
 
-Behavior:
+The editor subscribes to changes: clean buffers may reload automatically, while
+dirty buffers report divergence without replacing unsaved work. Watch-loss
+notifications also cause the editor to reconcile its file state.
 
-- clean buffers may reload automatically;
-- dirty buffers show a conflict warning;
-- Markdown previews refresh;
-- images and PDFs refresh;
-- directory listings update.
-
-Polling may be used as a fallback.
+Automatic watch-driven refresh for Markdown previews, images, PDFs and directory
+listings remains planned. Those desktop viewers currently refresh through the
+pane's explicit Reload action, not through a live source subscription. A Markdown
+theme change re-renders its cached source; it does not fetch changed file bytes.
 
 Watch changes are sent as the id-less `file.watchEvent` notification. If the
 client stops reading, the daemon coalesces pending events by subscription and
@@ -1596,7 +1755,6 @@ need to remain running between SSH sessions.
 - file reads and writes;
 - file watching;
 - directory listings;
-- MIME detection;
 - tmux discovery, including each pane's last-output time (§ 6.6);
 - agent-status events;
 - session recovery.
@@ -1621,6 +1779,15 @@ channel's stdin/stdout. The rules below are the ones the implementation
 - **Frames are bounded.** An input or output JSON line over 16 MiB is not
   accepted; the daemon drops the transport instead of buffering an unbounded
   request or response.
+- **Native-client JSON depth is narrower than server storage.** Qt's
+  `QJsonDocument` accepts at most 1024 nested containers, counting the complete
+  RPC envelope, and rejects a 1025th container. A native client rejects such a
+  frame, fails its pending calls and retires that transport; it does not truncate
+  the value or continue consuming trailing frames from the rejected channel.
+  The stack-safe Node encoder and opaque workspace storage do not impose that
+  same nesting cap. JSON a Node client can store and read is therefore not
+  necessarily loadable by the native Qt client; normalize or remove unsupported
+  deeply nested stored values using a compatible client before loading them there.
 - **Blank lines are ignored.** A line containing no non-whitespace character is
   skipped silently and produces no response, so stray separators are harmless.
 - **Unparseable or structurally invalid input is answered with `id: null`.**
@@ -1716,6 +1883,13 @@ Lookup indexes are kept separately in `remote/sql/indexes.sql` and are applied
 on every database open, including databases already at the current schema
 version.
 
+Layout persistence stores opaque, byte-bounded JSON; successful storage is not a
+certificate that the Qt client can parse or render that representation. In
+particular, the native parser's 1024-container limit applies to the whole response,
+not just the stored tree (§10.3). The server preserves its existing JSON domain
+rather than silently truncating data or narrowing all callers to the native
+parser's limit.
+
 The `dev_sessions` table carries `pinned` (§4.2) and `archived` (§4.2). `pinned` arrived with schema version 5; a
 version 4 database gains the column with a default of "not pinned", so nothing already stored is lost and every
 existing session simply starts unpinned. The workspace schema version is stated in the server's schema file, in
@@ -1743,21 +1917,43 @@ The client may store only:
   the surface that offers to keep it also offers to delete it, which removes the file. Anything the user
   has not asked to keep is not kept;
 - browser cookies and cache;
+- the bounded native PDF rendering cache described below;
 - temporary reconnect state.
 
-The client must not store project repositories or project files.
+The client must not store project repositories or project files, except for the
+narrow native-PDF rendering cache described below.
 The current profile store records connection metadata (including host, port, user,
 remote Node path, repository root, and an optional local identity-file path) but
 never stores a password, passphrase, repository, or project file. Private-key
 bytes are stored only by the per-key copy the list above permits, under all of
 that entry's limits, and never as a side effect of saving a profile.
 
-The mobile clients store less than the desktop, with one exception. They reuse
-this same profile store and the same client-local keys (§4.5 last-open session
-and last-used pane, via `ch::UiStateStore`), and the exception is the private-key
-copy: an imported SSH key is held in memory for the session, or referenced where
-the user keeps it, or — if the user asks for that one key — copied into
-app-private storage under the limits of that entry. See the mobile note in §12.1.
+If profile persistence fails, the client reports the failure rather than claiming
+the edit was saved. The in-memory edit remains available for connecting and retrying;
+it is not confirmed durable until a later save succeeds. A successful write made
+without the interprocess merge lock is a separate, explicitly reported degraded
+save, not a substitute for reporting an actual storage failure.
+
+**Native PDF rendering exception.** The native viewer keeps a remote PDF of at most
+8 MiB in a per-service `QTemporaryDir` under
+`QStandardPaths::CacheLocation/pdf-spool-XXXXXX`, named inside it by the remote
+path's SHA-256 hash. Android/iOS put that cache inside the app sandbox. Directory
+permissions are checked as owner-only (0700); files are atomically published with
+checked owner-only permissions (0600) before any document bytes are written.
+The complete bytes are needed while the PDF pane is open for on-demand rendering;
+they are not a durable project copy, export, or file passed to an OS handler.
+Retarget/pane teardown removes that pane's file; peer change/loss and client or
+service destruction remove only the service's owned directory. There is no global
+startup sweep or orphan reclamation. A crash, forced termination or failed removal
+can leave full PDF bytes in the private cache until OS eviction; there is no
+secure-erasure or guaranteed crash-cleanup promise.
+
+The mobile clients reuse the same profile store and client-local last-open-session
+and last-used-pane keys (§4.5, via `ch::UiStateStore`). An imported SSH key is held
+in memory for the session, referenced where the user keeps it, or — if the user
+asks for that one key — copied into app-private storage under the limits above.
+See the mobile note in §12.1. The native PDF rendering cache is the separate,
+narrow project-byte exception described above.
 The identity-file entry a mobile profile records is the reference case, which is
 the "SSH-agent or credential-store reference" this section already allows and not
 key material.
@@ -1766,43 +1962,70 @@ key material.
 
 Unsaved buffers must be recoverable after client failure.
 
-Recovery snapshots are stored on the server, one file per viewer pane holding an
-unsaved buffer, in a dedicated recovery directory under the server's user data
-location. The server reports that absolute directory in its `server.info` result
-as `recoveryDir` (`$XDG_DATA_HOME` or `~/.local/share`, plus
-`/codeharbor/recovery`); the client appends the pane's stable layout id:
+Recovery snapshots are stored on the server in a dedicated directory under its
+user-data location. `server.info.recoveryDir` reports that absolute directory
+(`$XDG_DATA_HOME` or `~/.local/share`, plus `/codeharbor/recovery`). Each snapshot
+belongs to the complete scope: accepted server identity, Dev Session, logical
+viewer-pane identity and opened remote file path.
 
 ```text
-<recoveryDir>/<paneId>
+<recoveryDir>/scope-v1-<SHA-256 of the length-framed scope>
 ```
 
-`EditorController::recoveryPath()` in `src/editor/EditorController.cpp` builds
-this, and it is a deliberate choice over a directory beside the edited file:
+`EditorController::updateRecoveryPath()` in `src/editor/EditorController.cpp`
+hashes the four UTF-8 fields, each preceded by its byte length. This is a
+deliberate choice over a directory beside the edited file or a raw pane-id key:
 
-- One file PER PANE, keyed by the pane's stable id rather than by the edited
-  path. Two panes editing the same file therefore keep independent snapshots
-  instead of sharing (and clobbering) one file, and a snapshot never appears
+- One file per complete scope, not per recyclable pane label alone. Different
+  sessions or files cannot collide just because a pane label was reused; two
+  panes editing the same file keep independent snapshots. No snapshot appears
   inside the user's repository as an untracked file.
+  Concurrent windows editing the same logical pane and file share one
+  last-successful scoped snapshot, not separate per-window copies or a history registry.
 - The base directory is chosen by the SERVER, not derived from the client's own
   data location. Recovery writes are remote (section 8.3 `writeFile`), so a
   client-derived path could name a directory that does not exist, or belongs to
   a different user, on the server; a server-reported directory is correct on any
   host. A server too old to report `recoveryDir` leaves the client with recovery
   disabled rather than guessing a path.
-- Because a pane's single snapshot file is reused as the pane opens different
-  files, each snapshot is SELF-DESCRIBING: it records the remote path it belongs
-  to alongside the buffer, and is offered on open only when that recorded path
-  matches the file now open. A snapshot from a file the pane has since left is
-  never handed back as the current file's unsaved work.
+- Each versioned snapshot is self-describing: server, session, pane and remote
+  file path must all match the current scope before its buffer can be offered.
+  Unscoped legacy raw-pane-id records are ambiguous and are never probed,
+  migrated or removed. There is no fallback to guessed identities.
+  Foreign or unsupported versioned records are likewise never adopted, overwritten
+  or cleared as though they were an empty current slot.
 - The snapshot is written and read through the ordinary remote file methods of
   section 8.3 (`stat`, `readFile`, `writeFile`) and guarded by the same revision
   tokens as a normal save (section 8.4), so concurrent writers cannot destroy
   each other's snapshots.
 
+Hosts supply explicit accepted server/session/pane snapshots through EditorFactory;
+the opened path supplies the fourth component. Missing or partial scope disables
+recovery visibly. `acceptedServerId` is distinct from the retained display/workspace
+server id: it is empty while connecting, revalidating, disconnected or lost, and
+on an unverified manual switch. It is published only after current `server.info`
+identity and recovery-directory metadata are accepted, before releasing readiness.
+Scope changes retire in-flight recovery operations so their replies cannot adopt
+an old slot's revision or clear a replacement scope's snapshot. This does not
+discard the dirty in-memory buffer preserved during same-server reconnect (§8.2).
+A document initially lacking context may bind when its first complete tuple
+arrives. Transient acceptance loss disables recovery I/O without changing that
+bound document or discarding its RAM; restoration of the same tuple re-enables it.
+A genuinely different complete tuple leaves the old document recovery-unavailable
+until an explicit open binds the new document. It does not automatically reopen,
+discard, or snapshot the old buffer into that other scope.
+
 A recovery offer must still belong to the untouched buffer that started its
 probe. Editing or saving while the probe is in flight prevents an old snapshot
 from being offered over newer work. Clearing a discovered snapshot uses the
 revision returned with its bytes, never the earlier existence check's revision.
+
+The recovery offer presents **Restore** and **Not now**. Restore places the scoped
+copy into the editor as unsaved work, not a write to the remote saved file.
+Not now only dismisses the offer: the saved file is unchanged and the recovery
+copy is not deleted. An unchanged copy may therefore be offered again on reopen.
+This is one latest scoped snapshot, not a history: newer edits can replace that
+copy before a successful save, so deferral does not promise retention until saving.
 
 Recovery reads use 2 MiB byte ranges and assemble at most 16 MiB, separately from
 the editor's 8 MiB main-file limit. All ranges must share a revision; a final
@@ -1923,6 +2146,14 @@ External websites must not receive Qt WebChannel objects, SSH functionality, rem
 
 Internal viewers must use a separate WebEngine profile.
 
+The native mobile web viewer has no WebEngine profile. It must install its
+Android/Darwin navigation and new-window guard on the marker-identified native
+view before loading an untrusted HTTP(S) URL. Non-HTTP(S) navigation must not reach
+an operating-system handler, and file/content resource access is blocked. A
+missing, unsupported, failed or lost guard refuses browsing visibly rather than
+falling back to an unguarded native view. Platform HTTP transport restrictions
+remain in effect; see DEVELOPMENT's mobile viewer constraints.
+
 ### 12.3 Logging
 
 Do not log by default:
@@ -1994,6 +2225,8 @@ src/
 ├── editor/
 ├── agent/
 ├── qml/
+├── mobile/       native single-pane Android/iOS presentation
+├── vt/           in-process terminal emulator for the mobile client
 └── web/
     ├── terminal/
     ├── markdown/
@@ -2201,10 +2434,10 @@ Because Oh My Pi is the primary daily driver, its adapter may be included in the
 
 - The application is named **CodeHarbor**.
 - The UI is built in Qt Quick and QML.
-- The core backend is C++.
-- The outer layout has exactly three fixed regions.
-- Viewer and terminal regions use independent recursive split trees.
-- Terminals use xterm.js.
+- The core backend is C++ and is shared by the desktop and mobile clients.
+- The desktop outer layout has exactly three fixed regions; mobile shows one selected pane.
+- Viewer and terminal regions use independent recursive split trees; mobile reads their leaves as a pane list.
+- Desktop terminals use xterm.js; mobile terminals use the in-process `src/vt` emulator.
 - Terminals connect only to the remote SSH server.
 - tmux provides process persistence.
 - One SSH server is sufficient for version 1.

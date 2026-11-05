@@ -46,7 +46,8 @@ import {
 // isPlainObject lives with the event schema (events.ts) because that is where
 // the JSON-object footgun it guards against was first written down; it is the
 // same check the bridge and the control listener apply to a decoded payload.
-import { isPlainObject } from "./events.ts";
+import { isPlainObject, resolveSocketPath } from "./events.ts";
+import { JsonSizeLimitError, stringifyJson } from "./json.ts";
 // Viewer control channel (agent -> desktop). Its per-daemon socket is bound by
 // runStdio below; the `viewer.commandResult` handler in the static method table
 // settles the producer that is still waiting on it, and server.info reports the
@@ -130,7 +131,13 @@ export const RPC_SERVER_VERSION = "0.4.3";
 // unattended pane reported as Idle, i.e. a sidebar that says "done" about work
 // still running. That must fail at the compatibility gate, where it is
 // explicable, rather than as a wrong badge nobody can trace.
-export const RPC_SCHEMA_VERSION = 8;
+// Bumped 8 -> 9 when workspace.ensureInitialLayout made initial terminal rows
+// and their layout atomic. Clients now require this method; an older daemon
+// cannot safely initialize a layout with separate create/set operations.
+// Bumped 9 -> 10 when server.info began advertising the required agent socket.
+// A tmux server may retain a different HOME/XDG environment; clients must export
+// this exact producer route rather than let new shells guess another endpoint.
+export const RPC_SCHEMA_VERSION = 10;
 
 export interface RpcRequest {
     jsonrpc: "2.0";
@@ -238,6 +245,7 @@ const methods: Record<string, MethodHandler> = {
         version: RPC_SERVER_VERSION,
         schemaVersion: RPC_SCHEMA_VERSION,
         serverId: serverIdentity(),
+        agentSocket: resolveSocketPath(),
         recoveryDir: pathJoin(recoveryBaseDir(), "codeharbor", "recovery"),
         ...(activeControlListener
             ? { controlSocket: activeControlListener.socketPath }
@@ -487,17 +495,19 @@ export async function handleLine(line: string): Promise<RpcResponse | null> {
 export function responseLine(response: RpcResponse): string {
     let refusal: { code: number; message: string };
     try {
-        const payload = JSON.stringify(response);
-        if (Buffer.byteLength(payload) <= MAX_LINE_BYTES) return `${payload}\n`;
-        refusal = {
-            code: RPC_RESOURCE_LIMIT,
-            message:
-                `The answer to this request is larger than the ${MAX_LINE_BYTES}-byte ` +
-                "transport frame limit and could not be sent. The operation may already have " +
-                "completed; read the current state before retrying.",
-        };
-    } catch {
-        refusal = { code: RPC_INTERNAL_ERROR, message: "Response could not be serialized" };
+        const payload = stringifyJson(response, MAX_LINE_BYTES);
+        if (payload === undefined) throw new TypeError("Response is not JSON-serializable");
+        return `${payload}\n`;
+    } catch (err) {
+        refusal = err instanceof JsonSizeLimitError
+            ? {
+                code: RPC_RESOURCE_LIMIT,
+                message:
+                    `The answer to this request is larger than the ${MAX_LINE_BYTES}-byte ` +
+                    "transport frame limit and could not be sent. The operation may already have " +
+                    "completed; read the current state before retrying.",
+            }
+            : { code: RPC_INTERNAL_ERROR, message: "Response could not be serialized" };
     }
     const refusalId =
         typeof response.id === "string" &&

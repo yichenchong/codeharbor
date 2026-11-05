@@ -10,6 +10,9 @@
 #include <QUrl>
 #include <QXmlStreamReader>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <utility>
 
 namespace ch {
@@ -308,7 +311,8 @@ QImage MobileImageProvider::requestImage(const QString &id, QSize *size,
     reader.setAutoTransform(true);
     // size() already makes QtSvg parse the document and follow image/CSS
     // resources, so the resource boundary must be checked BEFORE that accessor.
-    if (reader.format().startsWith("svg") && !isSelfContainedSvg(bytes))
+    const bool svg = reader.format().startsWith("svg");
+    if (svg && !isSelfContainedSvg(bytes))
         return {};
     // The dimensions the CALLER will see, which are not necessarily the ones
     // the file stores. setAutoTransform(true) makes read() apply the file's
@@ -321,33 +325,40 @@ QImage MobileImageProvider::requestImage(const QString &id, QSize *size,
     // transposed Image.sourceSize and lay the photograph out at the inverse of
     // its real aspect ratio.
     const QSize storedSize = reader.size();
+    if (!storedSize.isValid() || storedSize.isEmpty())
+        return {}; // Without dimensions there is no pre-decode memory bound.
+    if (!svg && qint64(storedSize.width()) * storedSize.height() > kMaxSourcePixels)
+        return {};
     const bool transposed = reader.transformation().testFlag(
         QImageIOHandler::TransformationRotate90);
-    const QSize sourceSize = transposed && storedSize.isValid()
-                                 ? storedSize.transposed()
-                                 : storedSize;
-    if (requestedSize.isValid() && !requestedSize.isEmpty()) {
-        // setScaledSize() is in the decoder's PRE-transform coordinates, so a
-        // target computed against the post-transform size has to be transposed
-        // back. Without that, a 400x200-stored/200x400-displayed photograph
-        // asked to fit 100x40 was scaled to 80x40 and then rotated to 40x80 —
-        // twice the requested height, and fitted against the wrong aspect.
-        if (sourceSize.isValid() && !sourceSize.isEmpty()) {
-            QSize scaled = sourceSize;
-            scaled.scale(requestedSize, Qt::KeepAspectRatio);
-            reader.setScaledSize(transposed ? scaled.transposed() : scaled);
-        } else {
-            reader.setScaledSize(transposed ? requestedSize.transposed()
-                                            : requestedSize);
-        }
+    const QSize sourceSize = transposed ? storedSize.transposed() : storedSize;
+    // Respect one-axis sourceSize requests too. Unspecified axes impose no
+    // additional restriction; an empty request still has the output budget.
+    double scale = 1;
+    if (requestedSize.width() > 0 || requestedSize.height() > 0) {
+        scale = std::numeric_limits<double>::max();
+        if (requestedSize.width() > 0)
+            scale = double(requestedSize.width()) / sourceSize.width();
+        if (requestedSize.height() > 0)
+            scale = std::min(scale, double(requestedSize.height()) / sourceSize.height());
     }
+    scale = std::min({scale,
+                      double(kMaxDecodedDimension) / sourceSize.width(),
+                      double(kMaxDecodedDimension) / sourceSize.height(),
+                      std::sqrt(double(kMaxDecodedPixels) / sourceSize.width()
+                                / sourceSize.height())});
+    const QSize scaled(std::max(1, int(std::floor(sourceSize.width() * scale))),
+                       std::max(1, int(std::floor(sourceSize.height() * scale))));
+    reader.setScaledSize(transposed ? scaled.transposed() : scaled);
 
     QImage image = reader.read();
     if (image.isNull())
         return {}; // bytes are not an image format this build can decode
+    if (image.width() > kMaxDecodedDimension || image.height() > kMaxDecodedDimension
+        || qint64(image.width()) * image.height() > kMaxDecodedPixels)
+        return {}; // A decoder must not ignore the requested output bound.
     if (size)
-        *size = sourceSize.isValid() && !sourceSize.isEmpty() ? sourceSize
-                                                             : image.size();
+        *size = sourceSize;
     return image;
 }
 

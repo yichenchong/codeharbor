@@ -89,7 +89,7 @@ int main(int argc, char *argv[])
     // The pool is declared before the bootstrap so it is destroyed AFTER it: the
     // channel devices the bootstrap owns must not outlive the session they were
     // opened on. connectAndWireFromEnvironment() is deliberately NOT called here
-    // — see below, after appController.setConnection().
+    // — it must wait for both controller wiring and the QML command receivers.
     ch::SshConnectionPool sshPool;
     ch::SessionBootstrap sessionBootstrap(&sshPool, &client, &agentMonitor);
 
@@ -127,16 +127,10 @@ int main(int argc, char *argv[])
     ch::EditorFactory editorFactory(&client);
     ch::TerminalFactory terminalFactory(&sshPool);
 
-    // A terminal's identity is a row in the SERVER's terminal_panes table, so
-    // the factory needs the workspace repository and the id of the server whose
-    // rows those are (SPEC 5.2). The repository is the AppController's and is
-    // declared above, so it outlives the factory; the server id is only known
-    // once server.info has answered, which is what the connection is for.
-    //
-    // Wired here, before the environment auto-connect below, for the same
-    // reason setEditorFactory() is: adoptServerIdentity() runs SYNCHRONOUSLY
-    // out of connectAndWire(), and a factory registered afterwards would miss
-    // the identity it is about to need.
+    // The workspace repository outlives this factory. AppController supplies
+    // server identity and workspace readiness together after validating
+    // server.info and switching its layouts; setTerminalFactory() below
+    // registers that handoff before environment auto-connect.
     terminalFactory.setWorkspace(appController.workspaceDb());
     // And the RPC peer for ONE out-of-band diagnostic: `tmux new-session -A`
     // creates the pane's session when it is missing and says so nowhere, so
@@ -145,10 +139,6 @@ int main(int argc, char *argv[])
     // whose remote session died says so instead of handing the user a silently
     // empty shell.
     terminalFactory.setRpcClient(&client);
-    QObject::connect(&appController, &ch::AppController::serverIdChanged, &terminalFactory,
-                     [&appController, &terminalFactory]() {
-                         terminalFactory.setServerId(appController.serverId());
-                     });
 
     // SPEC 6.6. The "generic" harness publishes no lifecycle events, so the
     // bridge has no adapter for it and the monitor would otherwise never learn
@@ -186,18 +176,6 @@ int main(int argc, char *argv[])
     ch::Notifier notifier;
     QObject::connect(&agentMonitor, &ch::AgentStatusMonitor::notify, &notifier,
                      &ch::Notifier::notify);
-
-    // A normal desktop launch stays server-less: this returns immediately unless
-    // CH_LIVE_SSH is set (with CH_LIVE_HOST/PORT/USER/NODE/REPO), so the UI still
-    // comes up with no session and RPC calls fail gracefully with a synthetic
-    // transport error.
-    //
-    // It MUST run after setConnection(): connectAndWire() emits wired()
-    // SYNCHRONOUSLY from inside attemptWire(). Wired before the controller is
-    // listening meant nobody ran adoptServerIdentity(), so the serverId stayed
-    // empty, workspace.list was issued for "" and the whole shell came up with
-    // an empty sidebar on top of a perfectly good SSH session.
-    sessionBootstrap.connectAndWireFromEnvironment();
 
     // Windows' frameless shell needs its native snap styles and maximise
     // hit-test bridge. The helper is a no-op elsewhere, but it still follows
@@ -241,6 +219,12 @@ int main(int argc, char *argv[])
         Qt::QueuedConnection);
 
     engine.loadFromModule("CodeHarbor", "Main");
+    // Environment startup can synchronously drain RPC notifications while SSH
+    // channels are being opened. The QML viewer-command receivers must exist
+    // before that happens, or commands are registered in flight but never run.
+    // Normal launches remain server-less unless CH_LIVE_SSH is enabled.
+    if (!engine.rootObjects().isEmpty())
+        sessionBootstrap.connectAndWireFromEnvironment();
 
     return app.exec();
 }

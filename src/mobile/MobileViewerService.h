@@ -5,7 +5,9 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QPointer>
+#include <QPair>
 #include <QString>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QVariantList>
 #include <QVariantMap>
@@ -36,7 +38,7 @@ namespace ch {
 //     RPC reply. There is exactly ONE local WRITE, the app-private PDF spool
 //     (see requestPdf()), which exists because QtQuick.Pdf's QML PdfDocument can
 //     only take a URL; it is documented there, keyed by digest rather than by
-//     remote name, and emptied on release, on destruction and at startup;
+//     remote name, and removed on release, peer retirement and destruction;
 //   * no network access of its own — the only socket is the SSH transport the
 //     CodeharbordClient is already bound to;
 //   * no handing of a remote URL to the OS. There is no QDesktopServices call
@@ -45,12 +47,11 @@ namespace ch {
 //     phone the equivalent would mean exporting a remote path to another
 //     application (SPEC 7.4 / 2.4).
 //
-// ASYNCHRONY. Like ViewerModel, every operation is fire-and-forget and every
-// answer arrives as a SIGNAL carrying the path it is about, so a page can match
-// a reply against what it asked for. Nothing here is pane-scoped: one service
-// instance serves the single visible pane. File operations carry the path;
-// containment answers also carry the original repository base, so a late answer
-// about one project's boundary cannot authorize a read in another project.
+// ASYNCHRONY. Every operation is fire-and-forget and every answer carries its
+// remote path. Reads, listings and containment checks accept only the newest
+// request for the same target: navigating A -> B -> A must not let the first A
+// reply satisfy the second A request. Containment targets include the repository
+// base, so answers from one project cannot authorize resources in another.
 class MobileViewerService : public QObject {
     Q_OBJECT
 public:
@@ -210,20 +211,19 @@ public slots:
     // pages. So the bytes have to land somewhere a URL can name. The in-memory
     // source was preferred and is not available.
     //
-    // The landing place is APP-PRIVATE: a "pdf-spool" directory under
-    // QStandardPaths::CacheLocation, which on Android is inside the app's own
-    // cache dir and on iOS inside the app container. Nothing else on the device
-    // can read it, and no OS handler is ever pointed at it — the URL goes to a
-    // PdfDocument inside this process and nowhere else.
+    // The landing place is a per-service owner-only QTemporaryDir named
+    // "pdf-spool-XXXXXX" under QStandardPaths::CacheLocation. Android/iOS put
+    // this inside the app sandbox. A second service cannot delete or overwrite
+    // this instance's files. Only PdfDocument receives the URL, never the OS.
     //
     // The file name is a SHA-256 digest of the remote path, never the remote
     // basename: a server-controlled name must not be able to choose a filename
     // on this device, which is how "../" and reserved names get in.
     //
-    // The spool is emptied in three places, so a PDF cannot outlive its use:
-    // releasePdf() (the pane unloading), the destructor, and construction —
-    // which also clears whatever a previous run left behind if it was killed by
-    // the OS before it could tidy up, the normal way a mobile app dies.
+    // Release removes the pane's file; peer retirement and destruction remove
+    // this service's whole directory. A crash/kill can leave bytes in app cache
+    // until OS eviction: there is no unsafe sweep of another live service's
+    // directory, and no secure-erasure guarantee.
     Q_INVOKABLE void requestPdf(const QString &path);
 
     // Delete the spooled file for `path`, and retire a read for it that is still
@@ -325,10 +325,10 @@ private:
     // Absolute path of the app-private spool directory, created on demand. Empty
     // when the platform reports no writable cache location at all, which
     // disables PDF viewing rather than writing somewhere unexpected.
-    QString pdfSpoolDir() const;
-    // Delete every file this instance spooled, and the directory's stale
-    // leftovers with them.
+    QString pdfSpoolDir();
+    // Remove only this service's private directory and remembered files.
     void purgePdfSpool();
+    void resetPeerState();
 
     // QPointer: see the constructor note — the client may be destroyed first.
     QPointer<CodeharbordClient> m_client;
@@ -338,15 +338,17 @@ private:
     // Remote path -> absolute spooled file. Cleared by releasePdf() and by the
     // destructor.
     QHash<QString, QString> m_pdfSpool;
+    std::unique_ptr<QTemporaryDir> m_pdfDirectory;
 
-    // In-flight requests whose reply WRITES something a release call is
-    // expected to clean up, keyed by path and carrying the epoch of the LATEST
-    // request for that path. requestImage()/requestPdf() record an epoch,
-    // forgetImage()/releasePdf() drop it, and only a reply whose epoch is still
-    // current may write or announce anything — see claimRequest() in the .cpp
-    // for the ordering this makes correct, and for the leak it exists to stop.
-    // Bounded by the number of distinct paths with a request outstanding.
+    // Only the latest request for a target may publish a reply. Entries exist
+    // only while requests are in flight, and are removed by completion, release,
+    // or a transport change. The service-wide epoch is never reset when entries
+    // are erased, so A -> B -> A cannot reuse A's retired identity.
     qint64 m_requestEpoch = 0;
+    QHash<QString, qint64> m_readRequests;
+    QHash<QString, qint64> m_directoryRequests;
+    QHash<QString, qint64> m_statRequests;
+    QHash<QPair<QString, QString>, qint64> m_resolveRequests;
     QHash<QString, qint64> m_imageRequests;
     QHash<QString, qint64> m_pdfRequests;
 };

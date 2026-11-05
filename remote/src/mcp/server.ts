@@ -25,12 +25,13 @@
 import { isEntrypoint } from "../tools/entrypoint.ts";
 
 import { createLineFramer, RPC_SERVER_VERSION } from "../codeharbord.ts";
-import { CONTROL_OPS, type ControlOp } from "../control.ts";
+import { CONTROL_OPS, MAX_CONTROL_LINE_BYTES, type ControlOp } from "../control.ts";
 import {
     MISSING_COORDINATES_MESSAGE,
     readCoordinates,
     sendControlRequest,
 } from "../control-client.ts";
+import { stringifyJson } from "../json.ts";
 
 // The MCP revision this server implements. Reported verbatim in the initialize
 // result; a client that speaks a different one is expected to adapt or to say so
@@ -44,6 +45,10 @@ export const MCP_SERVER_NAME = "codeharbor";
 // because an unbounded line buffer is how a stdio server gets killed by a peer
 // that lost a newline.
 export const MAX_MCP_LINE_BYTES = 1024 * 1024;
+
+// Bound concurrent desktop waits and buffered output independently of framing.
+export const MAX_MCP_INFLIGHT = 32;
+export const MAX_MCP_PENDING_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 // JSON-RPC 2.0 reserved codes, spelled here rather than imported from the RPC
 // contract: this is a DIFFERENT protocol that happens to share an envelope, and
@@ -234,6 +239,7 @@ function failure(id: string | number | null, code: number, message: string): Mcp
 export async function handleMessage(
     value: unknown,
     env: NodeJS.ProcessEnv = process.env,
+    signal?: AbortSignal,
 ): Promise<McpResponse | null> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
         return failure(null, MCP_INVALID_REQUEST, "Invalid Request");
@@ -243,9 +249,8 @@ export async function handleMessage(
         message.jsonrpc !== "2.0" ||
         typeof message.method !== "string" ||
         (message.id !== undefined &&
-            message.id !== null &&
             typeof message.id !== "string" &&
-            !(typeof message.id === "number" && Number.isFinite(message.id)))
+            !(typeof message.id === "number" && Number.isInteger(message.id)))
     ) {
         return failure(null, MCP_INVALID_REQUEST, "Invalid Request");
     }
@@ -254,7 +259,7 @@ export async function handleMessage(
     const isNotification = message.id === undefined;
     if (
         message.params !== undefined &&
-        (typeof message.params !== "object" || message.params === null)
+        (typeof message.params !== "object" || message.params === null || Array.isArray(message.params))
     ) {
         return isNotification ? null : failure(id, MCP_INVALID_PARAMS, "Invalid params");
     }
@@ -278,7 +283,8 @@ export async function handleMessage(
         case "notifications/initialized":
         case "notifications/cancelled":
         case "notifications/roots/list_changed":
-            return null;
+            return isNotification ? null
+                : failure(id, MCP_INVALID_REQUEST, "Notifications must not include an id");
         case "ping":
             return isNotification ? null : success(id, {});
         case "tools/list":
@@ -316,9 +322,11 @@ export async function handleMessage(
             // isError — that is the MCP contract, and it is what lets the model
             // read the reason and try something else instead of seeing its tool
             // provider error out.
-            const response = await sendControlRequest(tool.op, args as Record<string, unknown>, env);
+            const response = await sendControlRequest(
+                tool.op, args as Record<string, unknown>, env, undefined, undefined, signal,
+            );
             if (response.ok) {
-                return success(id, textResult(JSON.stringify(response.data ?? {}), false));
+                return success(id, textResult(stringifyJson(response.data ?? {}, MAX_CONTROL_LINE_BYTES)!, false));
             }
             return success(
                 id,
@@ -339,6 +347,7 @@ export async function handleMessage(
 export async function handleLine(
     line: string,
     env: NodeJS.ProcessEnv = process.env,
+    activeRequests?: Map<string | number, AbortController>,
 ): Promise<McpResponse | null> {
     if (!/\S/.test(line)) return null;
     let decoded: unknown;
@@ -347,8 +356,38 @@ export async function handleLine(
     } catch {
         return failure(null, MCP_PARSE_ERROR, "Parse error");
     }
+    const message = typeof decoded === "object" && decoded !== null && !Array.isArray(decoded)
+        ? decoded as Record<string, unknown> : null;
+    const id = message?.id;
+    if (activeRequests && message?.jsonrpc === "2.0"
+        && message.method === "notifications/cancelled" && id === undefined) {
+        const params = message.params;
+        if (typeof params === "object" && params !== null && !Array.isArray(params)) {
+            const requestId = (params as Record<string, unknown>).requestId;
+            if (typeof requestId === "string"
+                || (typeof requestId === "number" && Number.isInteger(requestId))) {
+                activeRequests.get(requestId)?.abort();
+            }
+        }
+        return null;
+    }
+    let controller: AbortController | undefined;
+    if (activeRequests && message?.jsonrpc === "2.0" && message.method === "tools/call"
+        && (typeof id === "string" || (typeof id === "number" && Number.isInteger(id)))) {
+        if (activeRequests.has(id)) {
+            return failure(id, MCP_INVALID_REQUEST, "Request id is already in flight");
+        }
+        if (activeRequests.size >= MAX_MCP_INFLIGHT) {
+            return failure(id, -32000, "Too many viewer requests are already in flight");
+        }
+        controller = new AbortController();
+        activeRequests.set(id, controller);
+    }
     try {
-        return await handleMessage(decoded, env);
+        const response = await handleMessage(decoded, env, controller?.signal);
+        // Cancellation cannot undo an already dispatched desktop operation.
+        // It does stop our socket wait and suppress its now-unwanted response.
+        return controller?.signal.aborted ? null : response;
     } catch (err) {
         // handleMessage is total today; this guard keeps a future non-total path
         // from becoming an unhandled rejection that kills the server.
@@ -357,12 +396,33 @@ export async function handleLine(
             MCP_INTERNAL_ERROR,
             err instanceof Error ? err.message : String(err),
         );
+    } finally {
+        if (controller && activeRequests && (typeof id === "string" || typeof id === "number")) {
+            activeRequests.delete(id);
+        }
     }
 }
 
+/** Per-connection cancellation state; stateless handleLine remains useful to callers. */
+export function createMcpSession(env: NodeJS.ProcessEnv = process.env): {
+    handleLine(line: string): Promise<McpResponse | null>;
+    close(): void;
+} {
+    const activeRequests = new Map<string | number, AbortController>();
+    return {
+        handleLine: (line) => handleLine(line, env, activeRequests),
+        close() {
+            for (const controller of activeRequests.values()) controller.abort();
+        },
+    };
+}
+
 export function runStdio(): void {
-    process.stdout.on("error", () => {});
+    process.stdout.on("error", () => {
+        process.exit(1);
+    });
     process.stdin.on("error", () => {});
+    process.stderr.on("error", () => {});
     // The control ops and the tool table are two spellings of one list; a tool
     // added without its op (or the reverse) would fail only when a model happened
     // to call it. Fail loudly at startup instead.
@@ -384,7 +444,14 @@ export function runStdio(): void {
     // round trip was still outstanding, so the tool calls silently produced
     // nothing at all.
     let inFlight = 0;
+    const session = createMcpSession();
     let pendingWrites = 0;
+    let pendingOutputBytes = 0;
+    const failTransport = (message: string): never => {
+        session.close();
+        process.stderr.write(`codeharbor-mcp: ${message}; closing\n`);
+        process.exit(1);
+    };
     let inputClosed = false;
     const finishIfDone = (): void => {
         if (inputClosed && inFlight === 0 && pendingWrites === 0) {
@@ -394,19 +461,31 @@ export function runStdio(): void {
     const feed = createLineFramer(
         (line) => {
             inFlight += 1;
-            void handleLine(line).then(
+            void session.handleLine(line).then(
                 (response) => {
                     inFlight -= 1;
                     if (response) {
+                        let output: string;
                         try {
-                            pendingWrites += 1;
-                            process.stdout.write(`${JSON.stringify(response)}\n`, () => {
+                            output = `${stringifyJson(response, MAX_MCP_PENDING_OUTPUT_BYTES)}\n`;
+                        } catch {
+                            return failTransport("response could not be encoded within its byte limit");
+                        }
+                        const bytes = Buffer.byteLength(output);
+                        if (pendingOutputBytes + bytes > MAX_MCP_PENDING_OUTPUT_BYTES) {
+                            failTransport("pending output exceeded its byte limit");
+                        }
+                        pendingWrites += 1;
+                        pendingOutputBytes += bytes;
+                        try {
+                            process.stdout.write(output, (error) => {
                                 pendingWrites -= 1;
+                                pendingOutputBytes -= bytes;
+                                if (error) failTransport("could not write a response");
                                 finishIfDone();
                             });
                         } catch {
-                            // The peer is gone; nothing left to answer.
-                            pendingWrites -= 1;
+                            failTransport("could not write a response");
                         }
                     }
                     finishIfDone();
@@ -420,10 +499,7 @@ export function runStdio(): void {
             );
         },
         () => {
-            process.stderr.write(
-                `codeharbor-mcp: input line exceeded ${MAX_MCP_LINE_BYTES} bytes without a newline; closing\n`,
-            );
-            process.stdin.destroy();
+            failTransport(`input line exceeded ${MAX_MCP_LINE_BYTES} bytes without a newline`);
         },
         MAX_MCP_LINE_BYTES,
     );

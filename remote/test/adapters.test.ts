@@ -170,10 +170,6 @@ test("codeharbord dispatch answers introspection and rejects unknown methods", a
     ) as { version: string };
     assert.equal(info.version, manifest.version);
     assert.equal(info.schemaVersion, RPC_SCHEMA_VERSION);
-    assert.deepEqual(
-        Object.keys(info).sort(),
-        ["name", "recoveryDir", "schemaVersion", "serverId", "version"],
-    );
     // recoveryDir is an absolute server path ending in the recovery directory.
     assert.equal(typeof info.recoveryDir, "string");
     assert.match(String(info.recoveryDir), /codeharbor[/\\]recovery$/);

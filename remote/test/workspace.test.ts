@@ -4168,3 +4168,447 @@ test("setLayout refuses a tree one byte over the limit and writes nothing", asyn
     ws.close();
     await cleanup(dbPath);
 });
+
+test("duplicateSession remaps deeply nested stored layouts without recursive traversal", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const { session, viewer } = seed(ws);
+        const depth = 2200;
+        const serialized =
+            '{"type":"split","children":['.repeat(depth) +
+            JSON.stringify({ type: "leaf", paneId: viewer.id }) +
+            '],"ratios":[1]}'.repeat(depth);
+        // A valid stored tree below the byte cap can be deeper than a recursive
+        // map() traversal supports. Avoid a recursive fixture builder too.
+        assert.ok(Buffer.byteLength(serialized) < MAX_LAYOUT_TREE_BYTES);
+        ws.db
+            .prepare("UPDATE session_layouts SET tree = ? WHERE dev_session_id = ? AND region = 'viewer'")
+            .run(serialized, session.id);
+        const copy = ws.duplicateSession({ id: session.id });
+        let leaf = copy.layouts.viewer as Record<string, unknown>;
+        for (let level = 0; level < depth; level++) {
+            assert.equal(leaf.type, "split");
+            assert.ok(Array.isArray(leaf.children));
+            leaf = leaf.children[0] as Record<string, unknown>;
+        }
+        assert.equal(leaf.type, "leaf");
+        assert.equal(leaf.paneId, copy.viewerPanes[0]!.id);
+        assert.notEqual(leaf.paneId, viewer.id);
+        const original = ws.db
+            .prepare("SELECT tree FROM session_layouts WHERE dev_session_id = ? AND region = 'viewer'")
+            .get(session.id) as { tree: string };
+        assert.equal(original.tree, serialized);
+    } finally {
+        ws.close();
+    }
+});
+
+function initialTerminalTemplate(first = "terminal-1", second = "terminal-2") {
+    return {
+        type: "split",
+        orientation: "vertical",
+        children: [
+            { type: "leaf", paneId: first },
+            { type: "leaf", paneId: second },
+        ],
+        ratios: [1, 1],
+    };
+}
+
+test("ensureInitialLayout preserves present null and empty layouts without minting terminals", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const group = ws.createGroup({ serverId: SERVER, name: "G" });
+        const session = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        for (const region of ["viewer", "terminal"] as const) {
+            for (const tree of [null, { type: "leaf", paneId: "" }]) {
+                const stored = ws.setLayout({ serverId: SERVER, devSessionId: session.id, region, tree });
+                const winner = ws.ensureInitialLayout({
+                    serverId: SERVER,
+                    devSessionId: session.id,
+                    region,
+                    tree: region === "viewer" ? { type: "leaf", paneId: "viewer-1" } : initialTerminalTemplate(),
+                });
+                assert.deepEqual(winner, stored);
+            }
+        }
+        assert.deepEqual(ws.list(SERVER)[0].sessions[0].terminalPanes, []);
+    } finally {
+        ws.close();
+    }
+});
+
+test("ensureInitialLayout mints fresh terminal identities instead of adopting recycled labels", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const group = ws.createGroup({ serverId: SERVER, name: "G" });
+        const session = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        const previous = ws.createTerminalPane({
+            serverId: SERVER, devSessionId: session.id, name: "terminal-1",
+        });
+        assert.throws(
+            () => ws.ensureInitialLayout({
+                serverId: SERVER,
+                devSessionId: session.id,
+                region: "terminal",
+                tree: { type: "leaf", paneId: "terminal-1", terminalPaneId: previous.id },
+            }),
+            isInvalidParams,
+        );
+        assert.equal(ws.getLayout({ devSessionId: session.id, region: "terminal" }), null);
+        const template = initialTerminalTemplate();
+        const layout = ws.ensureInitialLayout({
+            serverId: "untrusted-server",
+            devSessionId: session.id,
+            region: "terminal",
+            tree: template,
+        });
+        const tree = layout.tree as { children: Array<{ paneId: string; terminalPaneId: string }> };
+        assert.equal(layout.serverId, SERVER);
+        assert.equal(new Set(tree.children.map((leaf) => leaf.terminalPaneId)).size, 2);
+        for (const leaf of tree.children) {
+            assert.notEqual(leaf.terminalPaneId, previous.id);
+            const pane = ws.getTerminalPane(leaf.terminalPaneId);
+            assert.equal(pane.devSessionId, session.id);
+            assert.equal(pane.name, leaf.paneId);
+            assert.notEqual(pane.tmuxTarget, previous.tmuxTarget);
+        }
+        assert.equal(ws.list(SERVER)[0].sessions[0].terminalPanes.length, 3);
+        assert.equal("terminalPaneId" in template.children[0], false, "request template must not be mutated");
+        const viewer = ws.ensureInitialLayout({
+            serverId: SERVER,
+            devSessionId: session.id,
+            region: "viewer",
+            tree: { type: "leaf", paneId: "viewer-1" },
+        });
+        assert.deepEqual(viewer.tree, { type: "leaf", paneId: "viewer-1" });
+        const authored = ws.setLayout({
+            serverId: SERVER,
+            devSessionId: session.id,
+            region: "viewer",
+            tree: { type: "leaf", paneId: "viewer-authored", url: "https://example.com/" },
+        });
+        assert.deepEqual(ws.ensureInitialLayout({
+            serverId: SERVER,
+            devSessionId: session.id,
+            region: "viewer",
+            tree: { type: "leaf", paneId: "viewer-stale-default" },
+        }), authored);
+    } finally {
+        ws.close();
+    }
+});
+
+test("ensureInitialLayout rolls back new panes when their stored identities exceed the tree bound", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const group = ws.createGroup({ serverId: SERVER, name: "G" });
+        const session = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        assert.throws(
+            () => ws.ensureInitialLayout({
+                serverId: SERVER,
+                devSessionId: session.id,
+                region: "terminal",
+                tree: treeOfSerializedBytes("terminal-1", MAX_LAYOUT_TREE_BYTES),
+            }),
+            isResourceLimit,
+        );
+        assert.equal(ws.getLayout({ devSessionId: session.id, region: "terminal" }), null);
+        assert.deepEqual(ws.list(SERVER)[0].sessions[0].terminalPanes, []);
+        ws.ensureInitialLayout({
+            serverId: SERVER, devSessionId: session.id, region: "terminal", tree: initialTerminalTemplate(),
+        });
+        assert.equal(ws.list(SERVER)[0].sessions[0].terminalPanes.length, 2);
+    } finally {
+        ws.close();
+    }
+});
+
+test("two clients observing absent layouts initialize one winning tree without orphan panes", { timeout: 120_000 }, async () => {
+    const dbPath = await tmpDbPath();
+    const setup = openWorkspace(dbPath);
+    const group = setup.createGroup({ serverId: SERVER, name: "G" });
+    const session = setup.createSession({
+        serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+    });
+    setup.close();
+    const daemonPath = fileURLToPath(new URL("../src/codeharbord.ts", import.meta.url));
+    const daemons = [0, 1].map(() => {
+        const proc = spawn(process.execPath, [daemonPath, "rpc", "--stdio"], {
+            env: { ...process.env, CODEHARBOR_DB: dbPath },
+            stdio: ["pipe", "pipe", "inherit"],
+        });
+        const pending: Array<{
+            resolve: (reply: Record<string, unknown>) => void;
+            reject: (error: Error) => void;
+        }> = [];
+        let buffered = "";
+        let failure: Error | undefined;
+        const fail = (error: Error) => {
+            failure = error;
+            for (const waiter of pending.splice(0)) waiter.reject(error);
+        };
+        proc.stdout.setEncoding("utf8");
+        proc.stdout.on("data", (chunk: string) => {
+            buffered += chunk;
+            for (let end = buffered.indexOf("\n"); end >= 0; end = buffered.indexOf("\n")) {
+                const line = buffered.slice(0, end);
+                buffered = buffered.slice(end + 1);
+                const waiter = pending.shift();
+                if (!waiter) continue;
+                try {
+                    waiter.resolve(JSON.parse(line));
+                } catch (error) {
+                    waiter.reject(error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+        });
+        proc.on("error", fail);
+        proc.on("exit", () => fail(new Error("initializer daemon exited before answering")));
+        const call = (method: string, params: unknown): Promise<Record<string, unknown>> => {
+            if (failure) return Promise.reject(failure);
+            const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+            pending.push({ resolve, reject });
+            proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) + "\n");
+            return promise;
+        };
+        return { proc, call };
+    });
+    try {
+        // Both real connections have observed absence before either initializes.
+        const absent = await Promise.all(daemons.map((daemon) => daemon.call(
+            "workspace.getLayout", { devSessionId: session.id, region: "terminal" },
+        )));
+        for (const reply of absent) {
+            assert.equal(reply.error, undefined, JSON.stringify(reply.error));
+            assert.equal(reply.result, null);
+        }
+        const replies = await Promise.all(daemons.map((daemon, index) => daemon.call(
+            "workspace.ensureInitialLayout",
+            {
+                serverId: SERVER,
+                devSessionId: session.id,
+                region: "terminal",
+                tree: initialTerminalTemplate(`client-${index}-1`, `client-${index}-2`),
+            },
+        )));
+        for (const reply of replies) assert.equal(reply.error, undefined, JSON.stringify(reply.error));
+        const first = replies[0].result as { id: string; tree: { children: Array<{ terminalPaneId: string }> } };
+        const second = replies[1].result as typeof first;
+        assert.equal(first.id, second.id);
+        assert.deepEqual(first.tree, second.tree);
+        const after = openWorkspace(dbPath);
+        try {
+            const panes = after.list(SERVER)[0].sessions[0].terminalPanes;
+            assert.equal(panes.length, 2);
+            assert.deepEqual(
+                new Set(panes.map((pane) => pane.id)),
+                new Set(first.tree.children.map((leaf) => leaf.terminalPaneId)),
+            );
+            assert.equal(new Set(panes.map((pane) => pane.tmuxTarget)).size, 2);
+        } finally {
+            after.close();
+        }
+    } finally {
+        await Promise.all(daemons.map(({ proc }) => {
+            if (proc.exitCode !== null || proc.signalCode !== null || proc.pid === undefined) {
+                return Promise.resolve();
+            }
+            const { promise, resolve } = Promise.withResolvers<void>();
+            proc.once("exit", () => resolve());
+            proc.stdin.end();
+            proc.kill();
+            return promise;
+        }));
+        await cleanup(dbPath);
+    }
+});
+
+test("setLayout and duplicateSession preserve deeply nested arbitrary JSON without native recursive serialization", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const { session } = seed(ws);
+        const depth = 8000;
+        const serialized = '{"metadata":'.repeat(depth) + "true" + "}".repeat(depth);
+        assert.ok(Buffer.byteLength(serialized) < MAX_LAYOUT_TREE_BYTES);
+        const tree: unknown = JSON.parse(serialized);
+        const saved = ws.setLayout({
+            serverId: SERVER, devSessionId: session.id, region: "viewer", tree,
+        });
+        const copy = ws.duplicateSession({ id: session.id });
+        for (const result of [saved.tree, copy.layouts.viewer]) {
+            let current: unknown = result;
+            for (let level = 0; level < depth; level++) {
+                assert.ok(current !== null && typeof current === "object" && "metadata" in current);
+                current = current.metadata;
+            }
+            assert.equal(current, true);
+        }
+    } finally {
+        ws.close();
+    }
+});
+
+test("pane deletion repairs and persists a deeply nested surviving split tree", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const { session, viewer } = seed(ws);
+        const depth = 2200;
+        const prefixes = Array.from(
+            { length: depth },
+            (_, level) => `{"type":"split","children":[{"type":"leaf","paneId":"keep-${level}"},`,
+        );
+        const serialized = prefixes.join("") +
+            JSON.stringify({ type: "leaf", paneId: viewer.id }) +
+            '],"ratios":[1,1]}'.repeat(depth);
+        assert.ok(Buffer.byteLength(serialized) < MAX_LAYOUT_TREE_BYTES);
+        ws.setLayout({
+            serverId: SERVER, devSessionId: session.id, region: "viewer", tree: JSON.parse(serialized),
+        });
+        ws.deleteViewerPane({ id: viewer.id });
+        const stored = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+        assert.ok(stored);
+        let current = stored.tree as { type: string; paneId?: string; children?: unknown[]; ratios?: number[] };
+        for (let level = 0; level < depth - 1; level++) {
+            assert.equal(current.type, "split");
+            assert.ok(Array.isArray(current.children));
+            assert.ok(Array.isArray(current.ratios));
+            assert.equal(current.children.length, 2);
+            assert.equal(current.ratios.length, 2);
+            assert.equal(current.ratios.every((ratio) => Number.isFinite(ratio) && ratio > 0), true);
+            current = current.children[1] as typeof current;
+        }
+        assert.equal(current.type, "leaf");
+        assert.equal(current.paneId, `keep-${depth - 1}`);
+        assert.deepEqual(ws.list(SERVER)[0].sessions[0].viewerPanes, []);
+    } finally {
+        ws.close();
+    }
+});
+
+test("layout serialization preserves JSON value conversions and rejects cyclic or non-JSON roots atomically", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const { session } = seed(ws);
+        const shared = { message: "shared" };
+        const saved = ws.setLayout({
+            serverId: SERVER,
+            devSessionId: session.id,
+            region: "viewer",
+            tree: {
+                type: "leaf",
+                paneId: "viewer-json",
+                absent: undefined,
+                omitted: () => "not a JSON value",
+                values: [undefined, Symbol("omitted"), NaN, Infinity, new Number(7), new String("text"), new Boolean(false)],
+                date: new Date("2020-01-02T03:04:05.000Z"),
+                converted: { toJSON: () => ({ converted: true }) },
+                first: shared,
+                second: shared,
+            },
+        });
+        assert.deepEqual(saved.tree, {
+            type: "leaf",
+            paneId: "viewer-json",
+            values: [null, null, null, null, 7, "text", false],
+            date: "2020-01-02T03:04:05.000Z",
+            converted: { converted: true },
+            first: { message: "shared" },
+            second: { message: "shared" },
+        });
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        const deeplyCircular: Record<string, unknown> = {};
+        let tail = deeplyCircular;
+        for (let level = 0; level < 8000; level++) {
+            const next: Record<string, unknown> = {};
+            tail.next = next;
+            tail = next;
+        }
+        tail.loop = deeplyCircular;
+        for (const invalid of [
+            circular, deeplyCircular, undefined, () => "not JSON", Symbol("not JSON"),
+            1n, Object(1n), { nested: 1n },
+        ]) {
+            assert.throws(
+                () => ws.setLayout({
+                    serverId: SERVER, devSessionId: session.id, region: "viewer", tree: invalid,
+                }),
+                isInvalidParams,
+            );
+            assert.deepEqual(ws.getLayout({ devSessionId: session.id, region: "viewer" }), saved);
+        }
+    } finally {
+        ws.close();
+    }
+});
+
+test("deleting a pane from an exact-cap layout preserves geometry when normalized ratios expand", () => {
+    const ws = openWorkspace(":memory:");
+    try {
+        const group = ws.createGroup({ serverId: SERVER, name: "G" });
+        const session = ws.createSession({
+            serverId: SERVER, groupId: group.id, name: "S", repositoryRoot: "/r",
+        });
+        const panes = Array.from({ length: 65 }, (_, index) => ws.createViewerPane({
+            serverId: SERVER,
+            devSessionId: session.id,
+            url: `https://example.com/${index}`,
+        }));
+        const tree = {
+            type: "split",
+            orientation: "horizontal",
+            children: panes.map((pane) => ({ type: "leaf", paneId: pane.id })),
+            ratios: panes.map(() => 1),
+            padding: "",
+        };
+        const baseline = Buffer.byteLength(JSON.stringify(tree));
+        tree.padding = "x".repeat(MAX_LAYOUT_TREE_BYTES - baseline);
+        assert.equal(Buffer.byteLength(JSON.stringify(tree)), MAX_LAYOUT_TREE_BYTES);
+        const original = ws.setLayout({
+            serverId: SERVER, devSessionId: session.id, region: "viewer", tree,
+        });
+        const removed = panes[32];
+        ws.deleteViewerPane({ id: removed.id });
+        const repaired = ws.getLayout({ devSessionId: session.id, region: "viewer" });
+        assert.ok(repaired);
+        const repairedTree = repaired.tree as typeof tree;
+        assert.equal(repaired.id, original.id);
+        assert.equal(repairedTree.padding, tree.padding);
+        assert.deepEqual(
+            repairedTree.children.map((leaf) => leaf.paneId),
+            panes.filter((pane) => pane.id !== removed.id).map((pane) => pane.id),
+        );
+        assert.equal(repairedTree.ratios.length, 64);
+        assert.equal(repairedTree.ratios.every((ratio) => ratio === 1 / 64), true);
+        assert.equal(repairedTree.ratios.reduce((sum, ratio) => sum + ratio, 0), 1);
+        const storedPanes = ws.list(SERVER)[0].sessions[0].viewerPanes;
+        assert.equal(storedPanes.length, 64);
+        assert.equal(storedPanes.some((pane) => pane.id === removed.id), false);
+        assert.ok(Buffer.byteLength(JSON.stringify(repairedTree)) > MAX_LAYOUT_TREE_BYTES);
+        // A server-derived rewrite may grow, but public writes keep their cap.
+        assert.throws(
+            () => ws.setLayout({
+                serverId: SERVER, devSessionId: session.id, region: "viewer", tree: repairedTree,
+            }),
+            isResourceLimit,
+        );
+        const copy = ws.duplicateSession({ id: session.id });
+        const copiedTree = copy.layouts.viewer as typeof tree;
+        assert.equal(copy.viewerPanes.length, 64);
+        assert.equal(copiedTree.padding, tree.padding);
+        assert.deepEqual(copiedTree.ratios, repairedTree.ratios);
+        assert.deepEqual(
+            new Set(copiedTree.children.map((leaf) => leaf.paneId)),
+            new Set(copy.viewerPanes.map((pane) => pane.id)),
+        );
+    } finally {
+        ws.close();
+    }
+});

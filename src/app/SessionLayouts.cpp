@@ -329,14 +329,13 @@ void SessionLayouts::setServerId(QString serverId)
     // trees and issues no request. AppController::setServerId already does this
     // from its side; enforcing it here too means the guarantee does not depend
     // on the order in which one caller happens to drive the two setters.
-    if (!m_devSessionId.isEmpty()) {
-        QPointer<SessionLayouts> self(this);
-        const quint64 generation = m_generation + 1;
-        load(QString());
-        if (!self || generation != m_generation)
-            return;
-    }
+    QPointer<SessionLayouts> self(this);
     m_serverId = std::move(serverId);
+    const QString selectedServer = m_serverId;
+    if (!m_devSessionId.isEmpty())
+        load(QString());
+    if (!self || selectedServer != m_serverId)
+        return;
     emit serverIdChanged();
 }
 
@@ -475,68 +474,71 @@ void SessionLayouts::publishTreeQuietly(int index)
     state.cache = obj.toVariantMap();
 }
 
-void SessionLayouts::clearTrees()
+void SessionLayouts::load(QString devSessionId)
+{
+    loadImpl(std::move(devSessionId), false);
+}
+
+void SessionLayouts::refresh()
+{
+    if (m_devSessionId.isEmpty() || !m_workspaceReady)
+        return;
+    loadImpl(m_devSessionId, true);
+}
+
+void SessionLayouts::loadImpl(QString devSessionId, bool preservePanes)
 {
     QPointer<SessionLayouts> self(this);
-    const quint64 generation = m_generation;
-    // The set names slots of the CURRENT Dev Session's terminal layout. Carrying
-    // it into another session would grant a same-named slot there permission to
-    // resolve by label, which is the one thing that must be earned per leaf.
-    m_legacyTerminalSlots.clear();
+    const bool sessionChanged = devSessionId != m_devSessionId;
+    const quint64 generation = ++m_generation;
+    if (!preservePanes)
+        ++m_paneGeneration;
+    m_devSessionId = std::move(devSessionId);
+    m_pendingLoads = m_devSessionId.isEmpty() ? 0 : kRegionCount;
+    m_pendingTerminalMints.clear();
+    bool cleared[kRegionCount]{};
+    // Commit the whole selection before publishing any part of it. A signal
+    // observer may immediately edit either region, so neither may still hold
+    // the previous session's tree under the new id/generation.
     for (int index = 0; index < kRegionCount; ++index) {
         RegionState& state = m_regions[index];
-        const bool wasValid = state.valid;
-        state = RegionState{};
-        if (!wasValid)
-            continue; // already null; no redundant signal
+        if (sessionChanged) {
+            cleared[index] = state.valid;
+            state = RegionState{};
+        }
+        state.loading = m_pendingLoads != 0;
+        state.pendingWrites.clear();
+        state.superseded = false;
+    }
+    if (sessionChanged)
+        m_legacyTerminalSlots.clear();
+
+    // Deliver invalidations even if an observer supersedes this load: both
+    // caches were already cleared, and a newer empty selection may have no
+    // further tree change to notify. Never republish a newer non-null tree.
+    for (int index = 0; index < kRegionCount; ++index) {
+        if (!cleared[index] || m_regions[index].valid)
+            continue;
         if (index == kTerminal)
             emit terminalTreeChanged();
         else
             emit viewerTreeChanged();
-        if (!self || generation != m_generation)
+        if (!self)
             return;
     }
-}
-
-void SessionLayouts::load(QString devSessionId)
-{
-    QPointer<SessionLayouts> self(this);
-    const bool sessionChanged = devSessionId != m_devSessionId;
-    // Bump first: any reply still on the wire now belongs to a superseded
-    // generation and will be dropped by applyLoadedTree.
-    const quint64 generation = ++m_generation;
-    emit generationChanged();
-    if (!self || generation != m_generation)
-        return;
-    m_devSessionId = std::move(devSessionId);
-    m_pendingLoads = 0;
-    // Every `terminal_panes` mint still on the wire was stamped with the
-    // generation just superseded, so its answer will be dropped on arrival:
-    // as far as this object is concerned none of them is in flight any more.
-    m_pendingTerminalMints.clear();
     if (sessionChanged) {
         emit devSessionIdChanged();
-        if (!self || generation != m_generation)
-            return;
-        // The previous session's panes must not linger while the new layout is
-        // in flight, and must not be edited into the new session either.
-        clearTrees();
-        if (!self || generation != m_generation)
+        if (!self)
             return;
     }
-    if (m_devSessionId.isEmpty()) {
-        clearPendingWrites();
-        return; // deselection: nothing to fetch
-    }
-
-    m_pendingLoads = kRegionCount;
-    // A deliberate reload adopts whatever the server has, so no earlier edit
-    // may veto it; only an edit made from HERE ON supersedes these replies.
-    for (RegionState& state : m_regions) {
-        state.loading = true;
-        state.pendingWrites.clear();
-        state.superseded = false;
-    }
+    emit generationChanged();
+    if (!self)
+        return;
+    if (!preservePanes)
+        emit paneGenerationChanged();
+    if (!self || generation != m_generation || m_devSessionId.isEmpty()
+        || !m_workspaceReady)
+        return;
     const DevSessionId sessionId{m_devSessionId};
     for (int index = 0; index < kRegionCount; ++index) {
         m_db->getLayout(sessionId, regionEnum(index),
@@ -548,7 +550,7 @@ void SessionLayouts::load(QString devSessionId)
                                                   std::move(tree),
                                                   std::move(err));
                         });
-        if (!self || generation != m_generation)
+        if (!self || generation != m_generation || !m_workspaceReady)
             return;
     }
 }
@@ -594,12 +596,13 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
 
     RegionState& state = m_regions[index];
     state.loading = false;
+    if (!m_workspaceReady)
+        return; // retain the last cache until accepted identity reloads it
     // A local edit has already replaced this region's tree since this load was
     // issued, so its answer - a tree, or the failure to fetch one - is history
     // either way: it predates what QML is showing AND what this client has
     // already persisted over it. Neither outcome may touch the region. Applying
-    // a tree would revert the edit (and on the seeding branch below would
-    // replace it with the region DEFAULT and write THAT to the server); giving
+    // a tree would revert the edit; giving
     // the region the "unusable layout" treatment for a FAILED or duplicate-key
     // answer would blank a layout the user just built and the server has
     // already accepted. See RegionState::superseded.
@@ -611,6 +614,28 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
         // put a tree in the slot (and cleared the queue).
         if (m_pendingLoads > 0 && --m_pendingLoads == 0)
             emit loaded(m_devSessionId);
+        return;
+    }
+    if (!err && !tree && !m_serverId.isEmpty()) {
+        // A null GET can race another client's first save. Initialize-if-absent
+        // creates the layout and terminal identities in one server transaction;
+        // publish only its winning tree, never a locally minted alternative.
+        state.loading = true;
+        m_db->ensureInitialLayout(
+            ServerId{m_serverId}, DevSessionId{m_devSessionId}, regionEnum(index),
+            defaultTree(index),
+            [self, generation, index](std::optional<SplitNode> initialized,
+                                       std::optional<RpcError> failure) {
+                if (!self)
+                    return;
+                const bool terminalRows = index == kTerminal && initialized && !failure;
+                self->applyLoadedTree(generation, index,
+                                      std::move(initialized), std::move(failure));
+                if (self && terminalRows && generation == self->m_generation
+                    && self->m_workspaceReady)
+                    emit self->terminalRowsChanged(
+                        self->m_serverId, self->m_devSessionId, generation);
+            });
         return;
     }
     if (err) {
@@ -645,68 +670,28 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
         }
     }
     if (!err) {
-        // No persisted layout for this region: adopt the default AND write it
-        // back, so it becomes the session's real layout instead of a shape that
-        // is re-derived on every load and lost the moment anything saves a tree.
-        //
-        // This is a deliberate reversal. The default used to be memory-only,
-        // reasoning that "a plain selection must not write to the server". That
-        // held while the default was one leaf, because one leaf is also what a
-        // region collapses to and what QML falls back to, so nothing could
-        // disagree with it. It does not hold for a MULTI-pane default: the QML
-        // fallback node is a single pane, and the first setRatios/setPaneUrl
-        // would persist whatever tree the region happened to be showing. The
-        // two stacked terminals have to be in the database to survive a restart,
-        // and the only moment we know a session has no layout is right here.
-        //
-        // Idempotent by construction: the write creates the row, so the next
-        // load for this session takes the `tree` branch and seeds nothing. Two
-        // clients racing both write the identical default.
-        const bool seeding = !tree;
+        // Without a selected server this remains an in-memory default; normal
+        // loads initialize through the authoritative transaction above.
+        const bool fromServer = tree.has_value();
+        bool legacyChanged = false;
         SplitNode next = tree ? std::move(*tree) : defaultTree(index);
         // Which terminal leaves may resolve by their slot LABEL. Recomputed
         // from scratch on every adopted server tree, and ONLY from a server
         // tree: a leaf the server has with no row id was written before layouts
-        // carried one, so its label really is its historical key. A leaf we
-        // seeded or split ourselves is not in here and never becomes so - it
-        // waits for the row being minted for it (see persist()).
+        // carried one, so its label really is its historical key. A local
+        // authored/split leaf waits for its own mint instead.
         if (index == kTerminal) {
             QSet<QString> legacy;
-            if (!seeding)
+            if (fromServer)
                 collectLegacyTerminalSlots(next, legacy);
+            legacyChanged = legacy != m_legacyTerminalSlots;
             m_legacyTerminalSlots = std::move(legacy);
         }
 
-        if (!state.valid || !(state.tree == next))
+        if (!state.valid || !(state.tree == next) || legacyChanged)
             setTree(index, std::move(next));
         if (!self || generation != m_generation)
             return;
-        // Not canEdit(): a load with no server selected yet is not a misuse and
-        // must not raise an error. The in-memory default still stands, and the
-        // first real edit persists it as before.
-        if (seeding && !m_devSessionId.isEmpty() && !m_serverId.isEmpty()) {
-            // Every terminal leaf of a freshly seeded default is brand new and
-            // needs a row of its own. persist() will hold the write back until
-            // the last of them lands, so the default reaches the server with
-            // its ids already in it rather than as id-less leaves a later load
-            // would have to read as pre-migration ones.
-            //
-            // Through the same funnel a QML-authored tree uses, rather than a
-            // second mint loop of its own: it already skips a leaf that carries
-            // a row id and one whose mint is on the wire, and the seeded tree
-            // is not always brand new — when the region was already showing
-            // exactly this default, setTree() above is skipped and the leaves
-            // still hold the ids of the mints that landed the first time round.
-            // A loop without those guards would order a second `terminal_panes`
-            // row for each of them, and nothing would ever be bound to it.
-            if (index == kTerminal)
-                adoptAuthoredTerminalTree(generation);
-            if (!self || generation != m_generation)
-                return;
-            persist(index);
-            if (!self || generation != m_generation)
-                return;
-        }
     }
     // A current-session gesture that arrived while this region was null is
     // replayed only after the authoritative tree (or the seeded default) is in
@@ -722,6 +707,11 @@ void SessionLayouts::applyLoadedTree(quint64 generation, int index,
 
 bool SessionLayouts::canEdit()
 {
+    if (!m_workspaceReady) {
+        emit error(QStringLiteral(
+            "SessionLayouts: server identity is not ready; layout edit ignored"));
+        return false;
+    }
     if (m_devSessionId.isEmpty()) {
         emit error(QStringLiteral(
             "SessionLayouts: no Dev Session selected; layout edit ignored"));
@@ -785,12 +775,6 @@ void SessionLayouts::queueWrite(int index, PendingWrite write)
     state.pendingWrites.push_back(std::move(write));
 }
 
-void SessionLayouts::clearPendingWrites()
-{
-    for (RegionState& state : m_regions)
-        state.pendingWrites.clear();
-}
-
 void SessionLayouts::flushPendingWrites(int index)
 {
     RegionState& state = m_regions[index];
@@ -805,7 +789,7 @@ void SessionLayouts::flushPendingWrites(int index)
     const QString devSessionId = m_devSessionId;
     const quint64 generation = m_generation;
     for (const PendingWrite& write : pending) {
-        if (!self || generation != m_generation)
+        if (!self || generation != m_generation || !m_workspaceReady)
             return;
         switch (write.kind) {
         case PendingWriteKind::Ratios:
@@ -854,6 +838,8 @@ bool SessionLayouts::hasPendingTerminalLeaf() const
 
 void SessionLayouts::persist(int index)
 {
+    if (!m_workspaceReady)
+        return;
     // Callers gate on canEdit(), so both ids are set here.
     //
     // Every write also retires any getLayout still on the wire for this region:
@@ -1216,7 +1202,7 @@ void SessionLayouts::abandonTerminalMint(const QString& paneId,
         publishTree(kTerminal);
         if (!self || generation != m_generation)
             return;
-        if (canEdit())
+        if (m_workspaceReady && canEdit())
             persist(kTerminal);
     }
     if (!self || generation != m_generation)
@@ -1226,6 +1212,8 @@ void SessionLayouts::abandonTerminalMint(const QString& paneId,
 
 void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& paneId)
 {
+    if (!m_workspaceReady)
+        return;
     CreateTerminalPaneParams params;
     params.serverId = ServerId{m_serverId};
     params.devSessionId = DevSessionId{m_devSessionId};
@@ -1292,8 +1280,11 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
             self->publishTree(kTerminal);
             if (!self || self->m_generation != generation)
                 return;
-            if (self->canEdit())
+            if (self->m_workspaceReady && self->canEdit())
                 self->persist(kTerminal);
+            if (self && self->m_generation == generation && self->m_workspaceReady)
+                emit self->terminalRowsChanged(
+                    self->m_serverId, self->m_devSessionId, generation);
         });
     if (!self || generation != m_generation)
         return;
@@ -1349,7 +1340,7 @@ void SessionLayouts::adoptAuthoredTerminalTree(quint64 generation)
     // use with it, exactly as closing that leaf would have done.
     m_legacyTerminalSlots.intersect(present);
     for (const QString& label : labels) {
-        if (!self || generation != m_generation)
+        if (!self || generation != m_generation || !m_workspaceReady)
             return;
         const SplitNode* leaf = findTerminalLeaf(label);
         if (!leaf || !leaf->terminalPaneId.isEmpty())
@@ -1404,7 +1395,8 @@ void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
                                          const QString& paneName,
                                          const QString& terminalPaneId)
 {
-    if (devSessionId != m_devSessionId || terminalPaneId.isEmpty())
+    if (!m_workspaceReady || devSessionId != m_devSessionId
+        || terminalPaneId.isEmpty() || !m_legacyTerminalSlots.contains(paneName))
         return;
     SplitNode* leaf = findTerminalLeaf(paneName);
     // Unknown pane (closed while the lookup travelled), or already bound. The
@@ -1423,8 +1415,14 @@ void SessionLayouts::bindTerminalPaneRow(const QString& devSessionId,
     // Quiet: the pane is already attached to this very row, and republishing
     // the terminal tree only to record what it just did would be churn. The
     // next load reads the id off the server.
+    QPointer<SessionLayouts> self(this);
+    const quint64 generation = m_generation;
     publishTreeQuietly(kTerminal);
+    if (!self || generation != m_generation || !m_workspaceReady)
+        return;
     persist(kTerminal);
+    if (self && generation == m_generation && m_workspaceReady)
+        emit terminalRowsChanged(m_serverId, m_devSessionId, generation);
 }
 
 void SessionLayouts::closePaneForSession(QString devSessionId,

@@ -14,6 +14,7 @@
 #include <QIODevice>
 #include <QRegularExpression>
 #include <QString>
+#include <QTemporaryDir>
 #include <QtTest/QtTest>
 
 #include <functional>
@@ -93,6 +94,7 @@ private:
     // never stand in for a new one.
     bool paneReportsSize(const QByteArray& tag, int cols, int rows, int timeoutMs);
 
+    QTemporaryDir m_knownHostsDirectory;
     SshConnectionPool m_pool;
     TerminalController m_controller;
     SshChannelDevice* m_device = nullptr;
@@ -127,8 +129,9 @@ void TstLiveTerminal::initTestCase()
     m_repo = env("CH_LIVE_REPO");
     m_knownHostsPath = env("CH_LIVE_KNOWN_HOSTS");
     if (m_knownHostsPath.isEmpty()) {
-        m_knownHostsPath =
-            QDir::temp().filePath(QStringLiteral("ch_live_terminal_known_hosts"));
+        QVERIFY2(m_knownHostsDirectory.isValid(),
+                 qPrintable(m_knownHostsDirectory.errorString()));
+        m_knownHostsPath = m_knownHostsDirectory.filePath(QStringLiteral("known_hosts"));
     }
 
     QVERIFY2(!m_host.isEmpty() && m_port != 0 && !m_user.isEmpty()
@@ -157,7 +160,7 @@ void TstLiveTerminal::initTestCase()
     // test invented and the terminal id is the row id it minted above. It only
     // has to be non-empty for the two OMP_* variables to be exported.
     m_attachCommand = TerminalController::tmuxNewSessionCommand(
-        m_sessionName, m_repo, QStringLiteral("ch_live"), terminalRowId);
+        m_sessionName, m_repo, QStringLiteral("ch_live"), terminalRowId, QString(), QString());
     m_marker = QByteArrayLiteral("CH_LIVE_MARKER_") + terminalRowId.toLatin1();
 
     // Collect what the renderer would see, and acknowledge it as the renderer

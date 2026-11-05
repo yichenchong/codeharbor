@@ -338,7 +338,7 @@ void MobileAppController::adoptActiveSession()
     // reply can genuinely arrive before this handler does. Re-arming here would
     // then park the shell on a load that had already finished.
     if (devSessionId == m_shownSessionId && m_pendingSessionId.isEmpty()
-        && m_layouts && m_shownLayoutGeneration == m_layouts->generation())
+        && m_layouts && m_shownPaneGeneration == m_layouts->paneGeneration())
         return;
 
     // Whatever we were waiting for is history: this is the newest load, and it
@@ -382,7 +382,7 @@ void MobileAppController::onLayoutsLoaded(const QString& devSessionId)
 
     m_pendingSessionId.clear();
     m_shownSessionId = devSessionId;
-    m_shownLayoutGeneration = m_layouts->generation();
+    m_shownPaneGeneration = m_layouts->paneGeneration();
     setLayoutPending(false);
     // setTrees BEFORE the stage moves: setNavStage(Panes) is what makes the
     // picker visible, and it must never be visible over the previous session's

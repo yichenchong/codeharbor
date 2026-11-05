@@ -378,7 +378,7 @@ public:
         m_calls.append(QStringLiteral("setSessionPinned(%1,%2)")
                                .arg(id, pinned ? QStringLiteral("true") : QStringLiteral("false")));
     }
-    Q_INVOKABLE void archiveSession(QString id)
+    Q_SLOT void archiveSession(QString id)
     {
         m_calls.append(QStringLiteral("archiveSession(%1)").arg(id));
     }
@@ -424,6 +424,9 @@ public:
         view.setResizeMode(QQuickView::SizeRootObjectToView);
         view.resize(320, 700);
         view.setSource(sidebarUrl());
+        if (view.rootObject())
+            QObject::connect(view.rootObject(), SIGNAL(archiveSessionRequested(QString)),
+                             &app, SLOT(archiveSession(QString)));
     }
 
     QQuickItem *root() const { return view.rootObject(); }

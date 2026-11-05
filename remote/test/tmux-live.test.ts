@@ -25,8 +25,8 @@
 // the first attempt. Verified both ways — under the tab it fails with an empty
 // listing, under the shipped separator it passes.
 //
-// The server is private (`-L`) so a test never creates, lists or kills sessions
-// on the server holding somebody's work.
+// The server is private (`-L`) and starts without user configuration (`-f`),
+// so tests neither touch somebody's sessions nor run their startup hooks.
 //
 // Skipped, never failed, when tmux is absent: a machine without tmux is a
 // legitimate place to run the remote suite.
@@ -74,7 +74,7 @@ const runner: CommandRunner = (argv) =>
     new Promise<CommandResult>((resolve) => {
         execFile(
             "tmux",
-            ["-L", SOCKET, ...argv],
+            ["-L", SOCKET, "-f", "/dev/null", ...argv],
             { encoding: "utf8", env: PRODUCTION_ENV },
             (err, stdout, stderr) => {
                 if (err === null) {
@@ -241,5 +241,46 @@ test(
         );
         await killSession({ name: `${base};` }, runner);
         assert.deepEqual((await listSessions(runner)).map((session) => session.name), [base]);
+    },
+);
+
+test(
+    "listing-to-kill preserves literal backslash, separator and target-sigil names",
+    { skip: SKIP },
+    async (t) => {
+        t.after(async () => {
+            await runner(["kill-server"]);
+        });
+        const sentinel = `${SESSION}_identity`;
+        const created = await runner(["new-session", "-d", "-s", sentinel]);
+        assert.equal(created.code, 0, created.stderr);
+
+        // tmux normalizes backslashes at creation time. The exact name to kill
+        // is the one discovery returns, not the string passed to new-session.
+        for (const requested of [
+            `${sentinel}\\;`,
+            `${sentinel}\\\\;`,
+            `${sentinel}\\`,
+            `${sentinel};;`,
+            `=${sentinel}`,
+            "@0",
+            "%0",
+            `${sentinel}*`,
+            "-a",
+        ]) {
+            const added = await runner([
+                "new-session", "-d", "-s", requested.replace(/;$/, "\\;"),
+            ]);
+            assert.equal(added.code, 0, added.stderr);
+            const sessions = await listSessions(runner);
+            const candidate = sessions.filter((session) => session.name !== sentinel);
+            assert.equal(candidate.length, 1, JSON.stringify(sessions));
+            await killSession({ name: candidate[0].name }, runner);
+            assert.deepEqual(
+                (await listSessions(runner)).map((session) => session.name),
+                [sentinel],
+                `killing ${JSON.stringify(candidate[0].name)} changed another session`,
+            );
+        }
     },
 );

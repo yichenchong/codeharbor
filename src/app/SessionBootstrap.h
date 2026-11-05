@@ -138,6 +138,9 @@ public:
     SshChannelDevice* agentDevice() const { return m_agentDevice; }
 
     State state() const { return m_state; }
+    // Includes the synchronous Connecting/Wired notification boundaries, not
+    // only nested preflight/provisioning waits.
+    bool attemptInProgress() const { return m_connectRequested || m_attempting; }
 
     // Reconnect attempts made since the last successful wire; 0 while Wired.
     int reconnectAttempt() const { return m_attempt; }
@@ -174,6 +177,8 @@ public:
     // connect attempt (including probeEndpoint() or remote provisioning's
     // nested event loop), unwires both consumers, drops the SSH session and
     // ends in State::Disconnected WITHOUT scheduling a reconnect.
+    // A pending RPC callback may itself disconnect while a loss is unwiring
+    // the streams; that newer teardown supersedes the outer reconnect tail.
     void disconnectSession();
 
     // Retry delay in seconds for the Nth (0-based) automatic reconnect attempt:
@@ -524,7 +529,7 @@ private:
     // today into unreachable ones.
     bool ensureRemoteService();
 
-    SshConnectionPool* m_pool = nullptr;
+    QPointer<SshConnectionPool> m_pool;
     QPointer<CodeharbordClient> m_client;
     QPointer<AgentStatusMonitor> m_monitor;
     SshChannelDevice* m_rpcDevice = nullptr;
@@ -547,6 +552,8 @@ private:
     QHash<QString, QString> m_channelDiagnostics;
 
     State m_state = State::Disconnected;
+    // Disconnect/replacement decisions retire an outer loss or teardown tail.
+    quint64 m_lifecycleGeneration = 0;
     QTimer* m_reconnectTimer = nullptr;
     // Last target handed to connectAndWire(), replayed by every retry.
     QString m_host;

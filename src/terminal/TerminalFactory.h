@@ -48,6 +48,7 @@ class SshConnectionPool;
 // reasons must not be re-reported when the session later goes down.
 class TerminalFactory : public QObject {
     Q_OBJECT
+    Q_PROPERTY(bool workspaceReady READ workspaceReady NOTIFY workspaceReadyChanged)
 public:
     explicit TerminalFactory(SshConnectionPool* pool, QObject* parent = nullptr);
 
@@ -98,13 +99,13 @@ public:
     //     found so the leaf can be backfilled and never ask by label again.
     //
     // Returns false when no resolution was started — no controller, no Dev
-    // Session, no pane name for a legacy label lookup, or no server to ask —
+    // Session, no pane name for a legacy lookup, or no accepted workspace/SSH —
     // A lookup and a create both need the server, so this refuses in exactly
     // the cases attach() does rather than inventing a target locally.
     //
-    // True means targetResolved() WILL be emitted for this controller, always
-    // asynchronously (a cached answer is posted, not delivered inline) so a
-    // caller can finish assigning its own state before the answer arrives.
+    // True means targetResolved() will be emitted asynchronously unless the
+    // controller is destroyed, detached, superseded, or loses workspace readiness.
+    // A cached answer is posted so callers can assign their state first.
     // Idempotent per pane: a second call while one is in flight joins it rather
     // than creating a second row, and an answer once known is remembered for
     // the rest of the process — including across a reconnect, so re-attaching
@@ -148,6 +149,12 @@ public:
     // identity, are meaningless on another one.
     void setWorkspace(WorkspaceDb* workspace);
     void setServerId(const QString& serverId);
+    // A live SSH connection is not permission to use a remembered workspace.
+    // The application closes this gate before connecting/disconnecting and
+    // opens it only after server.info and the current layout/server context
+    // have been accepted, including reconnects to the same server id.
+    bool workspaceReady() const;
+    void setWorkspaceReady(bool ready);
 
     // The RPC peer the out-of-band `tmux.listSessions` diagnostic is asked
     // over; injected, not owned, and nullptr simply turns that diagnostic off.
@@ -166,6 +173,11 @@ public:
     // unsets it in the pane rather than leaving a stale value.
     void setControlSocket(const QString& socketPath);
     QString controlSocket() const { return m_controlSocket; }
+    // Exact event endpoint from accepted server.info, never inferred from the
+    // SSH or tmux master's HOME/XDG environment. Only new tmux children inherit
+    // an update; an already-running shell/agent keeps its original environment.
+    void setAgentSocket(const QString& socketPath);
+    QString agentSocket() const { return m_agentSocket; }
 
 
     // A pane's harness changed on the server, so the remembered answer for it
@@ -225,7 +237,8 @@ public:
                             int cols,
                             int rows);
 
-    // Release the pane's channel without touching the remote tmux session, so
+    // Release the pane's channel and cancel its pending resolution without
+    // touching the remote tmux session or remembered attach authorization, so
     // a later attach() (or another client) finds the work still running.
     Q_INVOKABLE void detach(ch::TerminalController* controller);
 
@@ -260,6 +273,7 @@ public:
     static QString tmuxKillSessionCommand(const QString& target);
 
 signals:
+    void workspaceReadyChanged();
     // Attach failures and mid-session channel diagnostics, tagged with the pane
     // they belong to so one pane's failure is not reported on all of them.
     void error(ch::TerminalController* controller, const QString& message);
@@ -352,6 +366,7 @@ private:
         // the terminal the pane has just left; adopting it is what made a
         // retargeted pane attach to the previous Dev Session's shell.
         QString pendingResolveKey;
+        quint64 resolveGeneration = 0;
         // The TerminalController::outputReceived -> AgentStatusMonitor
         // forwarding for this pane. Held rather than fired and forgotten so an
         // identity change can tear it down and re-make it: a second connection
@@ -450,10 +465,13 @@ private:
     // it prints from here on is attributed to anybody.
     void clearAgentIdentity(ch::TerminalController* controller);
 
-    // One pane's outstanding resolveTarget() calls: every controller waiting on
-    // the same resolution key (a row id, or a legacy "<devSession>/<label>").
-    // Weak, because a pane can be closed while its lookup is in flight.
-    using Waiters = QList<QPointer<TerminalController>>;
+    // Each pane's latest request within one shared lookup. The generation
+    // distinguishes a cancelled request from a later request for the same key.
+    struct ResolutionWaiter {
+        QPointer<TerminalController> controller;
+        quint64 generation;
+    };
+    using Waiters = QList<ResolutionWaiter>;
 
     // Hand `target` (empty = failed) to everything waiting on `key` and forget
     // the key's in-flight state. `message` is reported through error() first,
@@ -461,6 +479,8 @@ private:
     // a cached one, and a server change all arrive here — and therefore also
     // the single place a pane's agent-status identity is adopted.
     void finishResolution(const QString& key, const QString& target, const QString& message);
+    void deliverResolution(const QString& key, const Waiters& waiters,
+                           const QString& target, const QString& message);
 
     SshConnectionPool* m_pool = nullptr;
     // Keyed on the controller; entries are dropped when it is destroyed and
@@ -473,10 +493,12 @@ private:
     // AppController declared above it.
     WorkspaceDb* m_workspace = nullptr;
     QString m_serverId;
+    bool m_workspaceReady = false;
     // Invalidates queued/cache and RPC completions even across A -> B -> A.
     quint64 m_resolutionEpoch = 0;
     // The current daemon's viewer control socket; empty when it reported none.
     QString m_controlSocket;
+    QString m_agentSocket;
     // RPC peer for the `tmux.listSessions` diagnostic; injected, not owned, and
     // a QPointer because it IS a QObject and nothing here has to be told when
     // it goes away — a null one simply means no diagnostic.

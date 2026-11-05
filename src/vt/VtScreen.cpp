@@ -946,18 +946,13 @@ void VtScreen::scrollDownLines(int count)
 
 void VtScreen::setScrollRegion(int top1Based, int bottom1Based)
 {
-    int top = top1Based - 1;
-    int bottom = bottom1Based - 1;
-    if (bottom <= 0 || bottom >= m_rows)
-        bottom = m_rows - 1;
-    if (top < 0)
-        top = 0;
-    if (top >= bottom) {
-        // A degenerate region (equal or inverted) means "no region" and resets to
-        // the full screen; honouring a one-line region would trap the cursor.
-        top = 0;
-        bottom = m_rows - 1;
-    }
+    const int top = qMax(1, top1Based) - 1;
+    const int bottom = bottom1Based <= 0 ? m_rows - 1
+                                        : qMin(bottom1Based, m_rows) - 1;
+    // Zero selects the default, but an explicit bottom of 1 does not. Invalid
+    // equal or inverted margins leave BOTH the region and cursor unchanged.
+    if (top >= bottom)
+        return;
     m_scrollTop = top;
     m_scrollBottom = bottom;
     // DECSTBM homes the cursor, which programs rely on: they set the region and
@@ -1114,7 +1109,10 @@ void VtScreen::applySgr(const int *params, const bool *isSubParam, int count)
             continue;
         }
 
-        applySimpleSgr(code);
+        if (code == 4 && subCount > 0 && params[index + 1] == 0)
+            m_attrs &= static_cast<quint16>(~VtUnderline);
+        else
+            applySimpleSgr(code);
         // Skip any sub-parameters: "4:3" is a curly underline, and reading the 3
         // as a separate code would turn it into italics.
         index = subEnd;
@@ -1352,7 +1350,7 @@ void VtScreen::softReset()
     m_pendingWrap = false;
     m_savedCursor = SavedCursor{};
     m_savedCursorAlt = SavedCursor{};
-    moveCursor(0, 0);
+    // DECSTR resets the saved cursor to home, not the active cursor.
     m_modesDirty = true;
     m_cursorDirty = true;
 }

@@ -432,6 +432,13 @@ private slots:
     void synchronousChannelLossFailsWiring_data();
     void synchronousChannelLossFailsWiring();
     void synchronousChannelLossDuringRetryHonorsTheAttemptCap();
+    void pendingCallDisconnectDuringLossDoesNotRestartTheLadder();
+    void pendingCallObserverMayDestroyTheBootstrap();
+    void stateObserversMayDestroyTheBootstrap_data();
+    void stateObserversMayDestroyTheBootstrap();
+    void deletingTheBootstrapDuringAProbeStopsTheWait();
+    void provisioningStateCancellationDoesNotRunTheInstaller();
+    void destroyingThePoolBeforeHandshakeFailsCleanly();
 };
 
 void TstSessionBootstrap::reconnectStateObserverCanCancelBeforeTheTimerIsArmed_data()
@@ -3525,6 +3532,149 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
         QVERIFY(QFile::remove(unsafeLock));
     }
 #endif
+}
+
+void TstSessionBootstrap::pendingCallObserverMayDestroyTheBootstrap()
+{
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    QPointer<TestBootstrap> boot = new TestBootstrap(&pool, &client, &monitor);
+    boot->setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    boot->setTrustUnknownHostKeys(true);
+    QVERIFY(boot->connectAndWire(
+        QStringLiteral("example.invalid"), 2222, QStringLiteral("user"),
+        QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/codeharbor")));
+    bool failed = false;
+    client.call(QStringLiteral("workspace.list"), QJsonValue(),
+                [&](QJsonValue, std::optional<RpcError> error) {
+                    QVERIFY(error.has_value());
+                    failed = true;
+                    delete boot.data();
+                });
+    static_cast<FakeChannel*>(boot->agentDevice())->dropRemote();
+    QVERIFY(failed);
+    QVERIFY(boot.isNull());
+    QVERIFY(!client.transport());
+    QVERIFY(!monitor.transport());
+}
+
+void TstSessionBootstrap::destroyingThePoolBeforeHandshakeFailsCleanly()
+{
+    QPointer<SshConnectionPool> pool = new SshConnectionPool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    TestBootstrap boot(pool, &client, &monitor);
+    connect(&boot, &SessionBootstrap::stateChanged, &boot, [&](State state) {
+        if (state == State::Connecting)
+            delete pool.data();
+    });
+    QVERIFY(!boot.connectAndWire(
+        QStringLiteral("example.invalid"), 2222, QStringLiteral("user"),
+        QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/codeharbor")));
+    QVERIFY(pool.isNull());
+    QCOMPARE(boot.state(), State::Failed);
+    QVERIFY(!boot.rpcDevice());
+    QVERIFY(!boot.agentDevice());
+}
+
+void TstSessionBootstrap::pendingCallDisconnectDuringLossDoesNotRestartTheLadder()
+{
+    Harness h;
+    QVERIFY(h.wire());
+    QSignalSpy scheduled(&h.boot, &SessionBootstrap::reconnectScheduled);
+    bool failed = false;
+    h.client.call(QStringLiteral("workspace.list"), QJsonValue(),
+                  [&](QJsonValue, std::optional<RpcError> error) {
+                      QVERIFY(error.has_value());
+                      failed = true;
+                      h.boot.disconnectSession();
+                  });
+    static_cast<FakeChannel*>(h.boot.agentDevice())->dropRemote();
+    QVERIFY(failed);
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QVERIFY(!h.boot.reconnectPending());
+    QCOMPARE(scheduled.count(), 0);
+    QVERIFY(!h.client.transport());
+    QVERIFY(!h.monitor.transport());
+    QCOMPARE(h.boot.connectCalls, 1);
+}
+
+void TstSessionBootstrap::stateObserversMayDestroyTheBootstrap_data()
+{
+    QTest::addColumn<State>("target");
+    QTest::newRow("connecting") << State::Connecting;
+    QTest::newRow("provisioning") << State::Provisioning;
+    QTest::newRow("wired") << State::Wired;
+    QTest::newRow("reconnecting") << State::Reconnecting;
+}
+
+void TstSessionBootstrap::stateObserversMayDestroyTheBootstrap()
+{
+    QFETCH(State, target);
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    QPointer<TestBootstrap> boot = new TestBootstrap(&pool, &client, &monitor);
+    boot->setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    boot->setTrustUnknownHostKeys(true);
+    if (target == State::Provisioning) {
+        boot->setRemoteArtifactUrl(artifactUrl());
+        boot->fakeScript(true, inspectionReport());
+    }
+    connect(boot, &SessionBootstrap::stateChanged, &client, [&](State state) {
+        if (state == target)
+            delete boot.data();
+    });
+    const bool connected = boot->connectAndWire(
+        QStringLiteral("example.invalid"), 2222, QStringLiteral("user"),
+        QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/codeharbor"));
+    if (target == State::Reconnecting) {
+        QVERIFY(connected);
+        boot->rpcChannel()->dropRemote();
+    } else {
+        QVERIFY(!connected);
+    }
+    QVERIFY(boot.isNull());
+    QVERIFY(!client.transport());
+    QVERIFY(!monitor.transport());
+}
+
+void TstSessionBootstrap::deletingTheBootstrapDuringAProbeStopsTheWait()
+{
+    ProbeServer server;
+    server.mute = true;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    QPointer<TestBootstrap> boot = new TestBootstrap(&pool, &client, &monitor);
+    boot->realProbe = true;
+    boot->onProbeStarted = [&] { delete boot.data(); };
+    const bool connected = boot->connectAndWire(
+        QStringLiteral("127.0.0.1"), server.serverPort(), QStringLiteral("user"),
+        QStringLiteral("/usr/bin/node"), QStringLiteral("/srv/codeharbor"));
+    QVERIFY(!connected);
+    QVERIFY(boot.isNull());
+    QVERIFY(!client.transport());
+    QVERIFY(!monitor.transport());
+}
+
+void TstSessionBootstrap::provisioningStateCancellationDoesNotRunTheInstaller()
+{
+    Harness h;
+    h.boot.setRemoteArtifactUrl(artifactUrl());
+    h.boot.fakeScript(true, inspectionReport());
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot, [&](State state) {
+        if (state == State::Provisioning)
+            h.boot.disconnectSession();
+    });
+    QVERIFY(!h.wire());
+    QCOMPARE(h.boot.state(), State::Disconnected);
+    QCOMPARE(h.boot.scriptsRun.size(), 1);
+    QVERIFY(h.boot.channels.isEmpty());
 }
 
 // Guiless: nothing here needs a display, and QTEST_MAIN would pull in

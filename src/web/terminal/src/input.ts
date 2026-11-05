@@ -192,11 +192,12 @@ function assertBinaryString(bytes: string): void {
 }
 
 export interface TerminalInputSink {
-    sendInput(data: string): void;
+    readonly inputGeneration: number;
+    sendInput(data: string, generation: number, done: (accepted: boolean) => void): void;
     /** Byte-safe counterpart of sendInput(): `base64` decodes to the exact
      *  bytes the terminal produced (see writeBinary() below and
      *  ch::TerminalBridge::sendBinaryInput). */
-    sendBinaryInput(base64: string): void;
+    sendBinaryInput(base64: string, generation: number, done: (accepted: boolean) => void): void;
 }
 
 /** One queued call: which slot it belongs to, and the payload for that slot. */
@@ -204,14 +205,15 @@ interface TerminalInputChunk {
     /** True when `payload` is base64 destined for sendBinaryInput(). */
     readonly binary: boolean;
     readonly payload: string;
+    readonly generation: number;
 }
 
 /**
- * Send one input chunk per event-loop turn while a paste is queued. A microtask
- * does not yield to WebChannel delivery, resize or paint: recursively scheduling
- * microtasks drains the entire paste before any of those tasks can run. A timer
- * gives them an opportunity between chunks without reordering the bytes. The
- * first chunk of otherwise idle input is still sent immediately.
+ * Wait for the backend to accept each chunk, then yield one event-loop turn
+ * before sending the next. This bounds WebChannel input in flight as well as
+ * yielding to resize and paint. Every chunk retains the PTY generation observed
+ * when its input was queued; a partial write or stale-generation refusal stops
+ * the remaining paste. The first idle chunk is still sent immediately.
  *
  * Text and binary share this ONE queue, and that is the point of routing binary
  * through here at all rather than calling the bridge directly. A mouse report
@@ -227,6 +229,7 @@ export class TerminalInputWriter {
     private inFlight = false;
     private scheduled = false;
     private closed = false;
+    private epoch = 0;
     constructor(sink: TerminalInputSink, maxBytes = kTerminalInputChunkBytes) {
         if (!Number.isFinite(maxBytes) || !Number.isInteger(maxBytes) || maxBytes < 1) {
             throw new RangeError("maxBytes must be a positive integer");
@@ -247,8 +250,9 @@ export class TerminalInputWriter {
         // into more chunks than the engine's argument limit (hundreds of
         // thousands, which a small maxBytes reaches easily) makes the spread
         // form throw RangeError and lose the whole paste.
+        const generation = this.sink.inputGeneration;
         for (const chunk of chunkTerminalInput(data, this.maxBytes)) {
-            this.backlog.push({ binary: false, payload: chunk });
+            this.backlog.push({ binary: false, payload: chunk, generation });
         }
         this.pump();
     }
@@ -277,18 +281,27 @@ export class TerminalInputWriter {
             return;
         }
         assertBinaryString(bytes);
+        const generation = this.sink.inputGeneration;
         for (let offset = 0; offset < bytes.length; offset += this.maxBytes) {
             this.backlog.push({
                 binary: true,
                 payload: btoa(bytes.slice(offset, offset + this.maxBytes)),
+                generation,
             });
         }
         this.pump();
     }
 
+    /** Discard unsent input when the PTY lifecycle changes. An in-flight reply
+     *  may still arrive, but cannot cancel input queued after this boundary. */
+    cancelPending(): void {
+        ++this.epoch;
+        this.backlog.length = 0;
+    }
+
     close(): void {
         this.closed = true;
-        this.backlog.length = 0;
+        this.cancelPending();
     }
 
     private pump(): void {
@@ -300,34 +313,43 @@ export class TerminalInputWriter {
             return;
         }
         this.inFlight = true;
-        let sent = false;
-        try {
-            if (chunk.binary) {
-                this.sink.sendBinaryInput(chunk.payload);
-            } else {
-                this.sink.sendInput(chunk.payload);
+        const epoch = this.epoch;
+        let completed = false;
+        const done = (accepted: boolean): void => {
+            if (completed) {
+                return;
             }
-            sent = true;
-        } catch (error) {
-            // A transient WebChannel failure must not silently lose a key or
-            // part of a paste. Keep the failed chunk at the front; a later
-            // write() can retry it, while close() still discards it during
-            // teardown.
-            this.backlog.unshift(chunk);
-            throw error;
-        } finally {
+            completed = true;
             this.inFlight = false;
-            // Do not spin retrying a failed bridge call. The next write is the
-            // explicit opportunity to retry. While a successful drain is
-            // scheduled, new writes must join the queue instead of bypassing
-            // the event-loop yield.
-            if (sent && this.backlog.length > 0 && !this.closed) {
+            // A failed or partial write cannot be retried automatically. The
+            // remote shell may already hold its prefix; stop this paste.
+            if (!accepted && epoch === this.epoch) {
+                this.backlog.length = 0;
+            }
+            if (this.backlog.length > 0 && !this.closed) {
                 this.scheduled = true;
                 setTimeout(() => {
                     this.scheduled = false;
                     this.pump();
                 }, 0);
             }
+        };
+        try {
+            if (chunk.binary) {
+                this.sink.sendBinaryInput(chunk.payload, chunk.generation, done);
+            } else {
+                this.sink.sendInput(chunk.payload, chunk.generation, done);
+            }
+        } catch (error) {
+            // A synchronous bridge exception means dispatch never completed.
+            // Keep this chunk for an explicit later write, not a timer retry.
+            if (!completed) {
+                this.inFlight = false;
+                if (!this.closed && epoch === this.epoch) {
+                    this.backlog.unshift(chunk);
+                }
+            }
+            throw error;
         }
     }
 }

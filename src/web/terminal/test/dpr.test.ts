@@ -106,3 +106,45 @@ test("a ratio inherited from a prototype is overridden and then restored", () =>
     assert.equal(controller.state.effective, 3);
     assert.equal(controller.state.actual, 3);
 });
+
+for (const inherited of [false, true]) {
+    test(`screen changes update an active ${inherited ? "inherited" : "own"} ratio override`, () => {
+        let screenRatio = 3;
+        const source = {};
+        Object.defineProperty(source, "devicePixelRatio", {
+            configurable: true,
+            get: () => screenRatio,
+        });
+        const view = (inherited ? Object.create(source) : source) as {
+            devicePixelRatio: number;
+            dispatchEvent: () => boolean;
+            Event: typeof Event;
+        };
+        view.dispatchEvent = () => true;
+        view.Event = Event;
+        const controller = createDevicePixelRatioController(view);
+        assert.equal(controller.set(2).effective, 2);
+
+        // Re-applying the same preference on a lower-density screen must not
+        // leave a backing store larger than that screen's physical pixels.
+        screenRatio = 1.25;
+        assert.deepEqual(controller.set(2), {
+            actual: 1.25,
+            effective: 1.25,
+            overridden: false,
+        });
+        assert.equal(view.devicePixelRatio, 1.25);
+
+        // A move in the other direction honors the preference immediately,
+        // without requiring a second settings update to learn the new ratio.
+        screenRatio = 3.5;
+        assert.deepEqual(controller.set(2), {
+            actual: 3.5,
+            effective: 2,
+            overridden: true,
+        });
+        assert.equal(view.devicePixelRatio, 2);
+        controller.restore();
+        assert.equal(view.devicePixelRatio, 3.5);
+    });
+}

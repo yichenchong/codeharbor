@@ -122,6 +122,7 @@ Item {
     // alive preserves the pane's page object while still issuing a fresh
     // request for the current address.
     function reload() {
+        root.errorText = "";
         webView.reload();
     }
 

@@ -9,6 +9,7 @@
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isEntrypoint } from "./tools/entrypoint.ts";
 import { adapterFor } from "./adapters/index.ts";
 import { nativeString } from "./adapters/types.ts";
@@ -20,6 +21,14 @@ import {
     resolveSocketPath,
     type AgentEvent,
 } from "./events.ts";
+import { JsonDepthLimitError, JsonSizeLimitError, stringifyJson } from "./json.ts";
+import {
+    BRIDGE_SUBSCRIBE_PROTOCOL,
+    BridgeSubscribers,
+    bridgeRelayIdleMs,
+    parseBridgeSubscription,
+    runBridgeProxy,
+} from "./bridge-relay.ts";
 
 // Upper bound on one line arriving on the bridge socket. A bridge message is a
 // handful of short identifiers plus an optional one-line summary, so a
@@ -28,6 +37,10 @@ import {
 // smaller than codeharbord's 16 MiB transport cap: that one has to carry whole
 // file contents, this one never does.
 export const MAX_BRIDGE_LINE_BYTES = 1024 * 1024;
+
+// Qt's QJsonDocument accepts at most 1024 nested containers, including the
+// AgentEvent envelope. Deeper optional metadata must not hide the state event.
+export const MAX_BRIDGE_JSON_DEPTH = 1024;
 
 /**
  * Does one serialized JSONL message fit inside the relay's line bound?
@@ -64,7 +77,18 @@ function bridgeLockPath(socketPath: string): string {
     return `${socketPath}${BRIDGE_LOCK_SUFFIX}`;
 }
 
-function acquireBridgeLock(socketPath: string): string {
+function unlinkOwnedPath(filePath: string, identity: fs.Stats): void {
+    try {
+        const current = fs.lstatSync(filePath);
+        if (current.dev === identity.dev && current.ino === identity.ino) {
+            fs.unlinkSync(filePath);
+        }
+    } catch {
+        // Already removed, replaced, or no longer accessible.
+    }
+}
+
+function acquireBridgeLock(socketPath: string): () => void {
     const lockPath = bridgeLockPath(socketPath);
     for (;;) {
         const tempPath = `${lockPath}.${process.pid}.${Date.now()}.${Math.random()}`;
@@ -75,11 +99,12 @@ function acquireBridgeLock(socketPath: string): string {
                 mode: 0o600,
             });
             try {
+                const identity = fs.lstatSync(tempPath);
                 // Publishing the fully written PID with linkSync is atomic:
                 // no contender can observe an empty ownership record.
                 fs.linkSync(tempPath, lockPath);
                 fs.unlinkSync(tempPath);
-                return lockPath;
+                return () => unlinkOwnedPath(lockPath, identity);
             } catch (err) {
                 try {
                     fs.unlinkSync(tempPath);
@@ -449,6 +474,35 @@ export function createBridgeLineFramer(
 }
 
 
+/** Encode once for either a direct sink or every reader of the shared relay. */
+function encodeBridgeEvent(event: AgentEvent): string | null {
+    let candidate = event;
+    for (;;) {
+        try {
+            const payload = stringifyJson(candidate, MAX_BRIDGE_LINE_BYTES, MAX_BRIDGE_JSON_DEPTH);
+            if (payload === undefined) throw new TypeError("Agent event is not JSON-serializable");
+            return `${payload}\n`;
+        } catch (err) {
+            if (!(err instanceof JsonSizeLimitError) && !(err instanceof JsonDepthLimitError)) throw err;
+            // Optional decoration must not hide the authoritative state event.
+            if (candidate === event) candidate = { ...event };
+            if (candidate.metadata !== undefined) {
+                delete candidate.metadata;
+                continue;
+            }
+            if (candidate.summary !== undefined) {
+                delete candidate.summary;
+                continue;
+            }
+            process.stderr.write(
+                `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte ` +
+                `or ${MAX_BRIDGE_JSON_DEPTH}-container frame bound\n`,
+            );
+            return null;
+        }
+    }
+}
+
 /**
  * Default sink: relay events as JSONL on `out` (stdout in production),
  * honouring back-pressure. When out.write() reports a full buffer it pauses
@@ -497,35 +551,17 @@ export function makeStreamSink(out: NodeJS.WritableStream): EventSink {
         // source. Keep this guard for custom callers so a full output stream
         // can never be fed another event synchronously.
         if (paused.has(source)) return;
-        let payload: string;
+        let line: string | null;
         try {
-            payload = JSON.stringify(event);
+            line = encodeBridgeEvent(event);
         } catch {
             source.destroy();
             return;
         }
-        // Mapping adds the output timestamp/state envelope, so a producer line
-        // that fits exactly can become too large here. Preserve the state
-        // transition by shedding optional decoration, as the producers do.
-        if (!bridgeLineFits(payload)) {
-            const compact = { ...event };
-            if (compact.metadata !== undefined) {
-                delete compact.metadata;
-                payload = JSON.stringify(compact);
-            }
-            if (!bridgeLineFits(payload) && compact.summary !== undefined) {
-                delete compact.summary;
-                payload = JSON.stringify(compact);
-            }
-            if (!bridgeLineFits(payload)) {
-                process.stderr.write(
-                    `codeharbor-bridge: dropping an event that exceeds the ${MAX_BRIDGE_LINE_BYTES}-byte frame bound\n`,
-                );
-                source.destroy();
-                return;
-            }
+        if (line === null) {
+            source.destroy();
+            return;
         }
-        const line = `${payload}\n`;
         let ok: boolean;
         try {
             ok = out.write(line);
@@ -547,6 +583,8 @@ export interface BridgeOptions {
     handshakeTimeoutMs?: number;
     /** Overrides BRIDGE_PARTIAL_LINE_TIMEOUT_MS. */
     partialLineTimeoutMs?: number;
+    /** Internal shared-reader registration; producers do not use this path. */
+    onSubscribe?: (socket: net.Socket, version: unknown) => boolean;
 }
 
 /**
@@ -580,8 +618,25 @@ export async function startBridge(
     // sink left unguarded.
     const activeSink = sink ?? makeStreamSink(process.stdout);
     const server = net.createServer((socket) => {
+        let subscribed = false;
         const lines = createBridgeLineFramer(
             (line) => {
+                if (subscribed) {
+                    socket.destroy();
+                    return false;
+                }
+                if (options.onSubscribe && line.includes(BRIDGE_SUBSCRIBE_PROTOCOL)) {
+                    const request = parseBridgeSubscription(line);
+                    if (request) {
+                        subscribed = true;
+                        try {
+                            options.onSubscribe(socket, request.version);
+                        } catch {
+                            socket.destroy();
+                        }
+                        return !socket.destroyed;
+                    }
+                }
                 const event = processBridgeLine(line);
                 if (event) {
                     try {
@@ -621,7 +676,12 @@ export async function startBridge(
         };
         socket.once("data", () => clearTimeout(handshake));
         socket.on("data", (chunk: Buffer) => {
+            if (subscribed) {
+                socket.destroy();
+                return;
+            }
             lines.feed(chunk);
+            if (subscribed && lines.partial()) socket.destroy();
             watchPartialLine();
         });
         socket.on("resume", () => {
@@ -651,17 +711,22 @@ export async function startBridge(
     // letting the accumulation take the whole relay down.
     server.maxConnections = MAX_BRIDGE_CONNECTIONS;
     fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
-    const lockPath = acquireBridgeLock(socketPath);
+    const releaseOwnedLock = acquireBridgeLock(socketPath);
     let lockReleased = false;
+    let socketIdentity: fs.Stats | undefined;
+    const cleanup = (): void => {
+        if (socketIdentity) unlinkOwnedPath(socketPath, socketIdentity);
+        releaseLock();
+    };
     const releaseLock = (): void => {
         if (lockReleased) return;
         lockReleased = true;
-        try {
-            fs.unlinkSync(lockPath);
-        } catch {
-            // Another cleanup path may already have removed the lock.
-        }
+        process.removeListener("exit", cleanup);
+        releaseOwnedLock();
     };
+    // Keep ownership cleanup with the listener, not the CLI wrapper: an old
+    // listener must not unlink the paths of a replacement during a later exit.
+    process.once("exit", cleanup);
     server.once("close", releaseLock);
     try {
         let existing: fs.Stats | undefined;
@@ -716,6 +781,7 @@ export async function startBridge(
         server.once("error", onError);
         server.listen(socketPath, () => {
             try {
+                socketIdentity = fs.lstatSync(socketPath);
                 fs.chmodSync(socketPath, 0o600);
             } catch (err) {
                 server.removeListener("error", onError);
@@ -733,62 +799,60 @@ export async function startBridge(
     return server;
 }
 
-if (isEntrypoint(import.meta.url)) {
-    const socketPath = resolveSocketPath();
+async function runSharedBridgeRelay(socketPath: string): Promise<void> {
+    let server: net.Server | undefined;
+    let stopping = false;
+    const connections = new Set<net.Socket>();
+    const stopped = Promise.withResolvers<void>();
+    const shutdown = (): void => {
+        if (stopping) return;
+        stopping = true;
+        readers.close();
+        for (const socket of connections) socket.destroy();
+        if (server) server.close(() => stopped.resolve());
+        else stopped.resolve();
+    };
+    const readers = new BridgeSubscribers(shutdown, { idleTimeoutMs: bridgeRelayIdleMs() });
+    const signals = ["SIGHUP", "SIGINT", "SIGTERM"] as const;
+    for (const signal of signals) process.on(signal, shutdown);
     try {
-        const server = await startBridge(socketPath);
-        // Remove the socket file and the ownership lock on the way out, on
-        // EVERY way out. A signal handler alone covers only the signals: a
-        // fatal error anywhere else — an uncaught exception, an out-of-memory
-        // abort — exits without running one, and then BOTH files are left
-        // behind. The socket is the cheap half of that (the next run probes it
-        // and takes it over). The lock is the expensive half: the next run falls
-        // back to probing the recorded pid, and once the operating system
-        // recycles that pid onto any live process the bridge refuses to start at
-        // all with "address already in use" — permanently, until somebody
-        // deletes the file by hand. 'exit' fires for process.exit() and for a
-        // fatal error alike, and only synchronous work is allowed in it, which
-        // is exactly what these two unlinks are.
-        const cleanup = (): void => {
-            try {
-                if (fs.lstatSync(socketPath).isSocket()) fs.unlinkSync(socketPath);
-            } catch {
-                // Already unlinked by server.close(), or never created.
-            }
-            try {
-                fs.unlinkSync(bridgeLockPath(socketPath));
-            } catch {
-                // Already released by server.close(), or never acquired.
-            }
-        };
-        process.on("exit", cleanup);
-        // Without handlers, SIGHUP/SIGINT/SIGTERM terminate the process outright
-        // and leave the socket file behind, so the next run has to treat a
-        // socket that may still look live as stale. Close the listener and exit
-        // immediately, letting `cleanup` above remove both files: waiting for
-        // open connections to drain would let one stuck producer block shutdown
-        // forever, and server.close() is ASYNCHRONOUS, so its 'close' event —
-        // the thing that normally releases the lock — never fires before the
-        // exit.
-        const shutdown = (): void => {
+        server = await startBridge(socketPath, (event, source) => {
+            const line = encodeBridgeEvent(event);
+            if (line === null) source.destroy();
+            else readers.broadcast(line);
+        }, { onSubscribe: (socket, version) => readers.subscribe(socket, version) });
+        if (stopping) {
             server.close();
-            process.exit(0);
-        };
-        process.on("SIGHUP", shutdown);
-        process.on("SIGINT", shutdown);
-        process.on("SIGTERM", shutdown);
-        // Announced LAST, after the handlers above are in place. On Linux a
-        // write to a pipe is synchronous, so a supervisor that waits for this
-        // banner and then signals us can be scheduled the instant the bytes land
-        // — while this process has not yet reached the next statement. Announcing
-        // first therefore left a real window in which SIGTERM took its DEFAULT
-        // action, killing the relay outright and leaving both the socket and the
-        // ownership lock on disk: precisely the outcome the handlers exist to
-        // prevent, reachable by the most ordinary way there is to stop a service.
-        process.stderr.write(`codeharbor-bridge listening on ${socketPath}\n`);
+            return;
+        }
+        server.on("connection", (socket) => {
+            connections.add(socket);
+            socket.once("close", () => connections.delete(socket));
+        });
+        process.stderr.write(`codeharbor-bridge relay listening on ${socketPath}\n`);
+        await stopped.promise;
+    } finally {
+        readers.close();
+        for (const socket of connections) socket.destroy();
+        if (server?.listening) server.close();
+        for (const signal of signals) process.removeListener(signal, shutdown);
+    }
+}
+
+if (isEntrypoint(import.meta.url)) {
+    const args = process.argv.slice(2);
+    try {
+        const socketPath = resolveSocketPath();
+        if (args.length === 0) {
+            await runBridgeProxy(socketPath, fileURLToPath(import.meta.url));
+        } else if (args.length === 1 && args[0] === "--relay") {
+            await runSharedBridgeRelay(socketPath);
+        } else {
+            process.stderr.write("usage: codeharbor-bridge [--relay]\n");
+            process.exitCode = 2;
+        }
     } catch (err) {
-        // A live bridge already owns the socket (RR12), or listen failed.
         process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
-        process.exit(1);
+        process.exitCode = 1;
     }
 }

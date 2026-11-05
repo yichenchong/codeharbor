@@ -79,6 +79,10 @@ export const FORWARDED_EVENTS = [
     "session_shutdown",
 ] as const;
 
+// A stalled bridge must not retain an entire agent run in a promise chain.
+// Keep recent transitions; the newest state (especially shutdown) wins.
+export const MAX_PENDING_HOOK_EVENTS = 32;
+
 /**
  * Translate one harness event object into the producer's normalized input.
  *
@@ -150,7 +154,7 @@ export interface EventForwarder {
 
 /**
  * Build the forwarder for this process, or null when the agent is not running
- * in a CodeHarbor pane.
+ * in a CodeHarbor pane or its explicit event endpoint is invalid.
  *
  * The coordinates are read ONCE, here, rather than per event: they come from
  * the process environment, which a pane exports at creation and nothing later
@@ -163,34 +167,50 @@ export interface EventForwarder {
  */
 export function createForwarder(
     env: NodeJS.ProcessEnv = process.env,
-    socketPath: string = resolveSocketPath(env),
+    socketPath?: string,
     timeoutMs: number = HOOK_TIMEOUT_MS,
 ): EventForwarder | null {
     const devSessionId = (env.OMP_DEV_SESSION_ID ?? "").trim();
     const terminalId = (env.OMP_TERMINAL_ID ?? "").trim();
     if (missingCoordinates({ event: "", devSessionId, terminalId }).length > 0) return null;
-    // One write at a time, in the order the events fired. Each event opens its
-    // own short-lived connection, so firing several at once would let the relay
-    // accept them in any order and report, say, agent_end before the tool_call
-    // that preceded it — and the client's monitor takes the last state it is
-    // told. Chaining also bounds this producer to a single file descriptor no
-    // matter how fast the agent works.
-    //
-    // The chain link never rejects: emitHookEvent's rejection is absorbed right
-    // here, because an unhandled rejection inside the agent's process is
-    // exactly the "broken CodeHarbor takes down the agent" outcome SPEC 6.4
-    // forbids. Nothing is reported: stderr in an agent process is the user's
-    // screen, this would fire once per event for as long as the bridge is down,
-    // and the failure is already visible (and diagnosable) at the bridge, which
-    // is the side that knows whether it is running.
+    let destination: string;
+    try {
+        destination = socketPath ?? resolveSocketPath(env);
+    } catch {
+        // A bad explicit route must not fall back to another window or throw
+        // from extension initialization into the agent.
+        return null;
+    }
+    // Serialize writes, but bound the backlog. If delivery fails, intermediate
+    // queued states are already stale: retain only the newest one rather than
+    // spending another socket timeout replaying each event from the outage.
+    const pending: HookInput[] = [];
     let queue: Promise<void> = Promise.resolve();
+    let draining = false;
+    const drain = async (): Promise<void> => {
+        try {
+            while (pending.length > 0) {
+                const input = pending.shift()!;
+                try {
+                    await emitHookEvent(input, destination, timeoutMs);
+                } catch {
+                    if (pending.length > 1) pending.splice(0, pending.length - 1);
+                }
+            }
+        } finally {
+            draining = false;
+        }
+    };
     return {
         forward(eventName, payload) {
             try {
                 const input = toHookInput(eventName, payload, devSessionId, terminalId);
-                queue = queue.then(
-                    () => emitHookEvent(input, socketPath, timeoutMs),
-                ).then(() => {}, () => {});
+                if (pending.length >= MAX_PENDING_HOOK_EVENTS) pending.shift();
+                pending.push(input);
+                if (!draining) {
+                    draining = true;
+                    queue = drain();
+                }
             } catch {
                 // Native payloads belong to the harness. Even a throwing
                 // property accessor must not escape a tool_call handler and

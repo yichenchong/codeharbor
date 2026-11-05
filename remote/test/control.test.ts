@@ -15,10 +15,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { once as eventOnce } from "node:events";
+import { getEventListeners, once as eventOnce } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { setImmediate as once } from "node:timers/promises";
 
@@ -468,6 +468,74 @@ test("an oversized desktop answer becomes a bounded actionable refusal", async (
     }
 });
 
+test("deep desktop answers survive the control wire and oversize stays a structured refusal",
+    { timeout: 2000 }, async () => {
+        const h = await harness();
+        try {
+            const depth = 10_000;
+            const data = JSON.parse('{"a":'.repeat(depth) + "true" + "}".repeat(depth));
+            const pending = sendControlRequest("list", {}, h.env);
+            const command = await h.command(1);
+            assert.equal(h.listener.settle({ commandId: command.commandId, ok: true, data }), true);
+            const response = await pending;
+            assert.equal(response.ok, true);
+            let node: unknown = response.data;
+            for (let i = 0; i < depth; i += 1) {
+                assert.ok(typeof node === "object" && node !== null);
+                node = (node as Record<string, unknown>).a;
+            }
+            assert.equal(node, true);
+
+            const oversized = sendControlRequest("list", {}, h.env);
+            const oversizedCommand = await h.command(2);
+            h.listener.settle({
+                commandId: oversizedCommand.commandId,
+                ok: true,
+                data: JSON.parse('{"a":'.repeat(12_000) + "true" + "}".repeat(12_000)),
+            });
+            const refusal = await oversized;
+            assert.equal(refusal.ok, false);
+            assert.equal(refusal.error?.code, "failed");
+            assert.match(refusal.error?.message ?? "", /operation may already have completed/);
+            assert.ok(Buffer.byteLength(JSON.stringify(refusal)) <= MAX_CONTROL_LINE_BYTES);
+            assert.equal(h.listener.pendingCount(), 0);
+
+            const next = sendControlRequest("list", {}, h.env);
+            const nextCommand = await h.command(3);
+            h.listener.settle({ commandId: nextCommand.commandId, ok: true });
+            assert.equal((await next).ok, true);
+        } finally {
+            h.dispose();
+        }
+    });
+
+test("control replies accept the exact payload byte limit and refuse one byte more", async () => {
+    const h = await harness();
+    const envelope = JSON.stringify({ version: CH_CONTROL_VERSION, ok: true, data: { padding: "" } });
+    const padding = "x".repeat(MAX_CONTROL_LINE_BYTES - Buffer.byteLength(envelope));
+    try {
+        for (const [index, suffix] of ["", "x"].entries()) {
+            const pending = sendControlRequest("list", {}, h.env);
+            const command = await h.command(index + 1);
+            h.listener.settle({
+                commandId: command.commandId, ok: true, data: { padding: padding + suffix },
+            });
+            const response = await pending;
+            if (suffix === "") {
+                assert.equal(response.ok, true);
+                assert.equal(response.data?.padding, padding);
+                assert.equal(Buffer.byteLength(JSON.stringify(response)), MAX_CONTROL_LINE_BYTES);
+            } else {
+                assert.equal(response.ok, false);
+                assert.equal(response.error?.code, "failed");
+                assert.match(response.error?.message ?? "", /operation may already have completed/);
+            }
+        }
+    } finally {
+        h.dispose();
+    }
+});
+
 test("a later packet on one socket cannot dispatch a second command", async () => {
     const h = await harness();
     const socket = net.createConnection(h.listener.socketPath);
@@ -874,5 +942,96 @@ test("startup and stale-socket sweeping preserve regular files at socket-like na
         assert.equal(readFileSync(file, "utf8"), "user data");
     } finally {
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("control startup refuses an endpoint whose private permissions cannot be enforced", async (t) => {
+    const dir = tempDir();
+    const socketPath = path.join(dir, "control.sock");
+    const permissionError = Object.assign(new Error("socket chmod refused"), { code: "EPERM" });
+    const chmod = t.mock.method(fs, "chmodSync", () => {
+        throw permissionError;
+    });
+    try {
+        await assert.rejects(startControlListener(() => {
+            assert.fail("an insecure control endpoint must never dispatch a command");
+        }, socketPath), permissionError);
+        assert.equal(existsSync(socketPath), false);
+        chmod.mock.restore();
+        const replacement = await startControlListener(() => true, socketPath);
+        replacement.close();
+    } finally {
+        chmod.mock.restore();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a pre-cancelled viewer command does not serialize or dispatch", async () => {
+    const h = await harness();
+    const controller = new AbortController();
+    controller.abort();
+    try {
+        const response = await sendControlRequest("open", {
+            toJSON() {
+                assert.fail("a cancelled command must not be serialized");
+            },
+        }, h.env, undefined, undefined, controller.signal);
+        assert.equal(response.ok, false);
+        assert.equal(response.error?.code, "failed");
+        assert.match(response.error?.message ?? "", /cancelled/);
+        assert.equal(h.relayed.length, 0);
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+    } finally {
+        h.dispose();
+    }
+});
+
+test("cancelling a waiting viewer command closes its socket and removes its abort listener",
+    { timeout: 2000 }, async () => {
+        const dir = tempDir();
+        const socketPath = path.join(dir, "peer.sock");
+        const controller = new AbortController();
+        const received = Promise.withResolvers<void>();
+        const disconnected = Promise.withResolvers<void>();
+        const server = net.createServer((socket) => {
+            socket.on("error", () => {});
+            socket.once("data", () => received.resolve());
+            socket.once("close", () => disconnected.resolve());
+        });
+        try {
+            server.listen(socketPath);
+            await eventOnce(server, "listening");
+            const pending = sendControlRequest("list", {},
+                { OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t" },
+                socketPath, undefined, controller.signal);
+            await received.promise;
+            assert.equal(getEventListeners(controller.signal, "abort").length, 1);
+            controller.abort();
+            const response = await pending;
+            assert.equal(response.ok, false);
+            assert.equal(response.error?.code, "failed");
+            assert.match(response.error?.message ?? "", /cancelled/);
+            await disconnected.promise;
+            assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+        } finally {
+            server.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+test("a completed viewer command releases its abort listener", async () => {
+    const h = await harness();
+    const controller = new AbortController();
+    try {
+        const pending = sendControlRequest("list", {}, h.env, undefined, undefined, controller.signal);
+        const command = await h.command(1);
+        h.listener.settle({ commandId: command.commandId, ok: true });
+        const response = await pending;
+        assert.equal(response.ok, true);
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+        controller.abort();
+        assert.equal(response.ok, true);
+    } finally {
+        h.dispose();
     }
 });

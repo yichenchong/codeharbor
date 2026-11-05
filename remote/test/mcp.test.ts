@@ -14,6 +14,7 @@ import path from "node:path";
 import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 
 import {
     CONTROL_SOCKET_ENV,
@@ -25,6 +26,10 @@ import {
     MCP_SERVER_NAME,
     TOOLS,
     handleLine,
+    createMcpSession,
+    MAX_MCP_INFLIGHT,
+    MAX_MCP_LINE_BYTES,
+    MAX_MCP_PENDING_OUTPUT_BYTES,
 } from "../src/mcp/server.ts";
 import { RPC_SERVER_VERSION } from "../src/codeharbord.ts";
 
@@ -170,7 +175,7 @@ test("ping answers, so a harness health check succeeds", async () => {
 });
 
 test("malformed request ids are refused before tool dispatch", async () => {
-    for (const id of [true, false, {}, [], 1e400]) {
+    for (const id of [null, 1.5, true, false, {}, [], 1e400]) {
         const line = id === Infinity
             ? '{"jsonrpc":"2.0","id":1e400,"method":"tools/call","params":{"name":"viewer_close"}}'
             : JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "viewer_close" } });
@@ -200,11 +205,21 @@ test("tool arguments are checked against the advertised schema before dispatch",
     }
 });
 
-test("primitive envelope params are invalid even for parameterless methods", async () => {
-    for (const params of [null, true, 42, "hello"]) {
+test("non-object envelope params are invalid even for parameterless methods", async () => {
+    for (const params of [null, true, 42, "hello", []]) {
         const response = await handleLine(request(42, "ping", params), NO_ENV);
         assert.equal(response?.error?.code, -32602);
         assert.equal(response?.id, 42);
+    }
+});
+
+test("requests using notification-only methods are refused instead of left unanswered", async () => {
+    for (const method of [
+        "notifications/initialized", "notifications/cancelled", "notifications/roots/list_changed",
+    ]) {
+        const response = await handleLine(request(42, method), NO_ENV);
+        assert.equal(response?.id, 42);
+        assert.equal(response?.error?.code, -32600);
     }
 });
 
@@ -488,6 +503,163 @@ test("a symlinked MCP server answers stdio requests (RI2)", () => {
         assert.equal(result.status, 0, result.stderr);
         assert.deepEqual(JSON.parse(result.stdout), { jsonrpc: "2.0", id: 73, result: {} });
     } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("MCP cancellation closes the pending producer and suppresses its response", { timeout: 5000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-cancel-"));
+    const socketPath = path.join(dir, "control.sock");
+    const received = Promise.withResolvers<net.Socket>();
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.once("data", () => received.resolve(socket));
+    });
+    server.listen(socketPath);
+    await once(server, "listening");
+    const session = createMcpSession({
+        OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t",
+        [CONTROL_SOCKET_ENV]: socketPath,
+    });
+    try {
+        const pending = session.handleLine(request(1, "tools/call", { name: "viewer_list" }));
+        const socket = await received.promise;
+        const closed = once(socket, "close");
+        const duplicate = await session.handleLine(request(1, "tools/call", { name: "viewer_list" }));
+        assert.equal(duplicate?.error?.code, -32600);
+        assert.equal(await session.handleLine(JSON.stringify({
+            jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 },
+        })), null);
+        assert.equal(await pending, null);
+        await closed;
+        assert.deepEqual((await session.handleLine(request(2, "ping")))?.result, {});
+    } finally {
+        session.close();
+        for (const socket of sockets) socket.destroy();
+        server.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("MCP bounds outstanding viewer waits without dispatching overflow requests", { timeout: 5000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-limit-"));
+    const socketPath = path.join(dir, "control.sock");
+    const sockets = new Set<net.Socket>();
+    const received = Promise.withResolvers<void>();
+    let dispatches = 0;
+    const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.once("data", () => {
+            dispatches += 1;
+            if (dispatches === MAX_MCP_INFLIGHT) received.resolve();
+        });
+    });
+    server.listen(socketPath);
+    await once(server, "listening");
+    const session = createMcpSession({
+        OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t",
+        [CONTROL_SOCKET_ENV]: socketPath,
+    });
+    try {
+        const pending = Array.from({ length: MAX_MCP_INFLIGHT }, (_, id) =>
+            session.handleLine(request(id, "tools/call", { name: "viewer_list" })));
+        await received.promise;
+        const overflow = await session.handleLine(
+            request(MAX_MCP_INFLIGHT, "tools/call", { name: "viewer_close" }),
+        );
+        assert.ok(overflow?.error);
+        assert.equal(dispatches, MAX_MCP_INFLIGHT);
+        assert.deepEqual((await session.handleLine(request(1000, "ping")))?.result, {});
+        session.close();
+        assert.ok((await Promise.all(pending)).every((response) => response === null));
+    } finally {
+        session.close();
+        for (const socket of sockets) socket.destroy();
+        server.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("overlong MCP input exits unsuccessfully instead of reporting a clean shutdown", () => {
+    const serverPath = fileURLToPath(new URL("../src/mcp/server.ts", import.meta.url));
+    const child = spawnSync(process.execPath, [serverPath], {
+        input: "x".repeat(MAX_MCP_LINE_BYTES + 1),
+        encoding: "utf8",
+        timeout: 5000,
+    });
+    assert.equal(child.error, undefined);
+    assert.equal(child.status, 1);
+    assert.match(child.stderr, /input line exceeded/);
+});
+
+test("a stalled MCP output pipe cannot accumulate unbounded responses", { timeout: 10000 }, async () => {
+    const serverPath = fileURLToPath(new URL("../src/mcp/server.ts", import.meta.url));
+    const child = spawn(process.execPath, [serverPath]);
+    let errors = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { errors += chunk; });
+    child.stdin.on("error", () => {});
+    const exited = once(child, "exit");
+    const errorsEnded = once(child.stderr, "end");
+    try {
+        // An unknown method is echoed in its refusal. Keep every input frame
+        // legal while leaving stdout unread and exceeding the output budget.
+        const method = "x".repeat(MAX_MCP_LINE_BYTES / 2);
+        const count = Math.ceil(MAX_MCP_PENDING_OUTPUT_BYTES / method.length) + 8;
+        child.stdin.end(Array.from({ length: count }, (_, id) => request(id, method)).join("\n") + "\n");
+        const [status] = await exited;
+        await errorsEnded;
+        assert.equal(status, 1);
+        assert.match(errors, /pending output exceeded/);
+    } finally {
+        child.kill();
+        child.stdout.destroy();
+    }
+});
+
+test("MCP stdio returns deeply nested viewer data as valid bounded tool text (NIN6)", { timeout: 10000 }, async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-mcp-deep-"));
+    const socketPath = path.join(dir, "control.sock");
+    const depth = 10000;
+    const data = JSON.parse('{"n":'.repeat(depth) + "0" + "}".repeat(depth)) as Record<string, unknown>;
+    const listener = await startControlListener((command) => {
+        queueMicrotask(() => listener.settle({ commandId: command.commandId, ok: true, data }));
+        return true;
+    }, socketPath);
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL("../src/mcp/server.ts", import.meta.url)),
+    ], {
+        env: {
+            ...process.env,
+            OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t",
+            [CONTROL_SOCKET_ENV]: socketPath,
+        },
+        timeout: 5000,
+    });
+    let output = "";
+    let errors = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { errors += chunk; });
+    try {
+        child.stdin.end(`${request(1, "tools/call", { name: "viewer_list" })}\n`);
+        const [status] = await once(child, "close");
+        assert.equal(status, 0, errors);
+        assert.equal(errors, "");
+        assert.ok(Buffer.byteLength(output) <= MAX_MCP_LINE_BYTES);
+        const response = JSON.parse(output);
+        assert.equal(response.id, 1);
+        assert.equal(response.error, undefined);
+        const result = toolText(response.result);
+        assert.equal(result.isError, false);
+        let value: unknown = JSON.parse(result.text);
+        for (let i = 0; i < depth; i += 1) value = (value as Record<string, unknown>).n;
+        assert.equal(value, 0);
+    } finally {
+        child.kill();
+        listener.close();
         rmSync(dir, { recursive: true, force: true });
     }
 });

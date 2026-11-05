@@ -132,10 +132,10 @@
     <key>ITSAppUsesNonExemptEncryption</key>
     <true/>
 
-    <!-- No cleartext networking of any kind. The client speaks SSH over a raw
-         socket, which App Transport Security does not govern, and nothing in
-         the mobile shell may fetch a URL on behalf of remote content
-         (SPEC 7.5), so every ATS exception stays off. -->
+    <!-- Native web browsing does not grant an App Transport Security exception:
+         HTTPS pages remain available, while HTTP pages can be rejected by the
+         platform transport policy. Remote files and RPC arrive over SSH raw
+         sockets, which App Transport Security does not govern. -->
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

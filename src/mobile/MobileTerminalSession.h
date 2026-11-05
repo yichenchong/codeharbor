@@ -212,6 +212,7 @@ signals:
     void statusTextChanged();
 
 private:
+    void createController();
     void onFlushReady(const QByteArray &batch);
     void onTargetResolved(TerminalController *controller, const QString &target);
     void onFactoryError(TerminalController *controller, const QString &message);
@@ -257,22 +258,17 @@ private:
     // and not the user. close() therefore ABANDONS the flight by clearing this,
     // and an answer with nothing to match is dropped.
     //
-    // WHAT THIS DOES NOT DO, so nobody expects more of it than it gives: it
-    // cannot pick the right answer out of TWO outstanding requests, because the
-    // signal does not say which request it answers. Re-opening this session on a
-    // DIFFERENT pane while a lookup is in flight therefore lets the first answer
-    // through, and it is ch::TerminalFactory::attach() that refuses it — the
-    // factory only honours a target it authorised for this controller's LATEST
-    // request. The pane lands in its ordinary "could not be attached" state with
-    // the Reattach affordance already on screen, never on another pane's shell.
-    // In this shell that path is unreachable anyway: one session is minted per
-    // page and a page shows one pane for its whole life.
+    // TerminalFactory cancels delivery on detach, destruction and superseding
+    // requests. A different identity also gets a fresh controller, so retained
+    // bytes, channel input and late signals cannot cross between panes.
     QString m_resolvingIdentity;
     // Re-entrancy guard: ch::TerminalFactory::attach() walks the controller's
     // state machine, which reaches this object's own handlers, which are free to
     // call open() again.
     bool m_attaching = false;
     bool m_attached = false;
+    // A closed page must not be reopened by a later accepted server.info.
+    bool m_openRequested = false;
 };
 
 } // namespace ch

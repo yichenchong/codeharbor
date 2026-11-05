@@ -75,6 +75,14 @@ void MobileTerminalView::setScreen(VtScreen *screen)
         connect(m_screen, &VtScreen::screenScrolled, this, &MobileTerminalView::onScreenScrolled);
         connect(m_screen, &VtScreen::cursorMoved, this, &MobileTerminalView::onCursorMoved);
         connect(m_screen, &VtScreen::screenReset, this, &MobileTerminalView::onScreenReset);
+        connect(m_screen, &QObject::destroyed, this, [this]() {
+            m_screen.clear();
+            m_paintedCursorAbsoluteRow = -1;
+            clampScrollOffset();
+            markAllDamaged();
+            emit screenChanged();
+            emit maxScrollOffsetChanged();
+        });
         // The screen's OWN geometry (which the session sets from this item's
         // grid) decides where the live screen starts, so a reflow moves every
         // absolute row this item is showing.
@@ -249,6 +257,8 @@ void MobileTerminalView::geometryChange(const QRectF &newGeometry, const QRectF 
 
 void MobileTerminalView::recomputeGrid()
 {
+    const qreal previousCellWidth = m_cellWidth;
+    const qreal previousLineHeight = m_lineHeight;
     m_metrics = QFontMetricsF(m_font);
     const qreal advance = m_metrics.horizontalAdvance(QChar(kMetricSample));
     m_cellWidth = advance > 0.0 ? advance : 1.0;
@@ -258,7 +268,8 @@ void MobileTerminalView::recomputeGrid()
 
     const int columns = qMax(0, static_cast<int>(std::floor(width() / m_cellWidth)));
     const int rows = qMax(0, static_cast<int>(std::floor(height() / m_lineHeight)));
-    const bool gridChangedNow = columns != m_columns || rows != m_rows;
+    const bool gridChangedNow = columns != m_columns || rows != m_rows
+        || m_cellWidth != previousCellWidth || m_lineHeight != previousLineHeight;
     m_columns = columns;
     m_rows = rows;
     clampScrollOffset();
@@ -307,11 +318,13 @@ void MobileTerminalView::markRowsDamaged(int firstRow, int lastRow)
 
 void MobileTerminalView::markAllDamaged()
 {
-    if (m_rows <= 0) {
-        update();
-        return;
-    }
-    markRowsDamaged(0, m_rows - 1);
+    for (int row = 0; row < m_rows; ++row)
+        m_damagedRows.insert(row);
+    // Include the gutter below the last complete row. It is background too, and
+    // row-band damage alone would leave its previous colour after a theme change.
+    m_pendingDamage = QRect(0, 0, static_cast<int>(std::ceil(width())),
+                            static_cast<int>(std::ceil(height())));
+    update();
 }
 
 void MobileTerminalView::onLinesChanged(int firstAbsoluteRow, int lastAbsoluteRow)

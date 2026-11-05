@@ -19,11 +19,15 @@
 #include <QSettings>
 #include <QSignalSpy>
 #include <QStandardPaths>
+#include <QHostAddress>
+#include <QTcpServer>
+#include <QTimer>
 #include <QTemporaryDir>
 #include <QVariantMap>
 
 #include <cstring>
 #include <functional>
+#include <utility>
 
 #include "GroupPaletteService.h"
 #include "AppController.h"
@@ -38,17 +42,16 @@
 #include "TerminalFactory.h"
 #include "TerminalController.h"
 #include "RpcTypes.h"
+#include "SshChannelDevice.h"
 
 using namespace ch;
 
 namespace {
 
-// Minimal in-process QIODevice standing in for the RPC transport. The app test
-// target deliberately does not link Qt6::Network, so QLocalSocket is out; this
-// captures the client's writes verbatim (takeSent) and injects server->client
-// frames via deliver(). Opened Unbuffered so the client's write() reaches
-// writeData() immediately and readyRead dispatch is synchronous (no event
-// loop), letting a test control response ordering exactly.
+// Minimal in-process QIODevice standing in for the RPC transport. Captures the
+// client's writes verbatim (takeSent) and injects server->client frames through
+// deliver(). Opened Unbuffered so writeData() and readyRead dispatch are
+// synchronous, letting a test control response ordering exactly.
 class FakeTransport : public QIODevice {
 public:
     explicit FakeTransport(QObject* parent = nullptr) : QIODevice(parent)
@@ -77,6 +80,7 @@ public:
         m_sent.clear();
         return sent;
     }
+    bool failWrites = false;
 
 protected:
     qint64 readData(char* data, qint64 maxSize) override
@@ -91,6 +95,8 @@ protected:
 
     qint64 writeData(const char* data, qint64 len) override
     {
+        if (failWrites)
+            return -1;
         m_sent.append(data, len);
         return len;
     }
@@ -331,12 +337,16 @@ QByteArray layoutLeafFrame(int id, const QString& paneId)
 }
 
 // A `server.info` success frame.
-QByteArray serverInfoFrame(int id, int schemaVersion, const QString& serverId,
-                           const QString& version)
+QByteArray serverInfoFrame(
+    int id, int schemaVersion, const QString& serverId, const QString& version,
+    QJsonValue agentSocket = QJsonValue(QStringLiteral("/run/codeharbor/agent-test.sock")))
 {
     QJsonObject info{{"name", "codeharbord"},
                      {"version", version},
-                     {"schemaVersion", schemaVersion}};
+                     {"schemaVersion", schemaVersion},
+                     {"controlSocket", "/run/codeharbor/control-test.sock"}};
+    if (!agentSocket.isUndefined())
+        info.insert(QStringLiteral("agentSocket"), agentSocket);
     if (!serverId.isEmpty())
         info.insert(QStringLiteral("serverId"), serverId);
     const QJsonObject resp{{"jsonrpc", "2.0"}, {"id", id}, {"result", info}};
@@ -372,6 +382,58 @@ protected:
         if (duringConnect)
             duringConnect();
         return connectOk;
+    }
+};
+
+// The real bootstrap state machine over controllable SSH channel byte streams.
+class FramedChannel : public SshChannelDevice {
+public:
+    explicit FramedChannel(QObject* parent) : SshChannelDevice(nullptr, parent)
+    {
+        QIODevice::open(QIODevice::ReadWrite | QIODevice::Unbuffered);
+    }
+    FakeTransport frames;
+    void deliver(const QByteArray& frame)
+    {
+        frames.deliver(frame);
+        emit readyRead();
+    }
+    void dropRemote() { emit readChannelFinished(); }
+    qint64 bytesAvailable() const override
+    {
+        return frames.bytesAvailable() + QIODevice::bytesAvailable();
+    }
+protected:
+    qint64 readData(char* data, qint64 count) override { return frames.read(data, count); }
+    qint64 writeData(const char* data, qint64 count) override { return frames.write(data, count); }
+};
+
+class WiredBootstrap : public FakeBootstrap {
+public:
+    using FakeBootstrap::FakeBootstrap;
+protected:
+    SshChannelDevice* openChannelDevice(const QString&, const QString&) override
+    {
+        return new FramedChannel(this);
+    }
+};
+
+class ProbingBootstrap : public WiredBootstrap {
+public:
+    using WiredBootstrap::WiredBootstrap;
+    std::function<void()> duringProbe;
+    int openedChannels = 0;
+protected:
+    bool probeEndpoint(const QString& host, quint16 port, QString* error) override
+    {
+        if (duringProbe)
+            QTimer::singleShot(0, this, std::exchange(duringProbe, {}));
+        return SessionBootstrap::probeEndpoint(host, port, error);
+    }
+    SshChannelDevice* openChannelDevice(const QString& command, const QString& role) override
+    {
+        ++openedChannels;
+        return WiredBootstrap::openChannelDevice(command, role);
     }
 };
 
@@ -492,6 +554,8 @@ private slots:
     void terminalPaneHarnessReadsTheAuthoritativeTree();
     void observedHarnessUpgradesAGenericPaneOnce();
     void observedHarnessUpgradeKeepsTheTriggeringState();
+    void newlyCreatedTerminalRowsReachTheirOwnSidebar_data();
+    void newlyCreatedTerminalRowsReachTheirOwnSidebar();
     void observedHarnessLeavesAPlainShellAlone();
     void observedHarnessArrivingBeforeTheTreeIsNotLost();
     void aParkedObservationSurvivesIdsWithSeparators();
@@ -519,6 +583,23 @@ private slots:
     void refreshWithoutATransportIsASilentNoOp();
     void serverSideRepoRootChangeNotifiesActiveSession();
     void switchingServerDropsTheActiveSessionButKeepsItRemembered();
+    void activationObserverMayDestroyTheController();
+    void activationCancelledByALayoutObserverDoesNotNotifyAgain();
+    void reentrantServerSwitchKeepsTheNewestLayoutKey();
+    void disconnectDuringConnectRemainsDisconnected_data();
+    void disconnectDuringConnectRemainsDisconnected();
+    void replacingTheSpineRetiresAParkedPrompt();
+    void replacingTheSpineCancelsAnActualNestedProbe();
+    void destroyingABorrowedBootstrapEndsAParkedPrompt();
+    void explicitConnectRetiresThePreviousWorkspaceBeforeDialling();
+    void workspaceActionsWaitForTheNewServerIdentity();
+    void staleMutationRepliesCannotAffectAnotherServer_data();
+    void staleMutationRepliesCannotAffectAnotherServer();
+    void failedIdentityLookupRefusesTheWire();
+    void aKillFailureCannotSendTheRemainingTargetsToANewServer();
+    void reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness_data();
+    void reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness();
+    void acceptedIdentityObserverCanDisconnectBeforeReadiness();
 
     void hostKeyPromptParksTheAttemptAndAcceptRetriesWithItPinned();
     void rejectedHostKeyEndsTheAttemptAndLeavesNothingPinned();
@@ -535,6 +616,7 @@ private slots:
     void twoMethodServerChainCarriesBothSecretsWithoutCrossingThem();
     void connectWhileParkedLeavesTheChainsSecretsIntact();
     void submitCredentialWithAnUnknownKindIsIgnored();
+    void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions_data();
     void serverOlderThanTheSchemaFloorIsRefusedWithBothVersions();
     void serverAtTheSchemaFloorIsAdoptedNormally();
     void uiStateStoreIgnoresCorruptWidths();
@@ -543,6 +625,7 @@ private slots:
     // A profile save that could not take its interprocess lock has to reach the
     // user, not stop at a signal nothing is connected to.
     void aDegradedProfileSaveReachesTheShellsErrorToast();
+    void aFailedProfileWriteReachesTheShellWithoutClaimingDurability();
     // server.info is the one server round-trip that did not route its failure
     // through the teardown gate, and it is in flight for exactly the window a
     // user's Disconnect covers.
@@ -550,6 +633,8 @@ private slots:
     // A server at the schema floor that still names no identity is as
     // undrivable as one that is too old, and must be refused the same way.
     void serverThatReportsNoIdentityIsRefusedRatherThanLeftConnected();
+    void missingOrInvalidAgentSocketRefusesTheWire_data();
+    void missingOrInvalidAgentSocketRefusesTheWire();
     void supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire_data();
     void supersededServerInfoRepliesCannotAdoptOrRefuseTheCurrentWire();
     void deferredServerRefusalCannotDisconnectANewerWire_data();
@@ -1416,6 +1501,153 @@ void TstAppController::terminalPaneHarnessReadsTheAuthoritativeTree()
     QVERIFY(controller.terminalPaneHarness(QStringLiteral("gone")).isEmpty());
 }
 
+// A row born after the sidebar snapshot must enter that snapshot before live
+// agent state can contribute to its own window's Dev Session badge.
+void TstAppController::newlyCreatedTerminalRowsReachTheirOwnSidebar_data()
+{
+    QTest::addColumn<QString>("source");
+    QTest::addColumn<bool>("eventBeforeSnapshot");
+    for (const QString& source : {QStringLiteral("split"), QStringLiteral("initializer"),
+                                  QStringLiteral("legacy")}) {
+        for (bool early : {false, true}) {
+            const QByteArray name = source.toLatin1() + (early ? "-early-event" : "-late-event");
+            QTest::newRow(name.constData()) << source << early;
+        }
+    }
+}
+
+void TstAppController::newlyCreatedTerminalRowsReachTheirOwnSidebar()
+{
+    QFETCH(QString, source);
+    QFETCH(bool, eventBeforeSnapshot);
+    QTemporaryDir dir;
+    FakeTransport transport;
+    CodeharbordClient client;
+    AppController controller(&client, nullptr, dir.filePath(QStringLiteral("ui.ini")));
+    SessionLayouts layouts(controller.workspaceDb(), controller.uiState());
+    controller.setConnection(nullptr, nullptr, nullptr, &layouts);
+    controller.setConnection(nullptr, nullptr, nullptr, &layouts); // no duplicate subscription
+    controller.setServerId(QStringLiteral("srv-1"));
+    client.setTransport(&transport);
+    FakeTransport agentTransport;
+    AgentStatusMonitor monitor;
+    monitor.setTransport(&agentTransport);
+    controller.setAgentMonitor(&monitor);
+    QSignalSpy errors(&controller, &AppController::error);
+    const auto respond = [&](int id, const QJsonValue& result) {
+        transport.deliver(QJsonDocument(QJsonObject{
+            {"jsonrpc", "2.0"}, {"id", id}, {"result", result}})
+                              .toJson(QJsonDocument::Compact) + '\n');
+    };
+    controller.refresh();
+    transport.deliver(listWithTerminalTargetsFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+        {{QStringLiteral("s1"), QStringList{}}}));
+    controller.activateSession(QStringLiteral("s1"));
+    const auto loads = takeRequestsExcludingPolls(transport);
+    QCOMPARE(loads.size(), 2);
+    for (const auto& request : loads) {
+        const int id = request.value(QStringLiteral("id")).toInt();
+        const QString region = request.value(QStringLiteral("params")).toObject()
+                                   .value(QStringLiteral("region")).toString();
+        if (region == QLatin1String("viewer")) {
+            transport.deliver(layoutLeafFrame(id, QStringLiteral("viewer-1")));
+        } else if (source == QLatin1String("initializer")) {
+            respond(id, QJsonValue(QJsonValue::Null));
+        } else {
+            transport.deliver(layoutLeafFrame(
+                id, source == QLatin1String("legacy") ? QStringLiteral("terminal-1") : QString()));
+        }
+    }
+    const QVariant viewerBefore = layouts.viewerTree();
+    const quint64 paneGeneration = layouts.paneGeneration();
+    const quint64 layoutGeneration = layouts.generation();
+    OfflineFactory legacyFactory(nullptr);
+    QObject legacyOwner;
+    if (source == QLatin1String("split")) {
+        QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QString(),
+                                   QStringLiteral("horizontal")), QStringLiteral("terminal-1"));
+    } else if (source == QLatin1String("legacy")) {
+        legacyFactory.setWorkspace(controller.workspaceDb());
+        legacyFactory.setServerId(QStringLiteral("srv-1"));
+        legacyFactory.setAgentMonitor(&monitor);
+        legacyFactory.setWorkspaceReady(true); // explicitly trusted in-process workspace
+        connect(&legacyFactory, &TerminalFactory::paneRowResolved, &layouts,
+                &SessionLayouts::bindTerminalPaneRow);
+        QVERIFY(legacyFactory.resolveTarget(legacyFactory.create(&legacyOwner),
+                                             QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                                             QString(), QStringLiteral("/repo")));
+    }
+    const auto create = takeRequest(transport);
+    QCOMPARE(create.value(QStringLiteral("method")).toString(),
+             source == QLatin1String("initializer") ? QStringLiteral("workspace.ensureInitialLayout")
+             : source == QLatin1String("legacy") ? QStringLiteral("workspace.resolveTerminalPane")
+                                                 : QStringLiteral("workspace.createTerminalPane"));
+    if (source == QLatin1String("initializer")) {
+        // A concurrent initializer may have won with this already-created row.
+        respond(create.value(QStringLiteral("id")).toInt(), QJsonObject{
+            {"id", "terminal-layout"},
+            {"tree", QJsonObject{{"type", "leaf"}, {"paneId", "terminal-1"},
+                                 {"terminalPaneId", "born-row"}}}});
+    } else {
+        transport.deliver(terminalPaneResultFrame(
+            create.value(QStringLiteral("id")).toInt(), QStringLiteral("born-row"),
+            QStringLiteral("s1"), QStringLiteral("generic")));
+    }
+    const auto afterCreate = takeRequestsExcludingPolls(transport);
+    QJsonObject refresh;
+    int refreshes = 0;
+    for (const auto& request : afterCreate) {
+        const QString method = request.value(QStringLiteral("method")).toString();
+        if (method == QLatin1String("workspace.list")) {
+            refresh = request;
+            ++refreshes;
+        } else {
+            QCOMPARE(method, QStringLiteral("workspace.setLayout"));
+            respond(request.value(QStringLiteral("id")).toInt(), QJsonObject{
+                {"id", "terminal-layout"},
+                {"tree", request.value(QStringLiteral("params")).toObject()
+                             .value(QStringLiteral("tree"))}});
+        }
+    }
+    QCOMPARE(refreshes, 1);
+    const auto event = agentEventLine(QStringLiteral("waiting_input"), QStringLiteral("s1"),
+                                      QStringLiteral("born-row"), QStringLiteral("oh-my-pi"));
+    if (eventBeforeSnapshot)
+        agentTransport.deliver(event);
+    transport.deliver(listWithTerminalFrame(
+        refresh.value(QStringLiteral("id")).toInt(), QStringLiteral("g"), QStringLiteral("s1"),
+        QStringLiteral("born-row"), QStringLiteral("generic")));
+    if (!eventBeforeSnapshot)
+        agentTransport.deliver(event);
+    const auto update = takeRequest(transport);
+    QCOMPARE(update.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.updateTerminalPane"));
+    QCOMPARE(update.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("id")).toString(), QStringLiteral("born-row"));
+    transport.deliver(terminalPaneResultFrame(
+        update.value(QStringLiteral("id")).toInt(), QStringLiteral("born-row"),
+        QStringLiteral("s1"), QStringLiteral("oh-my-pi")));
+    const auto adopted = takeRequest(transport);
+    QCOMPARE(adopted.value(QStringLiteral("method")).toString(), QStringLiteral("workspace.list"));
+    transport.deliver(listWithTerminalFrame(
+        adopted.value(QStringLiteral("id")).toInt(), QStringLiteral("g"), QStringLiteral("s1"),
+        QStringLiteral("born-row"), QStringLiteral("oh-my-pi")));
+    auto* model = controller.sessionsModel();
+    const QModelIndex session = model->index(0, 0, model->index(0, 0));
+    QCOMPARE(model->data(session, SessionsModel::RowStateRole).toInt(),
+             static_cast<int>(SessionRowState::WaitingForInput));
+    QCOMPARE(controller.terminalPaneHarness(QStringLiteral("born-row")), QStringLiteral("oh-my-pi"));
+    QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("born-row")),
+             static_cast<int>(AgentState::WaitingInput));
+    QCOMPARE(layouts.viewerTree(), viewerBefore);
+    QCOMPARE(layouts.paneGeneration(), paneGeneration);
+    QCOMPARE(layouts.generation(), layoutGeneration);
+    QCOMPARE(controller.activeSessionId(), QStringLiteral("s1"));
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+}
+
 // Route A: a pane minted as "generic" is a pane nobody has told which adapter it
 // runs, and a live agent event says exactly that. The upgrade goes through
 // setTerminalPaneHarness — the same workspace.updateTerminalPane the pane's gear
@@ -2019,6 +2251,7 @@ void TstAppController::aGenericPaneFromTheTreeReachesRunningInTheSidebar()
     factory.setServerId(QStringLiteral("srv-1"));
     factory.setAgentMonitor(&monitor);
     controller.setTerminalFactory(&factory);
+    factory.setWorkspaceReady(true); // direct accepted-workspace unit fixture
 
     QObject pane;
     TerminalController* paneController = factory.create(&pane);
@@ -2183,6 +2416,270 @@ struct ActiveSessionFixture {
 };
 
 } // namespace
+
+void TstAppController::explicitConnectRetiresThePreviousWorkspaceBeforeDialling()
+{
+    ConnectFixture f;
+    FakeTransport transport;
+    SessionLayouts layouts(f.controller.workspaceDb(), f.controller.uiState());
+    f.controller.setConnection(&f.pool, &f.boot, &f.profiles, &layouts);
+    f.controller.setServerId(QStringLiteral("old-host"));
+    layouts.setWorkspaceReady(true); // the fixture's previously accepted host
+    f.controller.uiState()->setActiveSession(QStringLiteral("old-host"), {});
+    f.client.setTransport(&transport);
+    f.controller.refresh();
+    transport.deliver(listWithSessionFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g"), QStringLiteral("s1"), false));
+    f.controller.activateSession(QStringLiteral("s1"));
+    for (int id : takeRequestIds(transport))
+        transport.deliver(layoutLeafFrame(id, QStringLiteral("viewer-1")));
+    f.boot.duringConnect = [&] {
+        QVERIFY(f.controller.activeSessionId().isEmpty());
+        QVERIFY(layouts.devSessionId().isEmpty());
+        QVERIFY(layouts.viewerTree().isNull());
+        QVERIFY(layouts.terminalTree().isNull());
+        QCOMPARE(f.controller.sessionsModel()->rowCount(), 0);
+        f.controller.createGroup(QStringLiteral("must-not-reach-the-old-id"));
+        QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+    };
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, 1);
+    QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("old-host")),
+             QStringLiteral("s1"));
+}
+
+void TstAppController::workspaceActionsWaitForTheNewServerIdentity()
+{
+    ConnectFixture f;
+    FakeTransport transport;
+    f.controller.setServerId(QStringLiteral("old-host"));
+    f.client.setTransport(&transport);
+    f.boot.fireWired();
+    const QJsonObject identity = takeRequest(transport);
+    QCOMPARE(identity.value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+    QSignalSpy errors(&f.controller, &AppController::error);
+    f.controller.createGroup(QStringLiteral("too-early"));
+    f.controller.refresh();
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+    QCOMPARE(errors.count(), 1);
+    transport.deliver(serverInfoFrame(
+        identity.value(QStringLiteral("id")).toInt(),
+        AppController::kMinimumServerSchemaVersion, QStringLiteral("new-host"),
+        QStringLiteral("current")));
+    QCOMPARE(f.controller.serverId(), QStringLiteral("new-host"));
+    takeRequest(transport); // the accepted identity's authoritative refresh
+    f.controller.createGroup(QStringLiteral("safe-now"));
+    const QJsonObject mutation = takeRequest(transport);
+    QCOMPARE(mutation.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createGroup"));
+    QCOMPARE(mutation.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("serverId")).toString(),
+             QStringLiteral("new-host"));
+}
+
+void TstAppController::staleMutationRepliesCannotAffectAnotherServer_data()
+{
+    QTest::addColumn<QString>("operation");
+    QTest::newRow("delete-session") << QStringLiteral("delete");
+    QTest::newRow("rename-session") << QStringLiteral("rename");
+    QTest::newRow("archive-session") << QStringLiteral("archive");
+}
+
+void TstAppController::staleMutationRepliesCannotAffectAnotherServer()
+{
+    QFETCH(QString, operation);
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    if (operation == QStringLiteral("delete"))
+        f.controller.deleteSession(QStringLiteral("s1"));
+    else if (operation == QStringLiteral("archive"))
+        f.controller.archiveSession(QStringLiteral("s1"));
+    else
+        f.controller.renameSession(QStringLiteral("s1"), QStringLiteral("renamed"));
+    const int mutationId = takeRequest(f.transport).value(QStringLiteral("id")).toInt();
+    f.controller.setServerId(QStringLiteral("other-host"));
+    takeRequest(f.transport); // the new server's own workspace.list
+    if (operation == QStringLiteral("delete"))
+        f.transport.deliver(deleteAckFrame(mutationId, {QStringLiteral("old-shell")}));
+    else
+        f.transport.deliver(QJsonDocument(
+            QJsonObject{{"jsonrpc", "2.0"}, {"id", mutationId},
+                        {"result", QJsonObject{{"id", "s1"}, {"name", "renamed"},
+                                               {"archived", operation == QStringLiteral("archive")}}}})
+                                .toJson(QJsonDocument::Compact) + '\n');
+    QVERIFY(takeRequestsExcludingPolls(f.transport).isEmpty());
+    QCOMPARE(f.controller.serverId(), QStringLiteral("other-host"));
+}
+
+void TstAppController::aKillFailureCannotSendTheRemainingTargetsToANewServer()
+{
+    ActiveSessionFixture f;
+    FakeTransport replacement;
+    f.deliverTreeWithS1();
+    f.controller.deleteSession(QStringLiteral("s1"));
+    const int deletion = takeRequest(f.transport).value(QStringLiteral("id")).toInt();
+    bool switched = false;
+    connect(&f.controller, &AppController::error, &f.controller, [&](const QString&) {
+        if (switched)
+            return;
+        switched = true;
+        f.client.setTransport(&replacement);
+        f.controller.setServerId(QStringLiteral("new-host"));
+    });
+    f.transport.failWrites = true;
+    f.transport.deliver(deleteAckFrame(
+        deletion, {QStringLiteral("old-first"), QStringLiteral("old-second")}));
+    QVERIFY(switched);
+    const auto requests = takeRequestsExcludingPolls(replacement);
+    QVERIFY(!requests.isEmpty());
+    for (const auto& request : requests)
+        QVERIFY(request.value(QStringLiteral("method")).toString()
+                != QStringLiteral("tmux.killSession"));
+    QCOMPARE(f.controller.serverId(), QStringLiteral("new-host"));
+}
+
+void TstAppController::failedIdentityLookupRefusesTheWire()
+{
+    ConnectFixture f;
+    FakeTransport transport;
+    f.client.setTransport(&transport);
+    f.boot.fireWired();
+    const int id = takeRequest(transport).value(QStringLiteral("id")).toInt();
+    QSignalSpy errors(&f.controller, &AppController::error);
+    transport.deliver(errorFrame(id, -32000, QStringLiteral("identity unavailable")));
+    QCOMPARE(errors.count(), 1);
+    QCoreApplication::processEvents();
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("failed"));
+    QCOMPARE(f.controller.connectionError(), QStringLiteral("identity unavailable"));
+}
+
+void TstAppController::activationObserverMayDestroyTheController()
+{
+    FakeTransport transport;
+    CodeharbordClient client;
+    QPointer<AppController> controller = new AppController(&client);
+    auto* layouts = new SessionLayouts(
+        controller->workspaceDb(), controller->uiState(), controller);
+    controller->setConnection(nullptr, nullptr, nullptr, layouts);
+    controller->setServerId(QStringLiteral("activation-delete"));
+    controller->uiState()->setActiveSession(QStringLiteral("activation-delete"), {});
+    client.setTransport(&transport);
+    controller->refresh();
+    transport.deliver(listWithSessionFrame(
+        takeRequest(transport).value(QStringLiteral("id")).toInt(),
+        QStringLiteral("g"), QStringLiteral("s1"), false));
+    connect(layouts, &SessionLayouts::generationChanged, &client,
+            [&controller] { delete controller.data(); });
+    controller->activateSession(QStringLiteral("s1"));
+    QVERIFY(controller.isNull());
+}
+
+void TstAppController::activationCancelledByALayoutObserverDoesNotNotifyAgain()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    QSignalSpy active(&f.controller, &AppController::activeSessionChanged);
+    bool cancelled = false;
+    connect(&f.layouts, &SessionLayouts::generationChanged, &f.controller, [&] {
+        if (cancelled)
+            return;
+        cancelled = true;
+        f.controller.disconnectServer();
+    });
+    f.controller.activateSession(QStringLiteral("s1"));
+    QVERIFY(cancelled);
+    QVERIFY(f.controller.activeSessionId().isEmpty());
+    QVERIFY(f.layouts.devSessionId().isEmpty());
+    QCOMPARE(active.count(), 1);
+}
+
+void TstAppController::reentrantServerSwitchKeepsTheNewestLayoutKey()
+{
+    ActiveSessionFixture f;
+    f.deliverTreeWithS1();
+    bool switched = false;
+    connect(f.controller.sessionsModel(), &QAbstractItemModel::modelReset,
+            &f.controller, [&] {
+                if (switched)
+                    return;
+                switched = true;
+                f.controller.setServerId(QStringLiteral("newest"));
+            });
+    f.controller.setServerId(QStringLiteral("superseded"));
+    QVERIFY(switched);
+    QCOMPARE(f.controller.serverId(), QStringLiteral("newest"));
+    QCOMPARE(f.layouts.serverId(), QStringLiteral("newest"));
+    const auto requests = takeRequestsExcludingPolls(f.transport);
+    QCOMPARE(requests.size(), 1);
+    QCOMPARE(requests.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("serverId")).toString(),
+             QStringLiteral("newest"));
+}
+
+void TstAppController::disconnectDuringConnectRemainsDisconnected_data()
+{
+    QTest::addColumn<bool>("duringHandshake");
+    QTest::newRow("before-bootstrap") << false;
+    QTest::newRow("inside-handshake") << true;
+}
+
+void TstAppController::disconnectDuringConnectRemainsDisconnected()
+{
+    QFETCH(bool, duringHandshake);
+    ConnectFixture f;
+    QSignalSpy errors(&f.controller, &AppController::error);
+    if (duringHandshake) {
+        f.boot.duringConnect = [&f] { f.controller.disconnectServer(); };
+    } else {
+        connect(&f.controller, &AppController::connectionStateChanged,
+                &f.controller, [&f] {
+                    if (f.controller.connectionState() == QStringLiteral("connecting"))
+                        f.controller.disconnectServer();
+                });
+    }
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, duringHandshake ? 1 : 0);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("disconnected"));
+    QCOMPARE(f.boot.state(), SessionBootstrap::State::Disconnected);
+    QCOMPARE(errors.count(), 0);
+}
+
+void TstAppController::destroyingABorrowedBootstrapEndsAParkedPrompt()
+{
+    ConnectFixture f;
+    QPointer<FakeBootstrap> replacement =
+        new FakeBootstrap(&f.pool, &f.client, &f.monitor);
+    replacement->setKnownHostsPath(f.dir.filePath(QStringLiteral("replacement-known-hosts")));
+    replacement->duringConnect = [&] { offerUnknownHostKey(f.pool); };
+    f.controller.setConnection(&f.pool, replacement, &f.profiles, nullptr);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+    delete replacement.data();
+    QVERIFY(replacement.isNull());
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("disconnected"));
+    f.controller.resolveHostKey(true);
+    f.controller.setConnection(&f.pool, &f.boot, &f.profiles, nullptr);
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, 1);
+}
+
+void TstAppController::replacingTheSpineRetiresAParkedPrompt()
+{
+    ConnectFixture f;
+    f.boot.duringConnect = [&f] { offerUnknownHostKey(f.pool); };
+    f.controller.upgradeRemoteService(f.profileId);
+    QCOMPARE(f.controller.connectionState(), QStringLiteral("hostkey"));
+    QVERIFY(f.boot.remoteUpgradeRequested());
+    f.controller.setConnection(&f.pool, &f.boot, &f.profiles, nullptr);
+    QVERIFY(!f.boot.remoteUpgradeRequested());
+    f.controller.resolveHostKey(true);
+    QCOMPARE(f.boot.connectCalls, 1);
+    f.boot.duringConnect = {};
+    f.controller.connectToProfile(f.profileId);
+    QCOMPARE(f.boot.connectCalls, 2);
+}
 
 // The active Dev Session can be deleted out from under the shell by ANOTHER
 // client: it simply stops appearing in the authoritative tree. Nothing else in
@@ -2438,6 +2935,55 @@ void TstAppController::archivingActiveSessionRetiresItThroughChainedRefresh()
     QVERIFY(f.controller.sessionsModel()->hasSessions());
 }
 
+void TstAppController::replacingTheSpineCancelsAnActualNestedProbe()
+{
+    QTcpServer muteServer;
+    QVERIFY(muteServer.listen(QHostAddress::LocalHost, 0));
+    ConnectFixture f;
+    f.profiles.updateProfile(f.profileId,
+                             {{QStringLiteral("port"), muteServer.serverPort()}});
+    ProbingBootstrap outgoing(&f.pool, &f.client, &f.monitor);
+    WiredBootstrap replacement(&f.pool, &f.client, &f.monitor);
+    outgoing.connectOk = true;
+    replacement.connectOk = true;
+    outgoing.setKnownHostsPath(f.dir.filePath(QStringLiteral("outgoing-known-hosts")));
+    replacement.setKnownHostsPath(f.dir.filePath(QStringLiteral("replacement-known-hosts")));
+    f.controller.setConnection(&f.pool, &outgoing, &f.profiles, nullptr);
+    bool gateObservedClosed = false;
+    QObject gateObserver;
+    connect(&outgoing, &SessionBootstrap::stateChanged, &gateObserver,
+            [&](SessionBootstrap::State state) {
+                if (state != SessionBootstrap::State::Disconnected)
+                    return;
+                f.controller.connectToProfile(f.profileId);
+                gateObservedClosed = replacement.connectCalls == 0;
+            });
+    bool replaced = false;
+    outgoing.duringProbe = [&] {
+        QVERIFY(outgoing.attemptInProgress());
+        f.controller.setConnection(&f.pool, &replacement, &f.profiles, nullptr);
+        f.controller.connectToProfile(f.profileId);
+        QCOMPARE(replacement.state(), SessionBootstrap::State::Wired);
+        auto* rpc = static_cast<FramedChannel*>(replacement.rpcDevice());
+        const QJsonObject info = takeRequest(rpc->frames);
+        rpc->deliver(serverInfoFrame(info.value(QStringLiteral("id")).toInt(),
+                                     AppController::kMinimumServerSchemaVersion,
+                                     QStringLiteral("replacement-server"),
+                                     QStringLiteral("current")));
+        replaced = true;
+    };
+    f.controller.connectToProfile(f.profileId);
+    QVERIFY(replaced);
+    QVERIFY(gateObservedClosed);
+    QCOMPARE(outgoing.state(), SessionBootstrap::State::Disconnected);
+    QCOMPARE(outgoing.connectCalls, 0);
+    QCOMPARE(outgoing.openedChannels, 0);
+    QCOMPARE(replacement.connectCalls, 1);
+    QCOMPARE(replacement.state(), SessionBootstrap::State::Wired);
+    QCOMPARE(f.client.transport(), replacement.rpcDevice());
+    QCOMPARE(f.controller.serverId(), QStringLiteral("replacement-server"));
+}
+
 // Disconnect must land on a clear empty state, not a half-live shell still
 // pointing at a Dev Session it can no longer reach. Leaving it active is not
 // cosmetic: SessionLayouts keeps the devSessionId, keeps passing canEdit(),
@@ -2449,46 +2995,88 @@ void TstAppController::archivingActiveSessionRetiresItThroughChainedRefresh()
 void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
 {
     ActiveSessionFixture f;
+    QTemporaryDir dir;
     SshConnectionPool pool;
     AgentStatusMonitor monitor;
-    SessionBootstrap bootstrap(&pool, &f.client, &monitor);
+    WiredBootstrap bootstrap(&pool, &f.client, &monitor);
+    bootstrap.connectOk = true;
+    bootstrap.setTrustUnknownHostKeys(true);
+    bootstrap.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
     f.controller.setConnection(&pool, &bootstrap, nullptr, &f.layouts);
-
-    f.deliverTreeWithS1();
-    f.activateAndLoadS1();
+    const auto wire = [&] {
+        return bootstrap.connectAndWire(
+            QStringLiteral("example.invalid"), 22, QStringLiteral("user"),
+            QStringLiteral("node"), QStringLiteral("/srv/codeharbor"));
+    };
+    QVERIFY(wire());
+    auto* first = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const auto firstInfo = takeRequest(first->frames);
+    first->deliver(serverInfoFrame(firstInfo.value(QStringLiteral("id")).toInt(),
+                                   AppController::kMinimumServerSchemaVersion,
+                                   QStringLiteral("srv"), QStringLiteral("current")));
+    QVERIFY(f.layouts.workspaceReady());
+    QCOMPARE(f.controller.acceptedServerId(), QStringLiteral("srv"));
+    const auto firstList = takeRequest(first->frames);
+    first->deliver(listWithTerminalFrame(firstList.value(QStringLiteral("id")).toInt(),
+                                        QStringLiteral("g"), QStringLiteral("s1"),
+                                        QStringLiteral("t1")));
+    f.controller.activateSession(QStringLiteral("s1"));
+    for (const auto& request : takeRequestsExcludingPolls(first->frames)) {
+        const QString region = request.value(QStringLiteral("params")).toObject()
+                                   .value(QStringLiteral("region")).toString();
+        first->deliver(layoutLeafFrame(request.value(QStringLiteral("id")).toInt(),
+                                        region + QStringLiteral("-1")));
+    }
     QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
     QVERIFY(!f.layouts.viewerTree().isNull());
-    f.transport.takeSent();
+    QVERIFY(!f.layouts.terminalTree().isNull());
 
     QSignalSpy activeSpy(&f.controller, &AppController::activeSessionChanged);
     f.controller.disconnectServer();
-
+    QVERIFY(f.controller.acceptedServerId().isEmpty());
     QCOMPARE(f.controller.activeSessionId(), QString());
     QCOMPARE(activeSpy.count(), 1);
     QCOMPARE(f.layouts.devSessionId(), QString());
     QVERIFY(f.layouts.viewerTree().isNull());
     QVERIFY(f.layouts.terminalTree().isNull());
-    // The distinction from a deletion: the server still HAS this session, so
-    // the next connect must reopen it.
     QCOMPARE(f.controller.uiState()->activeSession(QStringLiteral("srv")),
              QStringLiteral("s1"));
 
-    // A layout edit is now refused outright instead of diverging locally.
     QSignalSpy layoutErrorSpy(&f.layouts, &SessionLayouts::error);
-    f.transport.takeSent();
     f.layouts.splitPane(QStringLiteral("viewer"), QStringLiteral("viewer-1"),
                         QStringLiteral("horizontal"));
     QCOMPARE(layoutErrorSpy.count(), 1);
-    QVERIFY(f.transport.takeSent().isEmpty());
+    QVERIFY(f.client.transport() == nullptr);
+    QVERIFY(f.layouts.viewerTree().isNull());
 
-    // Reconnect: adoptServerIdentity re-drives refresh(), whose `refreshed`
-    // runs restoreActiveSession. Because the id was cleared, it reopens s1 -
-    // and reopening reloads BOTH regions from the server rather than reusing
-    // the tree we were holding when the link went down.
-    f.deliverTreeWithS1();
+    // Accept a fresh wire before the remembered session can load either tree.
+    QVERIFY(wire());
+    QVERIFY(f.controller.acceptedServerId().isEmpty());
+    auto* second = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const auto secondInfo = takeRequest(second->frames);
+    second->deliver(serverInfoFrame(secondInfo.value(QStringLiteral("id")).toInt(),
+                                    AppController::kMinimumServerSchemaVersion,
+                                    QStringLiteral("srv"), QStringLiteral("current")));
+    QVERIFY(f.layouts.workspaceReady());
+    QCOMPARE(f.controller.acceptedServerId(), QStringLiteral("srv"));
+    const auto secondList = takeRequest(second->frames);
+    second->deliver(listWithTerminalFrame(secondList.value(QStringLiteral("id")).toInt(),
+                                         QStringLiteral("g"), QStringLiteral("s1"),
+                                         QStringLiteral("t1")));
     QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
     QCOMPARE(f.layouts.devSessionId(), QStringLiteral("s1"));
-    QCOMPARE(takeRequestIds(f.transport).size(), 2); // one getLayout per region
+    const auto layoutRequests = takeRequestsExcludingPolls(second->frames);
+    QCOMPARE(layoutRequests.size(), 2);
+    for (const auto& request : layoutRequests) {
+        QCOMPARE(request.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.getLayout"));
+        const QString region = request.value(QStringLiteral("params")).toObject()
+                                   .value(QStringLiteral("region")).toString();
+        second->deliver(layoutLeafFrame(request.value(QStringLiteral("id")).toInt(),
+                                         region + QStringLiteral("-1")));
+    }
+    QVERIFY(!f.layouts.viewerTree().isNull());
+    QVERIFY(!f.layouts.terminalTree().isNull());
 }
 
 // refresh() with no transport bound is DOCUMENTED to return without asking
@@ -3145,8 +3733,19 @@ void TstAppController::submitCredentialWithAnUnknownKindIsIgnored()
 // release ahead of its codeharbord got an empty serverId, keyed the workspace to
 // "", and showed an EMPTY SIDEBAR over a healthy SSH session with no
 // explanation. Version skew is the default state under manual deployment.
+void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions_data()
+{
+    QTest::addColumn<int>("schema");
+    QTest::addColumn<QString>("remoteId");
+    QTest::newRow("before-server-identity") << 3 << QString();
+    QTest::newRow("before-atomic-layout-initializer") << 8 << QStringLiteral("old-server");
+    QTest::newRow("before-agent-endpoint-routing") << 9 << QStringLiteral("old-server");
+}
+
 void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions()
 {
+    QFETCH(int, schema);
+    QFETCH(QString, remoteId);
     FakeTransport transport;
     ConnectFixture f;
     f.client.setTransport(&transport);
@@ -3157,13 +3756,12 @@ void TstAppController::serverOlderThanTheSchemaFloorIsRefusedWithBothVersions()
     QCOMPARE(request.value(QStringLiteral("method")).toString(),
              QStringLiteral("server.info"));
 
-    // schema 3: the release before serverId existed, so it reports none.
     transport.deliver(serverInfoFrame(request.value(QStringLiteral("id")).toInt(),
-                                      3, QString(), QStringLiteral("0.0.9")));
+                                      schema, remoteId, QStringLiteral("0.0.9")));
 
     QCOMPARE(errorSpy.count(), 1);
     const QString message = errorSpy.at(0).at(0).toString();
-    QVERIFY2(message.contains(QStringLiteral("3")), qPrintable(message));
+    QVERIFY2(message.contains(QString::number(schema)), qPrintable(message));
     QVERIFY2(message.contains(QString::number(
                  AppController::kMinimumServerSchemaVersion)),
              qPrintable(message));
@@ -3365,6 +3963,17 @@ void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
         QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"),
                                       QStringLiteral("viewer")),
                  3);
+        // NMD3: backslashes are separators on native Windows settings too.
+        QSettings persisted(iniPath, QSettings::IniFormat);
+        const QStringList keysBefore = persisted.allKeys();
+        for (const QString& invalidRegion :
+             {QStringLiteral("\\viewer"), QStringLiteral("viewer\\nested")}) {
+            store.setNextPaneSuffix(QStringLiteral("s1"), invalidRegion, 9);
+            QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"), invalidRegion), 1);
+        }
+        QCOMPARE(store.nextPaneSuffix(QStringLiteral("s1"), QStringLiteral("viewer")), 3);
+        persisted.sync();
+        QCOMPARE(persisted.allKeys(), keysBefore);
         // The write side carries the same floor the read side enforces: a
         // counter stored below 1 would be repaired to 1 on the way out, which
         // silently forgets every id already spent and hands the next pane a
@@ -3404,6 +4013,337 @@ void TstAppController::uiStateStoreRejectsAnEmptyDevSessionId()
     QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
     const QString ini = QString::fromUtf8(file.readAll());
     QVERIFY2(!ini.contains(QStringLiteral("terminal-4")), qPrintable(ini));
+}
+
+void TstAppController::aFailedProfileWriteReachesTheShellWithoutClaimingDurability()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString blocked = dir.filePath(QStringLiteral("settings.ini"));
+    QVERIFY(QDir().mkpath(blocked)); // a directory cannot be replaced by QSettings
+    ServerProfiles profiles(blocked);
+    CodeharbordClient client;
+    AppController controller(&client);
+    controller.setConnection(nullptr, nullptr, &profiles, nullptr);
+    QSignalSpy errors(&controller, &AppController::error);
+    const QString id = profiles.addProfile(
+        {{QStringLiteral("name"), QStringLiteral("unsaved")},
+         {QStringLiteral("host"), QStringLiteral("example.invalid")},
+         {QStringLiteral("user"), QStringLiteral("user")}});
+    QVERIFY(!id.isEmpty());
+    QCOMPARE(profiles.profiles().size(), 1);
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.first().first().toString().contains(blocked));
+    QVERIFY(QFileInfo(blocked).isDir());
+}
+
+void TstAppController::missingOrInvalidAgentSocketRefusesTheWire_data()
+{
+    QTest::addColumn<QJsonValue>("agentSocket");
+    QTest::newRow("missing") << QJsonValue(QJsonValue::Undefined);
+    QTest::newRow("wrong-type") << QJsonValue(true);
+    QTest::newRow("empty") << QJsonValue(QString());
+    QTest::newRow("relative") << QJsonValue(QStringLiteral("events.sock"));
+    QString nulPath = QStringLiteral("/run/codeharbor/events.sock");
+    nulPath.insert(5, QChar::Null);
+    QTest::newRow("nul") << QJsonValue(nulPath);
+}
+
+void TstAppController::missingOrInvalidAgentSocketRefusesTheWire()
+{
+    QFETCH(QJsonValue, agentSocket);
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    WiredBootstrap bootstrap(&pool, &client, &monitor);
+    bootstrap.connectOk = true;
+    bootstrap.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    bootstrap.setTrustUnknownHostKeys(true);
+    AppController controller(&client, nullptr, dir.filePath(QStringLiteral("ui.ini")));
+    SessionLayouts layouts(controller.workspaceDb(), controller.uiState());
+    OfflineFactory factory(&pool);
+    factory.setWorkspace(controller.workspaceDb());
+    factory.setRpcClient(&client);
+    controller.setConnection(&pool, &bootstrap, nullptr, &layouts);
+    controller.setTerminalFactory(&factory);
+    const auto wire = [&] {
+        return bootstrap.connectAndWire(
+            QStringLiteral("example.invalid"), 22, QStringLiteral("user"),
+            QStringLiteral("node"), QStringLiteral("/srv/codeharbor"));
+    };
+    QVERIFY(wire());
+    auto* first = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const auto initialInfo = takeRequest(first->frames);
+    first->deliver(serverInfoFrame(initialInfo.value(QStringLiteral("id")).toInt(),
+                                   AppController::kMinimumServerSchemaVersion,
+                                   QStringLiteral("old-server"), QStringLiteral("current")));
+    QVERIFY(factory.workspaceReady());
+    QVERIFY(!factory.agentSocket().isEmpty());
+    controller.disconnectServer();
+    QVERIFY(factory.agentSocket().isEmpty());
+    QVERIFY(factory.controlSocket().isEmpty());
+    QVERIFY(wire());
+    auto* second = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const auto info = takeRequest(second->frames);
+    QSignalSpy errors(&controller, &AppController::error);
+    QSignalSpy readiness(&factory, &TerminalFactory::workspaceReadyChanged);
+    second->deliver(serverInfoFrame(info.value(QStringLiteral("id")).toInt(),
+                                    AppController::kMinimumServerSchemaVersion,
+                                    QStringLiteral("unaccepted-server"),
+                                    QStringLiteral("current"), agentSocket));
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.first().first().toString().contains(QStringLiteral("socket")));
+    QCOMPARE(controller.serverId(), QStringLiteral("old-server"));
+    QVERIFY(controller.acceptedServerId().isEmpty());
+    QVERIFY(!factory.workspaceReady());
+    QVERIFY(!layouts.workspaceReady());
+    QVERIFY(factory.agentSocket().isEmpty());
+    QVERIFY(factory.controlSocket().isEmpty());
+    QCOMPARE(readiness.count(), 0);
+    QTRY_COMPARE(bootstrap.state(), SessionBootstrap::State::Disconnected);
+    QVERIFY(client.transport() == nullptr);
+}
+
+void TstAppController::acceptedIdentityObserverCanDisconnectBeforeReadiness()
+{
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    WiredBootstrap bootstrap(&pool, &client, &monitor);
+    bootstrap.connectOk = true;
+    bootstrap.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    bootstrap.setTrustUnknownHostKeys(true);
+    AppController controller(&client, nullptr, dir.filePath(QStringLiteral("ui.ini")));
+    SessionLayouts layouts(controller.workspaceDb(), controller.uiState());
+    OfflineFactory factory(&pool);
+    factory.setWorkspace(controller.workspaceDb());
+    factory.setRpcClient(&client);
+    controller.setConnection(&pool, &bootstrap, nullptr, &layouts);
+    controller.setTerminalFactory(&factory);
+    int accepted = 0;
+    QObject observer;
+    connect(&controller, &AppController::acceptedServerIdChanged, &observer, [&] {
+        if (controller.acceptedServerId().isEmpty())
+            return;
+        ++accepted;
+        QVERIFY(!factory.workspaceReady());
+        controller.disconnectServer();
+    });
+    QVERIFY(bootstrap.connectAndWire(
+        QStringLiteral("example.invalid"), 22, QStringLiteral("user"),
+        QStringLiteral("node"), QStringLiteral("/srv/codeharbor")));
+    QVERIFY(controller.acceptedServerId().isEmpty());
+    auto* rpc = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const auto info = takeRequest(rpc->frames);
+    rpc->deliver(serverInfoFrame(info.value(QStringLiteral("id")).toInt(),
+                                 AppController::kMinimumServerSchemaVersion,
+                                 QStringLiteral("accepted-server"), QStringLiteral("current")));
+    QCOMPARE(accepted, 1);
+    QVERIFY(factory.agentSocket().isEmpty());
+    QVERIFY(factory.controlSocket().isEmpty());
+    QVERIFY(controller.acceptedServerId().isEmpty());
+    QCOMPARE(controller.serverId(), QStringLiteral("accepted-server"));
+    QVERIFY(!factory.workspaceReady());
+    QVERIFY(!layouts.workspaceReady());
+    QVERIFY(client.transport() == nullptr);
+    QCOMPARE(bootstrap.state(), SessionBootstrap::State::Disconnected);
+}
+
+void TstAppController::reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness_data()
+{
+    QTest::addColumn<bool>("sameServer");
+    QTest::newRow("same-id-preserves-panes") << true;
+    QTest::newRow("different-id-clears-context-first") << false;
+}
+
+void TstAppController::reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness()
+{
+    QFETCH(bool, sameServer);
+    QTemporaryDir dir;
+    SshConnectionPool pool;
+    CodeharbordClient client;
+    AgentStatusMonitor monitor;
+    WiredBootstrap bootstrap(&pool, &client, &monitor);
+    bootstrap.connectOk = true;
+    bootstrap.setKnownHostsPath(dir.filePath(QStringLiteral("known_hosts")));
+    bootstrap.setTrustUnknownHostKeys(true);
+    bootstrap.setReconnectTimeScale(0.001);
+    ServerProfiles profiles(dir.filePath(QStringLiteral("profiles.ini")));
+    AppController controller(&client, nullptr, dir.filePath(QStringLiteral("ui.ini")));
+    SessionLayouts layouts(controller.workspaceDb(), controller.uiState());
+    OfflineFactory factory(&pool);
+    factory.setWorkspace(controller.workspaceDb());
+    factory.setRpcClient(&client);
+    controller.setConnection(&pool, &bootstrap, &profiles, &layouts);
+    controller.setAgentMonitor(&monitor);
+    controller.setTerminalFactory(&factory);
+    QVERIFY(bootstrap.connectAndWire(
+        QStringLiteral("example.invalid"), 22, QStringLiteral("user"),
+        QStringLiteral("node"), QStringLiteral("/srv/codeharbor")));
+    auto* first = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const QJsonObject initialIdentity = takeRequest(first->frames);
+    first->deliver(serverInfoFrame(initialIdentity.value(QStringLiteral("id")).toInt(),
+                                   AppController::kMinimumServerSchemaVersion,
+                                   QStringLiteral("old-server"), QStringLiteral("current")));
+    QVERIFY(factory.workspaceReady());
+    QCOMPARE(factory.agentSocket(), QStringLiteral("/run/codeharbor/agent-test.sock"));
+    QCOMPARE(factory.controlSocket(), QStringLiteral("/run/codeharbor/control-test.sock"));
+    QCOMPARE(controller.acceptedServerId(), QStringLiteral("old-server"));
+    const QJsonObject initialList = takeRequest(first->frames);
+    first->deliver(listWithTerminalFrame(initialList.value(QStringLiteral("id")).toInt(),
+                                        QStringLiteral("g"), QStringLiteral("s1"),
+                                        QStringLiteral("old-row"), QStringLiteral("generic")));
+    controller.activateSession(QStringLiteral("s1"));
+    for (const auto& request : takeRequestsExcludingPolls(first->frames)) {
+        const QString region = request.value(QStringLiteral("params")).toObject()
+                                   .value(QStringLiteral("region")).toString();
+        first->deliver(layoutLeafFrame(request.value(QStringLiteral("id")).toInt(),
+                                        region + QStringLiteral("-1")));
+    }
+    QCOMPARE(controller.activeSessionId(), QStringLiteral("s1"));
+    const QString accepted = sameServer ? QStringLiteral("old-server")
+                                        : QStringLiteral("replacement-server");
+    const QString readySession = sameServer ? QStringLiteral("s1")
+                                            : QStringLiteral("fresh-session");
+    const QString readyRow = sameServer ? QStringLiteral("old-row")
+                                        : QStringLiteral("fresh-row");
+    QObject readinessPane;
+    auto* readyTerminal = factory.create(&readinessPane);
+    QSignalSpy resolutions(&factory, &TerminalFactory::targetResolved);
+    const quint64 oldLayoutGeneration = layouts.generation();
+    const quint64 oldPaneGeneration = layouts.paneGeneration();
+    bool readyAfterContext = false;
+    QObject readinessObserver;
+    QSignalSpy viewerChanges(&layouts, &SessionLayouts::viewerTreeChanged);
+    connect(&factory, &TerminalFactory::workspaceReadyChanged, &readinessObserver, [&] {
+        if (!factory.workspaceReady())
+            return;
+        readyAfterContext = true;
+        QCOMPARE(controller.serverId(), accepted);
+        QCOMPARE(controller.acceptedServerId(), accepted);
+        QCOMPARE(factory.agentSocket(), QStringLiteral("/different-root/reconnected-agent.sock"));
+        QCOMPARE(layouts.serverId(), accepted);
+        QCOMPARE(controller.activeSessionId(), sameServer ? QStringLiteral("s1") : QString());
+        if (sameServer) {
+            QVERIFY(layouts.generation() > oldLayoutGeneration);
+            QCOMPARE(layouts.paneGeneration(), oldPaneGeneration);
+        }
+        // Exercise the real pane consumer at the handoff, not a factory getter.
+        QVERIFY(factory.resolveTarget(readyTerminal, readySession, QStringLiteral("terminal-1"),
+                                      readyRow, QStringLiteral("/repo")));
+    });
+    QSignalSpy serverChanges(&controller, &AppController::serverIdChanged);
+    static_cast<FramedChannel*>(bootstrap.agentDevice())->dropRemote();
+    QVERIFY(!factory.workspaceReady());
+    QVERIFY(controller.acceptedServerId().isEmpty());
+    QVERIFY(factory.agentSocket().isEmpty());
+    QVERIFY(factory.controlSocket().isEmpty());
+    QCOMPARE(controller.activeSessionId(), QStringLiteral("s1"));
+    QTRY_COMPARE(bootstrap.state(), SessionBootstrap::State::Wired);
+    QSignalSpy errors(&controller, &AppController::error);
+    QVERIFY(factory.connected()); // the connected-pool test seam alone is insufficient
+    QVERIFY(controller.acceptedServerId().isEmpty());
+    QVERIFY(factory.agentSocket().isEmpty());
+    QVERIFY(factory.controlSocket().isEmpty());
+    QVERIFY(!factory.workspaceReady());
+    QVERIFY(!layouts.workspaceReady());
+    QVERIFY(!layouts.viewerTree().isNull());
+    auto* second = static_cast<FramedChannel*>(bootstrap.rpcDevice());
+    const QJsonObject identity = takeRequest(second->frames);
+    QCOMPARE(identity.value(QStringLiteral("method")).toString(), QStringLiteral("server.info"));
+    QObject pane;
+    auto* terminal = factory.create(&pane);
+    QVERIFY(!factory.resolveTarget(terminal, QStringLiteral("s1"), QStringLiteral("terminal-1"),
+                                    QStringLiteral("old-row"), QStringLiteral("/repo")));
+    const QVariant previousTree = layouts.viewerTree();
+    QCOMPARE(layouts.splitPane(QStringLiteral("viewer"), QStringLiteral("viewer-1"),
+                                QStringLiteral("horizontal")), QString());
+    QCOMPARE(layouts.viewerTree(), previousTree);
+    QVERIFY(takeRequestsExcludingPolls(second->frames).isEmpty());
+    static_cast<FramedChannel*>(bootstrap.agentDevice())->deliver(agentEventLine(
+        QStringLiteral("running"), QStringLiteral("s1"), QStringLiteral("old-row"),
+        QStringLiteral("oh-my-pi")));
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(takeRequestsExcludingPolls(second->frames).isEmpty());
+    second->deliver(serverInfoFrame(identity.value(QStringLiteral("id")).toInt(),
+                                    AppController::kMinimumServerSchemaVersion, accepted,
+                                    QStringLiteral("current"),
+                                    QStringLiteral("/different-root/reconnected-agent.sock")));
+    QVERIFY(factory.workspaceReady());
+    QCOMPARE(controller.acceptedServerId(), accepted);
+    QVERIFY(readyAfterContext);
+    QCOMPARE(serverChanges.count(), sameServer ? 0 : 1);
+    QVERIFY(layouts.workspaceReady());
+    if (sameServer) {
+        layouts.closePaneForSession(QStringLiteral("s1"), oldLayoutGeneration,
+                                    QStringLiteral("viewer"), QStringLiteral("viewer-1"));
+        QCOMPARE(layouts.viewerTree(), previousTree);
+    }
+    int refreshedLayouts = 0;
+    for (const auto& request : takeRequestsExcludingPolls(second->frames)) {
+        const QString method = request.value(QStringLiteral("method")).toString();
+        const int requestId = request.value(QStringLiteral("id")).toInt();
+        if (method == QStringLiteral("workspace.list")) {
+            second->deliver(sameServer
+                ? listWithTerminalFrame(requestId, QStringLiteral("g"), QStringLiteral("s1"),
+                                         QStringLiteral("old-row"), QStringLiteral("generic"))
+                : listResultFrame(requestId, QStringLiteral("empty-group")));
+        } else if (method == QStringLiteral("workspace.getLayout")) {
+            ++refreshedLayouts;
+            const QString region = request.value(QStringLiteral("params")).toObject()
+                                       .value(QStringLiteral("region")).toString();
+            second->deliver(layoutLeafFrame(requestId, region + QStringLiteral("-1")));
+        } else if (method == QStringLiteral("workspace.resolveTerminalPane")) {
+            const auto params = request.value(QStringLiteral("params")).toObject();
+            QCOMPARE(params.value(QStringLiteral("serverId")).toString(), accepted);
+            QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), readySession);
+            QCOMPARE(params.value(QStringLiteral("id")).toString(), readyRow);
+            second->deliver(terminalPaneResultFrame(
+                requestId, readyRow, readySession, QStringLiteral("generic")));
+        } else {
+            QFAIL("unexpected pre-identity/initialization request during reconnect");
+        }
+    }
+    QCOMPARE(refreshedLayouts, sameServer ? 2 : 0);
+    QCOMPARE(resolutions.count(), 1);
+    QCOMPARE(resolutions.first().at(0).value<TerminalController*>(), readyTerminal);
+    QVERIFY(!resolutions.first().at(1).toString().isEmpty());
+    QCOMPARE(viewerChanges.count(), sameServer ? 0 : 1);
+    const auto afterTree = takeRequestsExcludingPolls(second->frames);
+    if (sameServer) {
+        QCOMPARE(afterTree.size(), 1);
+        const auto update = afterTree.first();
+        QCOMPARE(update.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.updateTerminalPane"));
+        QCOMPARE(update.value(QStringLiteral("params")).toObject()
+                     .value(QStringLiteral("harness")).toString(),
+                 QStringLiteral("oh-my-pi"));
+        second->deliver(terminalPaneResultFrame(
+            update.value(QStringLiteral("id")).toInt(), QStringLiteral("old-row"),
+            QStringLiteral("s1"), QStringLiteral("oh-my-pi")));
+        const auto refreshed = takeRequest(second->frames);
+        QCOMPARE(refreshed.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.list"));
+        second->deliver(listWithTerminalFrame(
+            refreshed.value(QStringLiteral("id")).toInt(), QStringLiteral("g"),
+            QStringLiteral("s1"), QStringLiteral("old-row"), QStringLiteral("oh-my-pi")));
+        QCOMPARE(controller.terminalPaneHarness(QStringLiteral("old-row")),
+                 QStringLiteral("oh-my-pi"));
+        auto* agent = static_cast<FramedChannel*>(bootstrap.agentDevice());
+        agent->deliver(agentEventLine(QStringLiteral("idle"), QStringLiteral("s1"),
+                                      QStringLiteral("old-row"), QStringLiteral("oh-my-pi")));
+        QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("old-row")),
+                 static_cast<int>(AgentState::Idle));
+        monitor.noteTerminalOutput(QStringLiteral("s1"), QStringLiteral("old-row"));
+        QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("old-row")),
+                 static_cast<int>(AgentState::Idle)); // no generic activity clock
+    } else {
+        QVERIFY(afterTree.isEmpty()); // old-server observations were discarded
+    }
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(takeRequestsExcludingPolls(second->frames).isEmpty());
 }
 
 // ServerProfiles serialises its saves against a second copy of the application

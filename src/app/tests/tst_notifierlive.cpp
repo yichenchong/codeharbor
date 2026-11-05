@@ -2,13 +2,19 @@
 
 #include <QCoreApplication>
 #include <QDebug>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QTest>
 
-// LIVE gate: actually delivers a notification to whatever daemon owns
-// org.freedesktop.Notifications on the session bus. It is the ONLY proof that
-// agent-attention notifications reach a real display; every other notifier test
-// runs against the deliberately bus-less no-op path.
+#if CH_HAVE_DBUS
+#include <QDBusPendingCall>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
+#endif
+
+// LIVE gate: requires acknowledgements from the real session's notification
+// daemon. A successful D-Bus reply proves acceptance, not that a compositor
+// displayed a bubble (desktop policy may suppress it).
 //
 // A machine with no session bus and no daemon (headless CI, a bare SSH login)
 // is a legitimate environment, so this must not fail there. But a QSKIP that
@@ -54,30 +60,55 @@ void TestNotifierLive::deliversToTheSessionBus()
               "org.freedesktop.Notifications service");
     }
 
+    notifier.setCoalesceWindowMs(60000);
     QSignalSpy raised(&notifier, &ch::Notifier::notificationRaised);
     notifier.notify(QStringLiteral("CodeHarbor"),
                     QStringLiteral("live notifier gate"));
     QCOMPARE(raised.count(), 1);
 
-    // Let the async Notify round-trip complete; a failing call would surface
-    // as an error reply, which the notifier swallows, so we assert only that
-    // the delivery does not crash or hang and the second identical call is
-    // coalesced into a replacement rather than a second bubble.
-    QTest::qWait(500);
+#if CH_HAVE_DBUS
+    // Capture the actual call issued by Notifier, without exposing a production
+    // acknowledgement API solely for this test. Copy the pending call before
+    // the notifier's finished handler deletes its watcher.
+    const auto firstWatchers =
+        notifier.findChildren<QDBusPendingCallWatcher*>(QString(),
+                                                       Qt::FindDirectChildrenOnly);
+    QVERIFY(!firstWatchers.isEmpty());
+    const QPointer<QDBusPendingCallWatcher> firstWatcher = firstWatchers.constLast();
+    const QDBusPendingCall firstCall = *firstWatcher;
+    QTRY_VERIFY_WITH_TIMEOUT(firstCall.isFinished(), 30000);
+    const QDBusPendingReply<unsigned int> firstReply = firstCall;
+    QVERIFY2(!firstReply.isError(), qPrintable(firstReply.error().message()));
+    QVERIFY2(firstReply.value() != 0, "the daemon returned no notification id");
+    // Wait for Notifier's finished handler to adopt the id before asking it
+    // for a replacement; merely seeing a ready reply does not run that slot.
+    QTRY_VERIFY_WITH_TIMEOUT(firstWatcher.isNull(), 30000);
+#endif
 
     QSignalSpy coalesced(&notifier, &ch::Notifier::notificationCoalesced);
     notifier.notify(QStringLiteral("CodeHarbor"),
                     QStringLiteral("live notifier gate"));
     QCOMPARE(coalesced.count(), 1);
     QCOMPARE(raised.count(), 1);
-    QTest::qWait(500);
+#if CH_HAVE_DBUS
+    const auto replacementWatchers =
+        notifier.findChildren<QDBusPendingCallWatcher*>(QString(),
+                                                       Qt::FindDirectChildrenOnly);
+    QVERIFY(!replacementWatchers.isEmpty());
+    const QDBusPendingCall replacementCall = *replacementWatchers.constLast();
+    QTRY_VERIFY_WITH_TIMEOUT(replacementCall.isFinished(), 30000);
+    const QDBusPendingReply<unsigned int> replacementReply = replacementCall;
+    QVERIFY2(!replacementReply.isError(),
+             qPrintable(replacementReply.error().message()));
+    QCOMPARE(replacementReply.value(), firstReply.value());
+#endif
 
     // The positive counterpart to the banner above: a reader scanning the log
-    // can tell a real delivery apart from a skipped one without decoding
+    // can tell a daemon acknowledgement apart from a skip without decoding
     // ctest's result column.
     qInfo().noquote()
-        << "NOTIFICATION DELIVERY VERIFIED against a real "
-           "org.freedesktop.Notifications daemon";
+        << "NOTIFICATION DAEMON ACKNOWLEDGEMENT VERIFIED against "
+           "org.freedesktop.Notifications; visual display is not verified";
 }
 
 // Plain QCoreApplication: notifications need no GUI, and QTEST_MAIN would pull

@@ -156,6 +156,7 @@ private slots:
     void harnessChangesClearDerivedState();
     // Re-entrant eviction must not emit pending transitions for removed panes.
     void ageingSignalsSkipEvictedPanes();
+    void eventSignalsSkipEvictedPanes();
     // AG5: the ageing timer must be armed for exactly the panes the tick moves.
     void aSeenGenericCompletionResumesActivityDerivation();
     // AG6: both windows are policy, and 0 has a defined meaning for each.
@@ -1857,6 +1858,40 @@ void TstAgentMonitor::ageingSignalsSkipEvictedPanes()
     QCOMPARE(stateSpy.count(), 1);
     QCOMPARE(m_monitor->stateFor("dE1", "tE"), asInt(AgentState::Unknown));
     QCOMPARE(m_monitor->stateFor("dE2", "tE"), asInt(AgentState::Unknown));
+}
+
+void TstAgentMonitor::eventSignalsSkipEvictedPanes()
+{
+    SyncDevice device;
+    m_monitor->setTransport(&device);
+    for (int signal = 0; signal < 3; ++signal) {
+        QSignalSpy states(m_monitor, &AgentStatusMonitor::agentStateChanged);
+        QSignalSpy unseen(m_monitor, &AgentStatusMonitor::unseenChanged);
+        QSignalSpy harnesses(m_monitor, &AgentStatusMonitor::harnessObserved);
+        QSignalSpy notifications(m_monitor, &AgentStatusMonitor::notify);
+        const auto evict = [this] { m_monitor->retainDevSessions({}); };
+        QMetaObject::Connection connection;
+        if (signal == 0)
+            connection = connect(m_monitor, &AgentStatusMonitor::agentStateChanged,
+                                 this, evict);
+        else if (signal == 1)
+            connection = connect(m_monitor, &AgentStatusMonitor::unseenChanged,
+                                 this, evict);
+        else
+            connection = connect(m_monitor, &AgentStatusMonitor::harnessObserved,
+                                 this, evict);
+
+        device.push(eventLine("idle_unseen", "dEvicted", "tEvicted", "pi"));
+        QCOMPARE(m_monitor->stateFor("dEvicted", "tEvicted"),
+                 asInt(AgentState::Unknown));
+        QVERIFY(!m_monitor->hasUnseen("dEvicted"));
+        QCOMPARE(states.count(), 1);
+        QCOMPARE(unseen.count(), signal == 0 ? 0 : 1);
+        QCOMPARE(harnesses.count(), signal == 2 ? 1 : 0);
+        QCOMPARE(notifications.count(), 0);
+        disconnect(connection);
+    }
+    m_monitor->setTransport(nullptr);
 }
 
 // AG5. Two pieces of code decide when a pane's state may change with time

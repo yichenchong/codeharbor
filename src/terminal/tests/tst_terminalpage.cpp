@@ -30,6 +30,7 @@
 #include "SessionBootstrap.h"
 #include "SessionState.h"
 #include "SshConnectionPool.h"
+#include "TerminalBridge.h"
 #include "TerminalController.h"
 #include "TerminalFactory.h"
 #include "ViewerModel.h"
@@ -49,6 +50,7 @@
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QMetaObject>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -56,6 +58,8 @@
 #include <QStandardPaths>
 #include <QString>
 #include <QUrl>
+#include <QScopeGuard>
+#include <QSignalSpy>
 #include <QVariant>
 #include <QtQuick/QQuickWindow>
 #include <QtQuickControls2/QQuickStyle>
@@ -401,9 +405,15 @@ constexpr auto kJsInstallInputSpy = R"JS(
 (function () {
     try {
         window.__chInput = [];
+        window.__chInputDetails = [];
         if (!window.__chInputSpy) {
             window.__chInputSpy = function (event) {
                 window.__chInput.push(event.type + ":" + event.button);
+                window.__chInputDetails.push({
+                    type: event.type, button: event.button, buttons: event.buttons,
+                    shift: event.shiftKey, alt: event.altKey, trusted: event.isTrusted,
+                    x: event.clientX, y: event.clientY, cancelled: event.defaultPrevented
+                });
                 // Where the page believes the pointer was. The window and the
                 // page do not share a coordinate system — the pane's header and
                 // borders sit between them — and this is what lets a caller
@@ -598,6 +608,102 @@ constexpr auto kJsChoosePaste = R"JS(
 })()
 )JS";
 
+// The real stylesheet gives FitAddon a fixed flex surface. An unstyled,
+// content-sized iframe creates a ResizeObserver feedback loop absent from the
+// shipped page. Capture errors without suppressing browser reporting.
+constexpr auto kJsIsolatedTerminalCase = R"JS(
+(function (run, resultKey) {
+    var frame = document.createElement("iframe");
+    frame.style.cssText = "position:fixed;width:640px;height:480px;left:0;top:0;border:0";
+    document.body.appendChild(frame);
+    var doc = frame.contentDocument;
+    var view = frame.contentWindow;
+    var root = doc.createElement("div");
+    root.id = "ch-terminal-root";
+    doc.body.appendChild(root);
+    var errors = [];
+    var host = null;
+    var finished = false;
+    window[resultKey] = { done: false, status: "STYLES", errors: errors };
+    function record(reason) {
+        errors.push(reason && typeof reason.stack === "string" ? reason.stack : String(reason));
+    }
+    function onError(event) { record(event.error || event.message); }
+    function onRejection(event) { record(event.reason); }
+    window.addEventListener("error", onError);
+    view.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    view.addEventListener("unhandledrejection", onRejection);
+    function dispose() {
+        if (!host) return;
+        var outgoing = host;
+        host = null;
+        try { outgoing.dispose(); } catch (error) { record(error); }
+    }
+    function finish(status) {
+        if (finished) return;
+        finished = true;
+        dispose();
+        frame.remove();
+        window.removeEventListener("error", onError);
+        view.removeEventListener("error", onError);
+        window.removeEventListener("unhandledrejection", onRejection);
+        view.removeEventListener("unhandledrejection", onRejection);
+        window[resultKey] = { done: true, status: status, errors: errors };
+    }
+    var styles = [];
+    for (var source of document.querySelectorAll('style, link[rel="stylesheet"]')) {
+        var clone = source.cloneNode(true);
+        if (source.tagName === "LINK") {
+            clone.href = source.href;
+            styles.push(new Promise(function (resolve, reject) {
+                clone.onload = resolve;
+                clone.onerror = function () { reject(new Error("fixture stylesheet failed")); };
+            }));
+        }
+        doc.head.appendChild(clone);
+    }
+    Promise.all(styles).then(function () {
+        var key = "codeharbor.terminal.disableWebgl";
+        var previous = sessionStorage.getItem(key);
+        try {
+            sessionStorage.setItem(key, "1");
+            run({
+                root: root, doc: doc, view: view,
+                mount: function (bridge) {
+                    host = CodeHarborTerminal.mountTerminal(root, bridge);
+                    return host;
+                },
+                dispose: dispose,
+                finish: finish,
+                afterMount: function (action) {
+                    // xterm 5's Viewport constructor queues an unowned zero-
+                    // delay startup sync. Let that earlier task run while its
+                    // renderer exists, then dispose before the 120ms recovery
+                    // timer. This is startup ordering, not a retry or sleep.
+                    setTimeout(function () {
+                        try { action(); } catch (error) {
+                            record(error);
+                            finish("CASE_THROW");
+                        }
+                    }, 0);
+                }
+            });
+        } catch (error) {
+            record(error);
+            finish("MOUNT_THROW");
+        } finally {
+            if (previous === null) sessionStorage.removeItem(key);
+            else sessionStorage.setItem(key, previous);
+        }
+    }, function (error) {
+        record(error);
+        finish("STYLESHEET_THROW");
+    });
+    return "STARTED";
+})
+)JS";
+
 } // namespace
 
 class TstTerminalPage : public QObject {
@@ -614,6 +720,8 @@ private slots:
     // pixel ratio buys sharpness, and only the font size decides how big the
     // text looks.
     void apparentTextSizeIgnoresThePixelRatio();
+    void disposingARecoveredRendererCancelsItsDelayedPtyResize();
+    void aClipboardReadCannotPasteIntoAReplacementPty();
     // The right mouse button belongs to the application, not to the remote
     // side: it opens the page's own menu, that menu stays put while the pointer
     // moves, Escape closes it, and nothing about the press ever reaches the
@@ -649,6 +757,7 @@ private slots:
 private:
     QString evalJs(const QString& script, int timeoutMs = kProbeTimeoutMs);
     bool waitForJs(const QString& script, const QString& needle, int timeoutMs);
+    bool waitForRendererInputTransport();
     // Paste `line` into the terminal from the page, repeating until `needle`
     // shows up on xterm's screen. The retype matters: the first keystrokes can
     // land before the shell inside a freshly created tmux session has readline.
@@ -762,6 +871,23 @@ bool TstTerminalPage::waitForJs(const QString& script, const QString& needle, in
     return false;
 }
 
+bool TstTerminalPage::waitForRendererInputTransport()
+{
+    if (!m_controller || !m_controller->parent())
+        return false;
+    const auto* bridge = m_controller->parent()->findChild<ch::TerminalBridge*>(
+        QString(), Qt::FindDirectChildrenOnly);
+    if (!bridge)
+        return false;
+    const quint64 expected = bridge->inputGeneration();
+    const QString probe = QStringLiteral(
+        "(function () { var state = window.codeharborTerminalDiagnostics"
+        " && window.codeharborTerminalDiagnostics();"
+        " return state && state.inputGeneration === %1 ? 'CURRENT' : JSON.stringify(state); })()")
+                              .arg(expected);
+    return waitForJs(probe, QStringLiteral("CURRENT"), kProbeTimeoutMs);
+}
+
 // (1) The size handshake. xterm measures its own cells, so the renderer is the
 // only thing that knows the pane's real cols x rows; if that never crosses the
 // bridge the remote PTY is stuck at whatever the channel defaulted to.
@@ -774,6 +900,96 @@ void TstTerminalPage::rendererReportsItsInitialSizeToTheController()
     // A pane this size fits well more than the 1x1 a broken fit() would report.
     QVERIFY(m_controller->columns() >= 20);
     QVERIFY(m_controller->rows() >= 5);
+}
+
+void TstTerminalPage::disposingARecoveredRendererCancelsItsDelayedPtyResize()
+{
+    const QString script = QString::fromLatin1(kJsIsolatedTerminalCase)
+        + QStringLiteral("(") + QString::fromUtf8(R"JS(
+function (fixture) {
+    var sizes = [];
+    fixture.mount({
+        inputGeneration: 1,
+        sendInput: function (text, generation, done) { done(true); },
+        sendBinaryInput: function (text, generation, done) { done(true); },
+        resize: function (cols, rows) { sizes.push([cols, rows]); },
+        notifyViewVisible: function () {},
+        notifyOutputConsumed: function () {}
+    });
+    var recoveryScheduled = sizes.length >= 2
+        && sizes[sizes.length - 1][0] !== sizes[0][0];
+    fixture.afterMount(function () {
+        fixture.dispose();
+        var countAtDisposal = sizes.length;
+        setTimeout(function () {
+            fixture.finish(recoveryScheduled && sizes.length === countAtDisposal
+                ? "NO_LATE_RESIZE" : "LATE_OR_MISSING_RECOVERY:" + JSON.stringify(sizes));
+        }, 200);
+    });
+}
+)JS") + QStringLiteral(", '__chDisposedRecovery')");
+    QCOMPARE(evalJs(script), QStringLiteral("STARTED"));
+    const QString probe = QStringLiteral("JSON.stringify(window.__chDisposedRecovery)");
+    QVERIFY2(waitForJs(probe, QStringLiteral("\"done\":true"), kProbeTimeoutMs),
+             qPrintable(evalJs(probe)));
+    const QJsonObject result = QJsonDocument::fromJson(evalJs(probe).toUtf8()).object();
+    QVERIFY2(result.value(QStringLiteral("errors")).toArray().isEmpty(),
+             qPrintable(QString::fromUtf8(
+                 QJsonDocument(result.value(QStringLiteral("errors")).toArray())
+                     .toJson(QJsonDocument::Compact))));
+    QCOMPARE(result.value(QStringLiteral("status")).toString(), QStringLiteral("NO_LATE_RESIZE"));
+}
+
+void TstTerminalPage::aClipboardReadCannotPasteIntoAReplacementPty()
+{
+    const QString script = QString::fromLatin1(kJsIsolatedTerminalCase)
+        + QStringLiteral("(") + QString::fromUtf8(R"JS(
+function (fixture) {
+    fixture.doc.execCommand = function () { return false; };
+    var finishClipboard;
+    Object.defineProperty(fixture.view.navigator, "clipboard", {
+        configurable: true,
+        value: {
+            readText: function () {
+                return new Promise(function (resolve) { finishClipboard = resolve; });
+            }
+        }
+    });
+    var sent = [];
+    var host = fixture.mount({
+        inputGeneration: 1,
+        sendInput: function (text, generation, done) { sent.push(text); done(true); },
+        sendBinaryInput: function (text, generation, done) { sent.push(text); done(true); },
+        resize: function () {},
+        notifyViewVisible: function () {},
+        notifyOutputConsumed: function () {}
+    });
+    fixture.afterMount(function () {
+        fixture.root.querySelector(".ch-terminal-surface").dispatchEvent(new MouseEvent("contextmenu", {
+            button: 2, bubbles: true, cancelable: true
+        }));
+        var paste = fixture.root.querySelector('[data-action="paste"]');
+        if (!paste) { fixture.finish("NO_MENU"); return; }
+        paste.click();
+        if (!finishClipboard) { fixture.finish("NO_CLIPBOARD_READ"); return; }
+        host.setInputGeneration(2);
+        finishClipboard("text requested for the preceding PTY");
+        setTimeout(function () {
+            fixture.finish(sent.length === 0 ? "NO_STALE_PASTE" : "PASTED:" + sent);
+        }, 50);
+    });
+}
+)JS") + QStringLiteral(", '__chStaleClipboard')");
+    QCOMPARE(evalJs(script), QStringLiteral("STARTED"));
+    const QString probe = QStringLiteral("JSON.stringify(window.__chStaleClipboard)");
+    QVERIFY2(waitForJs(probe, QStringLiteral("\"done\":true"), kProbeTimeoutMs),
+             qPrintable(evalJs(probe)));
+    const QJsonObject result = QJsonDocument::fromJson(evalJs(probe).toUtf8()).object();
+    QVERIFY2(result.value(QStringLiteral("errors")).toArray().isEmpty(),
+             qPrintable(QString::fromUtf8(
+                 QJsonDocument(result.value(QStringLiteral("errors")).toArray())
+                     .toJson(QJsonDocument::Compact))));
+    QCOMPARE(result.value(QStringLiteral("status")).toString(), QStringLiteral("NO_STALE_PASTE"));
 }
 
 // (2) C++ -> JS across the real channel: the lifecycle string lands in the
@@ -811,6 +1027,7 @@ void TstTerminalPage::keystrokesReachTheControllerTransport()
     QBuffer transport;
     QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
+    QVERIFY(waitForRendererInputTransport());
 
     QCOMPARE(evalJs(QString::fromLatin1(kJsPressEnter)), QStringLiteral("SENT"));
     QTRY_VERIFY_WITH_TIMEOUT(transport.data().contains('\r'), kProbeTimeoutMs);
@@ -1027,6 +1244,7 @@ void TstTerminalPage::rightClickSendsNothingToTheRemoteSide()
     QBuffer transport;
     QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
+    QVERIFY(waitForRendererInputTransport());
 
     m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
     QTest::qWait(500);
@@ -1117,6 +1335,7 @@ void TstTerminalPage::pasteFromTheMenuReachesTheRemoteSide()
     QBuffer transport;
     QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
+    QVERIFY(waitForRendererInputTransport());
 
     const QString state = openTerminalMenu();
     QVERIFY2(state.startsWith(QStringLiteral("menu=1")),
@@ -1243,6 +1462,7 @@ void TstTerminalPage::copyShortcutReachesTheSystemClipboard()
     QBuffer transport;
     QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
+    QVERIFY(waitForRendererInputTransport());
     selectEverything();
     clipboard->setText(sentinel);
     QTest::keyClick(window, Qt::Key_C, kPlainCtrlC);
@@ -1392,6 +1612,7 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
     QBuffer mouseTransport;
     QVERIFY(mouseTransport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&mouseTransport);
+    QVERIFY(waitForRendererInputTransport());
 
     // The modifier is not the same everywhere, and that is xterm.js's rule, not
     // this application's: its force-selection decision reads Alt (the Option
@@ -1508,6 +1729,7 @@ void TstTerminalPage::realMouseInputTravelsThroughTheQmlPane()
     QBuffer transport;
     QVERIFY(transport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&transport);
+    QVERIFY(waitForRendererInputTransport());
 
     QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, pasteItem);
     QElapsedTimer pasteClock;
@@ -1563,6 +1785,14 @@ void TstTerminalPage::x10MouseReportsReachTheRemoteSideAsBytes()
     // dropped report is proven either way.
     const int windowWidth = window->width();
     const int windowHeight = window->height();
+    bool restored = false;
+    const auto restoreCase = qScopeGuard([&]() {
+        if (!restored) {
+            m_controller->setTransport(nullptr);
+            m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000l"));
+            window->resize(windowWidth, windowHeight);
+        }
+    });
     window->resize(1200, windowHeight);
     QElapsedTimer fitClock;
     fitClock.start();
@@ -1622,6 +1852,29 @@ void TstTerminalPage::x10MouseReportsReachTheRemoteSideAsBytes()
     QBuffer mouseTransport;
     QVERIFY(mouseTransport.open(QIODevice::WriteOnly));
     m_controller->setTransport(&mouseTransport);
+    QVERIFY(waitForRendererInputTransport());
+    // Native focus and textarea focus are separate from input ownership. Do
+    // not use another click to establish either, and do not assume the mode
+    // barrier above acknowledged this newer transport generation.
+    window->requestActivate();
+    QVariant focused;
+    QVERIFY(QMetaObject::invokeMethod(m_window.get(), "focusPane",
+                                      Q_RETURN_ARG(QVariant, focused)));
+    QVERIFY(focused.toBool());
+    QCOMPARE(evalJs(QStringLiteral(
+                 "(function () { if (!window.codeharborFocusTerminal) return 'NO_FOCUS';"
+                 " window.codeharborFocusTerminal(); return 'REQUESTED'; })()")),
+             QStringLiteral("REQUESTED"));
+    QVERIFY2(waitForJs(QStringLiteral(
+                          "(function () { var state = window.codeharborTerminalDiagnostics();"
+                          " return state.inputFocused ? 'FOCUSED' : JSON.stringify(state); })()"),
+                       QStringLiteral("FOCUSED"), kProbeTimeoutMs),
+             "the helper textarea did not acquire focus before the X10 gesture");
+    QCOMPARE(evalJs(QString::fromLatin1(kJsInstallInputSpy)), QStringLiteral("SPY"));
+    QSignalSpy inputErrors(&m_factory, &TerminalFactory::error);
+    const QString diagnosticProbe = QStringLiteral(
+        "JSON.stringify({events: window.__chInputDetails,"
+        " state: window.codeharborTerminalDiagnostics()})");
 
     // xterm.js's own force-selection decision reads Alt on macOS and Shift
     // everywhere else, and this page inverts the sense of that one flag, so the
@@ -1639,12 +1892,33 @@ void TstTerminalPage::x10MouseReportsReachTheRemoteSideAsBytes()
     const QPoint dragStart = gridOrigin + QPoint(grid.left() + 6, grid.top() + grid.height() / 2);
     const QPoint dragEnd =
         gridOrigin + QPoint(grid.left() + grid.width() - 6, grid.top() + grid.height() / 2);
+    bool pressed = true;
+    const auto releaseHeldButton = qScopeGuard([&]() {
+        if (pressed)
+            QTest::mouseRelease(window, Qt::LeftButton, kRemoteMouseModifier, dragEnd);
+    });
     QTest::mousePress(window, Qt::LeftButton, kRemoteMouseModifier, dragStart);
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsReadInputSpy), QStringLiteral("mousedown:0"),
+                       kProbeTimeoutMs),
+             qPrintable(QStringLiteral("Qt press did not reach the DOM: %1")
+                            .arg(evalJs(diagnosticProbe))));
+    QElapsedTimer pressClock;
+    pressClock.start();
+    while (pressClock.elapsed() < kProbeTimeoutMs && mouseTransport.data().size() < 6)
+        QTest::qWait(50);
+    QVERIFY2(mouseTransport.data().size() == 6,
+             qPrintable(QStringLiteral("the press did not produce its six-byte X10 report "
+                                       "before release (bytes=%1, input errors=%2): %3")
+                            .arg(QString::fromLatin1(mouseTransport.data().toHex(' ')))
+                            .arg(inputErrors.count())
+                            .arg(evalJs(diagnosticProbe))));
+    QCOMPARE(mouseTransport.data().left(4), QByteArrayLiteral("\x1b[M\x20"));
     for (int step = 1; step <= 6; ++step) {
         QTest::mouseMove(window, dragStart + (dragEnd - dragStart) * step / 6);
         QTest::qWait(30);
     }
     QTest::mouseRelease(window, Qt::LeftButton, kRemoteMouseModifier, dragEnd);
+    pressed = false;
 
     QElapsedTimer reportClock;
     reportClock.start();
@@ -1658,6 +1932,7 @@ void TstTerminalPage::x10MouseReportsReachTheRemoteSideAsBytes()
     // pane the drag actually crossed.
     const int reportedColumns = m_controller->columns();
     window->resize(windowWidth, windowHeight);
+    restored = true;
     qInfo().noquote() << "X10 reports on the transport:" << reports.toHex(' ') << "from a"
                       << reportedColumns << "column pane";
     QVERIFY2(!reports.isEmpty(),
@@ -1836,6 +2111,7 @@ void TstTerminalPage::livePaneRendersARealRemoteShell()
 
     m_factory.setWorkspace(&db);
     m_factory.setServerId(serverId);
+    m_factory.setWorkspaceReady(true);
 
     QVariant setSession;
     QVERIFY(QMetaObject::invokeMethod(

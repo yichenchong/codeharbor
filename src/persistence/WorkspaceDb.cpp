@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 
+#include <initializer_list>
 #include <utility>
 
 namespace ch {
@@ -41,9 +42,38 @@ bool hasNonEmptyString(const QJsonObject &obj, const QString &key)
     return value.isString() && !value.toString().isEmpty();
 }
 
+// Retain defaults for omitted members, but never turn a present wrong-kind
+// value into a plausible empty string, false flag, or zero position.
+struct ResultField {
+    QLatin1StringView key;
+    QJsonValue::Type type;
+    bool nullable = false;
+};
+
+bool hasValidFields(const QJsonObject& obj, std::initializer_list<ResultField> fields)
+{
+    for (const ResultField& field : fields) {
+        const QJsonValue value = obj.value(field.key);
+        if (value.isUndefined() || (field.nullable && value.isNull()))
+            continue;
+        if (value.type() != field.type)
+            return false;
+        // Position is the only numeric record member and maps to an int.
+        if (field.type == QJsonValue::Double && value.toInt(0) != value.toInt(1))
+            return false;
+    }
+    return true;
+}
+
 std::optional<Group> parseGroup(const QJsonObject& obj)
 {
-    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+    if (!hasNonEmptyString(obj, QStringLiteral("id")) ||
+        !hasValidFields(obj, {
+            {QLatin1String("serverId"), QJsonValue::String},
+            {QLatin1String("name"), QJsonValue::String},
+            {QLatin1String("position"), QJsonValue::Double},
+            {QLatin1String("collapsed"), QJsonValue::Bool},
+        }))
         return std::nullopt;
     Group group;
     group.id = GroupId{obj.value(QStringLiteral("id")).toString()};
@@ -56,7 +86,18 @@ std::optional<Group> parseGroup(const QJsonObject& obj)
 
 std::optional<DevSession> parseSession(const QJsonObject& obj)
 {
-    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+    if (!hasNonEmptyString(obj, QStringLiteral("id")) ||
+        !hasValidFields(obj, {
+            {QLatin1String("serverId"), QJsonValue::String},
+            {QLatin1String("groupId"), QJsonValue::String},
+            {QLatin1String("name"), QJsonValue::String},
+            {QLatin1String("repositoryRoot"), QJsonValue::String},
+            {QLatin1String("defaultWorkingDirectory"), QJsonValue::String, true},
+            {QLatin1String("taskDescription"), QJsonValue::String, true},
+            {QLatin1String("position"), QJsonValue::Double},
+            {QLatin1String("archived"), QJsonValue::Bool},
+            {QLatin1String("pinned"), QJsonValue::Bool},
+        }))
         return std::nullopt;
     DevSession session;
     session.id = DevSessionId{obj.value(QStringLiteral("id")).toString()};
@@ -77,7 +118,15 @@ std::optional<DevSession> parseSession(const QJsonObject& obj)
 
 std::optional<ViewerPane> parseViewerPane(const QJsonObject& obj)
 {
-    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+    if (!hasNonEmptyString(obj, QStringLiteral("id")) ||
+        !hasValidFields(obj, {
+            {QLatin1String("serverId"), QJsonValue::String},
+            {QLatin1String("devSessionId"), QJsonValue::String},
+            {QLatin1String("url"), QJsonValue::String},
+            {QLatin1String("handler"), QJsonValue::String, true},
+            {QLatin1String("title"), QJsonValue::String, true},
+            {QLatin1String("position"), QJsonValue::Double},
+        }))
         return std::nullopt;
     ViewerPane pane;
     pane.id = ViewerPaneId{obj.value(QStringLiteral("id")).toString()};
@@ -93,7 +142,17 @@ std::optional<ViewerPane> parseViewerPane(const QJsonObject& obj)
 
 std::optional<TerminalPane> parseTerminalPane(const QJsonObject& obj)
 {
-    if (!hasNonEmptyString(obj, QStringLiteral("id")))
+    if (!hasNonEmptyString(obj, QStringLiteral("id")) ||
+        !hasValidFields(obj, {
+            {QLatin1String("serverId"), QJsonValue::String},
+            {QLatin1String("devSessionId"), QJsonValue::String},
+            {QLatin1String("name"), QJsonValue::String},
+            {QLatin1String("workingDirectory"), QJsonValue::String, true},
+            {QLatin1String("tmuxTarget"), QJsonValue::String, true},
+            {QLatin1String("startupCommand"), QJsonValue::String, true},
+            {QLatin1String("harness"), QJsonValue::String, true},
+            {QLatin1String("position"), QJsonValue::Double},
+        }))
         return std::nullopt;
     TerminalPane pane;
     pane.id = TerminalId{obj.value(QStringLiteral("id")).toString()};
@@ -183,11 +242,9 @@ bool readOptionalArray(const QJsonObject &obj, const QString &key, QJsonArray &o
     return true;
 }
 
-// Nested list elements are skipped unless they are valid JSON objects with a
-// non-empty identity. QJsonValue::toObject() turns a non-object into an EMPTY
-// object, and an object missing its id would likewise map to a fully-default
-// record that looks real to the rest of the client. A malformed element is
-// dropped instead, so a broken element costs its own entry and nothing more.
+// Nested list elements are skipped unless they are valid record objects.
+// QJsonValue accessors otherwise turn malformed members into defaults that look
+// real to the rest of the client. A malformed element costs only its own entry.
 std::optional<SessionNode> parseSessionNode(const QJsonObject& obj)
 {
     const std::optional<DevSession> session = parseSession(obj);
@@ -542,9 +599,9 @@ auto okHandler(const char* method, WorkspaceDb::OkCallback cb)
 
 // Response handler for every workspace.* method whose result is a single record
 // object: forwards a server error verbatim, rejects a non-object result and an
-// object without the record's required non-empty id, and otherwise hands the
-// decoded record to `cb`. `decode` maps the result object to an optional typed
-// payload so malformed objects cannot become blank records.
+// object without the record's required non-empty id or with a wrong-kind member,
+// and otherwise hands the decoded record to `cb`. `decode` returns an optional
+// typed payload so malformed objects cannot become plausible records.
 template <typename Callback, typename Decode>
 auto recordHandler(const char* method, Callback cb, Decode decode)
 {
@@ -561,11 +618,50 @@ auto recordHandler(const char* method, Callback cb, Decode decode)
         auto decoded = decode(result.toObject());
         if (!decoded) {
             cb(std::nullopt,
-               malformedResult(method, "a JSON object with a non-empty id"));
+               malformedResult(method, "a valid record object with a non-empty id"));
             return;
         }
         cb(std::move(decoded), std::nullopt);
     };
+}
+
+// Both writes return an authoritative row. Only getLayout may legitimately
+// return no row; a write must not turn an unreadable tree into absent success.
+void writeLayout(CodeharbordClient* client, const char* method,
+                 const ServerId& serverId, const DevSessionId& devSessionId,
+                 Region region, const SplitNode& tree, WorkspaceDb::LayoutCallback cb)
+{
+    const std::optional<QJsonObject> treeJson = tree.tryToJson();
+    if (!treeJson) {
+        failAsync(client, std::move(cb),
+                  invalidParams(method, "`tree` is not a valid split tree"));
+        return;
+    }
+    const QJsonObject params{
+        {QStringLiteral("serverId"), serverId.value},
+        {QStringLiteral("devSessionId"), devSessionId.value},
+        {QStringLiteral("region"), regionKey(region)},
+        {QStringLiteral("tree"), *treeJson},
+    };
+    client->call(
+        QString::fromLatin1(method), params,
+        [method, cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
+            if (error) {
+                cb(std::nullopt, std::move(error));
+                return;
+            }
+            if (!result.isObject()) {
+                cb(std::nullopt, malformedResult(method, "a SessionLayout object"));
+                return;
+            }
+            std::optional<SplitNode> stored = parseLayoutRow(result.toObject());
+            if (!stored) {
+                cb(std::nullopt,
+                   malformedResult(method, "a SessionLayout object with a valid tree"));
+                return;
+            }
+            cb(std::move(stored), std::nullopt);
+        });
 }
 
 } // namespace
@@ -846,50 +942,16 @@ void WorkspaceDb::setLayout(const ServerId& serverId,
                             const DevSessionId& devSessionId, Region region,
                             const SplitNode& tree, LayoutCallback cb)
 {
-    // A tree tryToJson() refuses is one no client could ever load back
-    // (SplitTree.h): storing it would lose the user's layout silently, on the
-    // NEXT launch rather than now. Fail the write instead of performing it.
-    const std::optional<QJsonObject> treeJson = tree.tryToJson();
-    if (!treeJson) {
-        failAsync(m_client, std::move(cb),
-                  invalidParams(rpc::kMethodWorkspaceSetLayout,
-                                "`tree` is not a valid split tree"));
-        return;
-    }
+    writeLayout(m_client, rpc::kMethodWorkspaceSetLayout, serverId, devSessionId,
+                region, tree, std::move(cb));
+}
 
-    const QJsonObject params{
-        {QStringLiteral("serverId"), serverId.value},
-        {QStringLiteral("devSessionId"), devSessionId.value},
-        {QStringLiteral("region"), regionKey(region)},
-        {QStringLiteral("tree"), *treeJson},
-    };
-    m_client->call(
-        QString::fromLatin1(rpc::kMethodWorkspaceSetLayout), params,
-        [cb = std::move(cb)](QJsonValue result, std::optional<RpcError> error) {
-            if (error) {
-                cb(std::nullopt, std::move(error));
-                return;
-            }
-            if (!result.isObject()) {
-                cb(std::nullopt, malformedResult(rpc::kMethodWorkspaceSetLayout,
-                                                 "a SessionLayout object"));
-                return;
-            }
-            // Unlike getLayout, setLayout has NO legitimate "there is no layout
-            // here" answer: it echoes the row it has just stored. So a row whose
-            // `tree` is missing or fails SplitNode validation is a malformed
-            // reply, not an absent layout, and handing the caller
-            // (no tree, no error) would tell it the write succeeded while
-            // silently giving it nothing to adopt.
-            std::optional<SplitNode> stored = parseLayoutRow(result.toObject());
-            if (!stored) {
-                cb(std::nullopt,
-                   malformedResult(rpc::kMethodWorkspaceSetLayout,
-                                   "a SessionLayout object with a valid tree"));
-                return;
-            }
-            cb(std::move(stored), std::nullopt);
-        });
+void WorkspaceDb::ensureInitialLayout(const ServerId& serverId,
+                                      const DevSessionId& devSessionId, Region region,
+                                      const SplitNode& tree, LayoutCallback cb)
+{
+    writeLayout(m_client, rpc::kMethodWorkspaceEnsureInitialLayout, serverId,
+                devSessionId, region, tree, std::move(cb));
 }
 
 } // namespace ch

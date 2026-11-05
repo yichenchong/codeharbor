@@ -22,6 +22,8 @@ Item {
     property url paneUrl
     property string repoRoot: ""
     property string paneId: ""
+    property string acceptedServerId: ""
+    property string devSessionId: ""
     signal openRequested(string path)
     signal titleRequested(string title)
 
@@ -31,6 +33,30 @@ Item {
     // file.watch subscription is released when the page goes away (SPEC 8.7)
     // rather than leaked.
     property var controller: null
+
+    function clearRecoveryOffer() {
+        recovery.content = "";
+        recovery.offeredPath = "";
+        recovery.close();
+    }
+
+    function applyRecoveryScope() {
+        if (root.controller)
+            root.controller.setRecoveryScope(root.acceptedServerId, root.devSessionId, root.paneId);
+    }
+
+    function retireRecoveryScope() {
+        if (!root.controller)
+            return;
+        root.clearRecoveryOffer();
+        // Retire old replies immediately; apply only the final bound context,
+        // never a transient new-server/old-session combination.
+        root.controller.setRecoveryScope("", "", "");
+        Qt.callLater(root.applyRecoveryScope);
+    }
+    onAcceptedServerIdChanged: root.retireRecoveryScope()
+    onDevSessionIdChanged: root.retireRecoveryScope()
+    onPaneIdChanged: root.retireRecoveryScope()
 
     property string fileState: "disconnected"
     property string revision: ""
@@ -69,6 +95,7 @@ Item {
     function openPath(path) {
         if (!root.controller || path.length === 0)
             return;
+        root.clearRecoveryOffer();
         root.openedPath = path;
         root.controller.open(path);
     }
@@ -83,9 +110,10 @@ Item {
     Component.onCompleted: {
         if (!root.factory)
             return;
-        // paneId keys this pane's crash-recovery snapshot, so two panes on one
-        // file never share one (SPEC 11.3).
-        root.controller = root.factory.create(root, root.paneId);
+        // Recovery is scoped to the accepted peer, Dev Session, stable pane
+        // and actual opened path. An incomplete context never uses a raw key.
+        root.controller = root.factory.create(root, root.acceptedServerId,
+                                              root.devSessionId, root.paneId);
         if (!root.controller)
             return;
         root.fileState = root.controller.fileState;
@@ -145,6 +173,16 @@ Item {
             // was in flight is not in the file, and clearing the flag would
             // disable the Save button over an edit that was never written.
             root.dirty = editor.text !== root.savedText;
+            // A debounced observation may have arrived after Save queued these
+            // same bytes. Reconcile the confirmed baseline explicitly, and do
+            // not let a pending snapshot mark an already saved buffer dirty.
+            snapshot.stop();
+            if (root.controller) {
+                if (root.dirty)
+                    root.controller.reportContent(editor.text);
+                else
+                    root.controller.reportDirty(false, rev);
+            }
             root.conflict = false;
             root.statusText = root.dirty ? qsTr("Saved. There are newer edits.")
                                          : qsTr("Saved.");
@@ -162,6 +200,10 @@ Item {
             root.statusText = message;
         }
         function onRecoveryAvailable(recoveredContent) {
+            if (!root.controller || !root.controller.recoveryEnabled
+                    || root.openedPath.length === 0)
+                return;
+            recovery.offeredPath = root.openedPath;
             recovery.content = recoveredContent;
             recovery.open();
         }
@@ -266,6 +308,29 @@ Item {
                 color: MobileTheme.text
                 font.pixelSize: MobileTheme.fontSizeSmall
                 text: root.statusText
+            }
+        }
+
+        Rectangle {
+            width: parent.width
+            height: visible ? Math.max(MobileTheme.touchTarget,
+                recoveryUnavailableText.implicitHeight + 2 * MobileTheme.spacing) : 0
+            visible: root.controller !== null && root.openedPath.length > 0
+                     && !root.controller.recoveryEnabled
+            color: MobileTheme.warningSurface()
+            Text {
+                id: recoveryUnavailableText
+                objectName: "editorRecoveryStatus"
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: MobileTheme.spacing
+                anchors.rightMargin: MobileTheme.spacing
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: MobileTheme.text
+                font.pixelSize: MobileTheme.fontSizeSmall
+                text: qsTr("Crash recovery is unavailable until this document is opened in its accepted server and Dev Session with a stable pane and remote recovery directory.")
             }
         }
 
@@ -423,8 +488,19 @@ Item {
         width: root.sheetWidth
         modal: true
         property string content: ""
-        title: qsTr("Restore unsaved changes?")
+        property string offeredPath: ""
+        title: qsTr("Unsaved changes were recovered")
         standardButtons: Dialog.Yes | Dialog.No
+
+        // Preserve the standard roles, but distinguish postponing from deletion.
+        onOpened: {
+            const restore = recovery.standardButton(Dialog.Yes);
+            if (restore)
+                restore.text = qsTr("Restore");
+            const notNow = recovery.standardButton(Dialog.No);
+            if (notNow)
+                notNow.text = qsTr("Not now");
+        }
 
         // Same reason as the guard dialog above: the popup sizes its contentItem.
         // The message sits inside a plain Item rather than being the contentItem
@@ -444,11 +520,19 @@ Item {
                 wrapMode: Text.WordWrap
                 color: MobileTheme.text
                 font.pixelSize: MobileTheme.fontSizeSmall
-                text: qsTr("CodeHarbor kept a snapshot of edits to this file that were never saved.")
+                text: qsTr("Restore puts this copy back in the editor, unsaved. "
+                           + "Not now keeps the saved file on screen. The recovery copy "
+                           + "may be offered again. New edits can replace it; saving can clear it.");
             }
         }
 
         onAccepted: {
+            if (!root.controller || !root.controller.recoveryEnabled
+                    || recovery.offeredPath.length === 0
+                    || recovery.offeredPath !== root.openedPath) {
+                root.clearRecoveryOffer();
+                return;
+            }
             root.applying = true;
             editor.text = recovery.content;
             root.applying = false;
@@ -460,6 +544,8 @@ Item {
             // changes on the server.
             if (root.controller)
                 root.controller.reportContent(editor.text);
+            root.clearRecoveryOffer();
         }
+        onRejected: root.clearRecoveryOffer()
     }
 }

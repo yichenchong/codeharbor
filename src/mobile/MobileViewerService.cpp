@@ -11,9 +11,11 @@
 #include <QJsonValue>
 #include <QList>
 #include <QPointer>
+#include <QSaveFile>
 #include <QStandardPaths>
 
 #include <algorithm>
+#include <utility>
 
 namespace ch {
 
@@ -106,8 +108,8 @@ QString noClientMessage()
 // The map cannot grow: an entry exists only between a request and its reply or
 // its release, and CodeharbordClient guarantees every request's callback runs
 // exactly once, destruction included.
-bool claimRequest(QHash<QString, qint64> *requests, const QString &path,
-                  qint64 epoch)
+template<typename Key>
+bool claimRequest(QHash<Key, qint64> *requests, const Key &path, qint64 epoch)
 {
     const auto it = requests->constFind(path);
     if (it == requests->constEnd() || *it != epoch)
@@ -124,10 +126,16 @@ MobileViewerService::MobileViewerService(CodeharbordClient *client,
     , m_client(client)
     , m_imageCache(std::make_shared<MobileImageCache>())
 {
-    // A mobile app is normally KILLED rather than shut down, so the destructor
-    // below is not a guarantee. Clearing the spool on the way in is what makes
-    // sure yesterday's document is not still sitting in the cache directory.
-    purgePdfSpool();
+    if (m_client) {
+        const auto retirePeer = [this](quint64 generation) {
+            if (m_client && generation == m_client->transportGeneration())
+                resetPeerState();
+        };
+        connect(m_client, &CodeharbordClient::transportChanging, this, retirePeer);
+        connect(m_client, &CodeharbordClient::transportClosed, this, retirePeer);
+        connect(m_client, &QObject::destroyed, this,
+                [this] { resetPeerState(); });
+    }
 }
 
 MobileViewerService::~MobileViewerService()
@@ -135,27 +143,41 @@ MobileViewerService::~MobileViewerService()
     purgePdfSpool();
 }
 
-QString MobileViewerService::pdfSpoolDir() const
+QString MobileViewerService::pdfSpoolDir()
 {
+    if (m_pdfDirectory)
+        return m_pdfDirectory->path();
     const QString base =
         QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
-    if (base.isEmpty())
+    if (base.isEmpty() || !QDir().mkpath(base))
         return {};
-    const QString dir = base + QLatin1String("/pdf-spool");
-    if (!QDir().mkpath(dir))
+    auto directory = std::make_unique<QTemporaryDir>(
+        base + QLatin1String("/pdf-spool-XXXXXX"));
+    const auto permissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                             | QFileDevice::ExeOwner;
+    if (!directory->isValid() || !QFile::setPermissions(directory->path(), permissions))
         return {};
-    return dir;
+    const QString path = directory->path();
+    m_pdfDirectory = std::move(directory);
+    return path;
 }
 
 void MobileViewerService::purgePdfSpool()
 {
     m_pdfSpool.clear();
-    const QString dir = pdfSpoolDir();
-    if (dir.isEmpty())
-        return;
-    // removeRecursively() on the directory itself, not per remembered file: the
-    // point of the startup purge is the files this process does NOT remember.
-    QDir(dir).removeRecursively();
+    m_pdfDirectory.reset();
+}
+
+void MobileViewerService::resetPeerState()
+{
+    m_readRequests.clear();
+    m_directoryRequests.clear();
+    m_statRequests.clear();
+    m_resolveRequests.clear();
+    m_imageRequests.clear();
+    m_pdfRequests.clear();
+    m_imageCache->clear();
+    purgePdfSpool();
 }
 
 MarkdownModel *MobileViewerService::createMarkdownModel(QObject *owner)
@@ -252,11 +274,15 @@ void MobileViewerService::readFile(const QString &path)
         {QStringLiteral("offset"), 0},
         {QStringLiteral("length"), kMaxInlineReadBytes},
     };
+    const qint64 epoch = ++m_requestEpoch;
+    m_readRequests.insert(path, epoch);
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodReadFile), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, epoch](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
+                return;
+            if (!claimRequest(&guard->m_readRequests, path, epoch))
                 return;
             if (error) {
                 emit guard->fileError(path, error->message);
@@ -313,11 +339,13 @@ void MobileViewerService::writeFile(const QString &path, const QString &content,
         {QStringLiteral("expectedRevision"), expectedRevision},
     };
 
+    const quint64 generation = m_client->transportGeneration();
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWriteFile), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
-            if (!guard)
+        [guard, path, generation](QJsonValue result, std::optional<RpcError> error) {
+            if (!guard || !guard->m_client
+                || generation != guard->m_client->transportGeneration())
                 return;
             if (error) {
                 // Includes ch::rpc::kRevisionMismatch. Deliberately NOT special
@@ -348,11 +376,15 @@ void MobileViewerService::listDirectory(const QString &path)
     }
 
     const QJsonObject params{{QStringLiteral("path"), path}};
+    const qint64 epoch = ++m_requestEpoch;
+    m_directoryRequests.insert(path, epoch);
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodListDirectory), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, epoch](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
+                return;
+            if (!claimRequest(&guard->m_directoryRequests, path, epoch))
                 return;
             if (error) {
                 emit guard->directoryError(path, error->message);
@@ -402,11 +434,15 @@ void MobileViewerService::stat(const QString &path)
     }
 
     const QJsonObject params{{QStringLiteral("path"), path}};
+    const qint64 epoch = ++m_requestEpoch;
+    m_statRequests.insert(path, epoch);
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodStat), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, epoch](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
+                return;
+            if (!claimRequest(&guard->m_statRequests, path, epoch))
                 return;
             if (error) {
                 emit guard->fileError(path, error->message);
@@ -432,11 +468,16 @@ void MobileViewerService::resolvePath(const QString &path, const QString &base)
     QJsonObject params{{QStringLiteral("path"), path}};
     if (!base.isEmpty())
         params.insert(QStringLiteral("base"), base);
+    const auto target = qMakePair(path, base);
+    const qint64 epoch = ++m_requestEpoch;
+    m_resolveRequests.insert(target, epoch);
     QPointer<MobileViewerService> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodResolvePath), params,
-        [guard, path, base](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, base, target, epoch](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
+                return;
+            if (!claimRequest(&guard->m_resolveRequests, target, epoch))
                 return;
             if (error) {
                 emit guard->pathResolveError(path, base, error->message);
@@ -618,29 +659,24 @@ void MobileViewerService::requestPdf(const QString &path)
                     .toHex());
             const QString target = dir + QLatin1Char('/') + digest
                                    + QLatin1String(".pdf");
-            QFile file(target);
-            // flush() EXPLICITLY, before close(). QFile buffers, and
-            // QFileDevice::close() flushes without reporting whether the flush
-            // worked — so on a phone whose cache partition has just filled up
-            // (the ordinary way an app-private cache fails) a half-written PDF
-            // was announced as ready, and PdfDocument then either refused to
-            // open it or showed a document missing its last pages as though
-            // that were the document.
+            QSaveFile file(target);
+            file.setDirectWriteFallback(false);
+            // QSaveFile publishes only a complete file. Apply/check owner-only
+            // permissions on the private temporary file before writing bytes;
+            // failed open/chmod/write/commit never announces a partial PDF.
             const bool wrote =
-                file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                file.open(QIODevice::WriteOnly)
+                && file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner)
                 && file.write(reply.bytes) == reply.bytes.size()
-                && file.flush();
-            file.close();
+                && file.commit();
             if (!wrote) {
-                file.remove();
+                if (file.isOpen())
+                    file.cancelWriting();
                 emit guard->pdfError(
                     path, QStringLiteral("the document could not be written to "
                                          "the app's private storage"));
                 return;
             }
-            // Owner-only, on the platforms that honour it: nothing outside this
-            // app has any business reading a file from someone's repository.
-            file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
             guard->m_pdfSpool.insert(path, target);
             emit guard->pdfReady(path, QUrl::fromLocalFile(target));
         });

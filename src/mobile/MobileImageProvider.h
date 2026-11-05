@@ -127,6 +127,13 @@ public:
 
     explicit MobileImageProvider(std::shared_ptr<MobileImageCache> cache);
 
+    // Compressed byte limits do not bound decoded memory. Raster sources are
+    // limited to 64 Mi pixels; returned images to 16 Mi pixels and 8192 pixels
+    // per axis. SVG's virtual canvas is scaled into the same output budget.
+    static constexpr qint64 kMaxSourcePixels = 64 * qint64(1024 * 1024);
+    static constexpr qint64 kMaxDecodedPixels = 16 * qint64(1024 * 1024);
+    static constexpr int kMaxDecodedDimension = 8192;
+
     // Decode the cached bytes for the requested remote path. Returns a null
     // QImage — never a fetch, never a block — when the path is not cached or
     // its bytes are not an image format this build can decode.

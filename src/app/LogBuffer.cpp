@@ -1,6 +1,7 @@
 #include "LogBuffer.h"
 
 #include <QMutexLocker>
+#include <QPointer>
 #include <QVariantMap>
 #include <QWaitCondition>
 
@@ -212,10 +213,16 @@ void LogBuffer::appendRemote(const QString& origin, const QString& category,
     // complete startup report. Splitting here keeps each row independently
     // filterable and prevents one long report from hiding the useful tail.
     const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    const QPointer<LogBuffer> guard(this);
     for (const QString& line : lines) {
         const QString trimmed = line.trimmed();
-        if (!trimmed.isEmpty())
+        if (!trimmed.isEmpty()) {
             append(severity, category, source, trimmed, origin);
+            // Explicit appends notify synchronously. A receiver may destroy
+            // the buffer, so do not deliver the rest of this report to it.
+            if (!guard)
+                return;
+        }
     }
 }
 

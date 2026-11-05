@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { promises as fs, type PathLike } from "node:fs";
+import { promises as fs, type Dir, type PathLike } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -2420,6 +2420,124 @@ test("writeFile never returns a different symlink target's revision after saving
             isRevisionMismatch,
         );
         assert.equal(await fs.readFile(unrelated, "utf-8"), "unrelated bytes");
+    } finally {
+        t.mock.restoreAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile cannot select an unrelated target between revision checks", async (t) => {
+    const dir = await tmpDir();
+    const original = path.join(dir, "original.txt");
+    const unrelated = path.join(dir, "unrelated.txt");
+    const link = path.join(dir, "current.txt");
+    const statFile = fs.stat;
+    const realpath = fs.realpath;
+    try {
+        await fs.writeFile(original, "original bytes");
+        await fs.writeFile(unrelated, "unrelated bytes");
+        await fs.symlink(original, link);
+        const loaded = await readFile({ path: link });
+        let switched = false;
+        t.mock.method(fs, "stat", async (file: PathLike) => {
+            const result = await statFile(file);
+            if (!switched && (file === link || file === original)) {
+                switched = true;
+                await fs.unlink(link);
+                await fs.symlink(unrelated, link);
+            }
+            return result;
+        });
+        t.mock.method(fs, "realpath", async (file: PathLike) => {
+            const resolved = await realpath(file);
+            // Reproduce the old race: a second resolution chose unrelated,
+            // then the link pointed back before the final revision check.
+            if (file === link && switched && resolved === unrelated) {
+                await fs.unlink(link);
+                await fs.symlink(original, link);
+            }
+            return resolved;
+        });
+        await assert.rejects(
+            writeFile({ path: link, content: "edited original", expectedRevision: loaded.revision }),
+            isRevisionMismatch,
+        );
+        assert.equal(await fs.readFile(original, "utf-8"), "original bytes");
+        assert.equal(await fs.readFile(unrelated, "utf-8"), "unrelated bytes");
+        assert.deepEqual((await fs.readdir(dir)).sort(), ["current.txt", "original.txt", "unrelated.txt"]);
+    } finally {
+        t.mock.restoreAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("listDirectory stops enumeration and closes the handle at its byte limit", async (t) => {
+    const dir = await tmpDir();
+    try {
+        await fs.writeFile(path.join(dir, "entry"), "");
+        const entry = (await fs.readdir(dir, { withFileTypes: true }))[0]!;
+        entry.name = "\u0001".repeat(255);
+        const perEntry = 29 + Buffer.byteLength(JSON.stringify(entry.name));
+        const fits = Math.floor(MAX_DIRECTORY_LISTING_BYTES / perEntry);
+        let yielded = 0;
+        let closed = false;
+        const directory = {
+            async *[Symbol.asyncIterator]() {
+                try {
+                    // Do not consume the tail once the encoded reply is full.
+                    while (yielded < fits + 2) {
+                        yielded++;
+                        yield entry;
+                    }
+                } finally {
+                    closed = true;
+                }
+            },
+        } as unknown as Dir;
+        t.mock.method(fs, "opendir", async () => directory);
+        await assert.rejects(
+            listDirectory({ path: dir }),
+            (error: unknown) =>
+                error instanceof Error && "code" in error && error.code === RPC_RESOURCE_LIMIT,
+        );
+        assert.equal(yielded, fits + 1);
+        assert.equal(closed, true);
+    } finally {
+        t.mock.restoreAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("create-only writeFile preserves a file created after its final revision check", async (t) => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "new.txt");
+    const statFile = fs.stat;
+    let absentChecks = 0;
+    try {
+        t.mock.method(fs, "stat", async (target: PathLike) => {
+            try {
+                return await statFile(target);
+            } catch (error) {
+                if (
+                    target === file &&
+                    error !== null &&
+                    typeof error === "object" &&
+                    "code" in error &&
+                    error.code === "ENOENT" &&
+                    ++absentChecks === 2
+                ) {
+                    // Another process wins creation in the stat-to-commit gap.
+                    await fs.writeFile(file, "other writer", { flag: "wx" });
+                }
+                throw error;
+            }
+        });
+        await assert.rejects(
+            writeFile({ path: file, content: "our creation", expectedRevision: "" }),
+            isRevisionMismatch,
+        );
+        assert.equal(await fs.readFile(file, "utf-8"), "other writer");
+        assert.deepEqual(await fs.readdir(dir), ["new.txt"]);
     } finally {
         t.mock.restoreAll();
         await fs.rm(dir, { recursive: true, force: true });

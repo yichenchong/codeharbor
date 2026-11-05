@@ -47,6 +47,27 @@ bool isAsciiPunct(QChar c)
            || (u >= u'[' && u <= u'`') || (u >= u'{' && u <= u'~');
 }
 
+struct EmphasisFlanking {
+    bool canOpen = false;
+    bool canClose = false;
+};
+
+EmphasisFlanking emphasisFlanking(QStringView text, qsizetype at, int length,
+                                  bool underscore)
+{
+    const qsizetype after = at + length;
+    const bool spaceBefore = at == 0 || text.at(at - 1).isSpace();
+    const bool spaceAfter = after == text.size() || text.at(after).isSpace();
+    const bool punctBefore = at > 0
+        && (isAsciiPunct(text.at(at - 1)) || text.at(at - 1).isPunct());
+    const bool punctAfter = after < text.size()
+        && (isAsciiPunct(text.at(after)) || text.at(after).isPunct());
+    const bool left = !spaceAfter && (!punctAfter || spaceBefore || punctBefore);
+    const bool right = !spaceBefore && (!punctBefore || spaceAfter || punctAfter);
+    return {left && (!underscore || !right || punctBefore),
+            right && (!underscore || !left || punctAfter)};
+}
+
 // Columns of leading whitespace, tabs counted as 4 (CommonMark's tab stop), and
 // the index of the first non-whitespace character.
 int indentWidth(const QString &line, qsizetype *firstNonSpace)
@@ -99,11 +120,11 @@ int runLength(QStringView s, qsizetype from, QChar c, qsizetype limit = -1)
 //     character. 4x the block's own length is far more than well-formed prose
 //     needs (each finder scan there is local, and every character is inside at
 //     most a couple of them), and it makes the worst case linear.
-//   * `depth` bounds recursion. scanInline() recurses per nested span, so
-//     "*****...x...*****" with 50 000 matched pairs is 50 000 stack frames — a
-//     stack overflow, not an exception, and on a mobile UI thread with a
-//     smaller stack than a desktop's. Real documents nest emphasis inside a
-//     link inside a list item: single digits.
+//   * `depth` bounds inline-scanner recursion. Emphasis-close matching uses
+//     the same maximum for its own nested search. Without these limits,
+//     50 000 nested spans can exhaust a mobile UI thread's small stack.
+//     Real documents nest emphasis inside a link inside a list item: single
+//     digits.
 struct InlineLimits {
     qint64 steps = 0;
     int depth = 0;
@@ -166,8 +187,10 @@ qsizetype findCodeClose(QStringView s, qsizetype from, int n,
 // `underscore` asks for CommonMark's extra right-flanking rule, which applies
 // to '_' and not to '*': see the opener's own note in scanInline().
 qsizetype findEmphasisClose(QStringView s, qsizetype from, QChar c, int n,
-                            bool underscore, InlineLimits *limits)
+                            bool underscore, InlineLimits *limits,
+                            int remainingDepth = kMaxInlineDepth)
 {
+    const EmphasisFlanking opener = emphasisFlanking(s, from - n, n, underscore);
     qsizetype i = from;
     while (i < s.size()) {
         if (!spend(limits))
@@ -185,11 +208,24 @@ qsizetype findEmphasisClose(QStringView s, qsizetype from, QChar c, int n,
         }
         if (ch == c) {
             const int len = chargedRunLength(s, i, c, limits);
-            const bool wordAfter =
-                i + len < s.size() && s.at(i + len).isLetterOrNumber();
-            if (len >= n && i > 0 && !s.at(i - 1).isSpace()
-                && !(underscore && wordAfter))
+            const EmphasisFlanking candidate = emphasisFlanking(s, i, len, underscore);
+            // A run that can both close and open finishes the existing span
+            // first, leaving its remainder for the scanner: "*a***b***c*"
+            // means italic a/c and strong b, not italic around all three.
+            const bool ruleOfThree = (opener.canClose || candidate.canOpen)
+                && (n + len) % 3 == 0 && (n % 3 != 0 || len % 3 != 0);
+            if (len >= n && candidate.canClose && !ruleOfThree)
                 return i;
+            // Otherwise a differently sized opener may be nested. Its closer
+            // can share a run with ours, as in "**a *b***".
+            if (len != n && len <= 3 && candidate.canOpen && remainingDepth > 0) {
+                const qsizetype nested = findEmphasisClose(
+                    s, i + len, c, len, underscore, limits, remainingDepth - 1);
+                if (nested >= 0) {
+                    i = nested + len;
+                    continue;
+                }
+            }
             i += len;
             continue;
         }
@@ -208,6 +244,14 @@ qsizetype findLinkTextEnd(QStringView s, qsizetype from, InlineLimits *limits)
         const QChar ch = s.at(i);
         if (ch == QLatin1Char('\\')) {
             ++i;
+            continue;
+        }
+        if (ch == QLatin1Char('`')) {
+            const int length = chargedRunLength(s, i, ch, limits);
+            const qsizetype close = findCodeClose(s, i + length, length, limits);
+            // Brackets inside a matched code span are literal label text, not
+            // link/image delimiters. Unmatched backticks remain ordinary text.
+            i = close < 0 ? i + length - 1 : close + length - 1;
             continue;
         }
         if (ch == QLatin1Char('['))
@@ -348,18 +392,16 @@ void scanInline(QStringView src, QString *out, QList<RawSpan> *spans,
             const int n = qMin(runLength(src, i, c, 4), 3);
             const int style = n >= 3 ? (kStyleStrong | kStyleEmphasis)
                                      : (n == 2 ? kStyleStrong : kStyleEmphasis);
-            const bool leftFlanking =
-                i + n < src.size() && !src.at(i + n).isSpace();
+            const bool underscore = c == QLatin1Char('_');
+            const EmphasisFlanking flanking = emphasisFlanking(src, i, n, underscore);
             // CommonMark forbids INTRAWORD '_' emphasis and allows intraword
             // '*', and that asymmetry is not a nicety here: a repository's prose
             // is full of identifiers like `snake_case_name` and `__init__`, and
             // treating those underscores as delimiters DELETED them from the
             // text — "snake_case_name" reached the screen as "snakecasename"
-            // with the middle word italicised. The mirror-image rule for the
-            // closing run lives in findEmphasisClose().
-            const bool underscore = c == QLatin1Char('_');
-            const bool wordBefore = i > 0 && src.at(i - 1).isLetterOrNumber();
-            if (leftFlanking && mayRecurse && !(underscore && wordBefore)) {
+            // with the middle word italicised. The same flanking helper applies
+            // to the closing runs in findEmphasisClose().
+            if (flanking.canOpen && mayRecurse) {
                 const qsizetype close =
                     findEmphasisClose(src, i + n, c, n, underscore, limits);
                 if (close >= 0) {
@@ -1032,6 +1074,8 @@ QVector<MarkdownModel::Block> MarkdownModel::parse(const QString &source)
                 int depth = 0;
                 QString rest;
                 if (quoteLine(lines.at(j), &depth, &rest)) {
+                    if (depth != quoteDepth)
+                        break;
                     body.append(rest);
                     ++j;
                     continue;

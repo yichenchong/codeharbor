@@ -151,6 +151,8 @@ private:
 
     QString m_remoteDir;
     QString m_filePath;
+    QString m_serverId;
+    QString m_sessionId;
     QStringList m_bootstrapErrors;
 
     // Latest contentLoaded payload and how many arrived, recorded straight off
@@ -186,6 +188,23 @@ void TstLiveEditorReconnect::initTestCase()
                             .arg(m_bootstrapErrors.join(QStringLiteral(" | ")))));
     QCOMPARE(m_bootstrap->state(), State::Wired);
 
+    QObject identityLifetime;
+    bool identityAnswered = false;
+    std::optional<RpcError> identityError;
+    m_client.call(QStringLiteral("server.info"), QJsonValue(),
+                  [this, guard = QPointer<QObject>(&identityLifetime),
+                   &identityAnswered, &identityError](
+                      QJsonValue result, std::optional<RpcError> error) {
+                      if (!guard)
+                          return;
+                      identityError = error;
+                      m_serverId = result.toObject().value(QStringLiteral("serverId")).toString();
+                      identityAnswered = true;
+                  });
+    QTRY_VERIFY_WITH_TIMEOUT(identityAnswered, kRpcTimeoutMs);
+    QVERIFY(!identityError.has_value());
+    QVERIFY(!m_serverId.isEmpty());
+
     // ---- the out-of-band connection ---------------------------------------
     QVERIFY2(startSideShell(),
              qPrintable(QStringLiteral("could not start the out-of-band shell: %1")
@@ -199,6 +218,7 @@ void TstLiveEditorReconnect::initTestCase()
     // first write.
     const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
     m_remoteDir = QStringLiteral("/tmp/ch-live-editor-reconnect-%1").arg(token);
+    m_sessionId = QStringLiteral("live-reconnect-session-%1").arg(token);
     m_filePath = m_remoteDir + QStringLiteral("/note.txt");
 
     QByteArray out;
@@ -378,7 +398,8 @@ void TstLiveEditorReconnect::watchResubscribesAfterReconnect()
     writeRemote(v1);
 
     // ---- open the file through the production controller ------------------
-    m_controller = std::make_unique<EditorController>(&m_client, QStringLiteral("viewer-1"));
+    m_controller = std::make_unique<EditorController>(
+        &m_client, m_serverId, m_sessionId, QStringLiteral("viewer-1"));
     // The recovery base a connected AppController would push in (SPEC 11.3); set
     // directly here so reportContent's debounced snapshot write is exercised
     // over the real channel. Its exact path is not asserted by this gate.

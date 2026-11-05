@@ -75,6 +75,7 @@ target_link_libraries(tst_paneidentity PRIVATE
     Qt6::WebEngineQuick
     Qt6::WebChannel
     codeharbor_qmlplugin
+    ch_app
     ch_editor
     ch_terminal
     ch_viewers

@@ -17,6 +17,13 @@ TerminalBridge::TerminalBridge(TerminalController* controller, QObject* parent)
             &TerminalBridge::onFlushReady);
     connect(m_controller, &TerminalController::stateChanged, this,
             [this](TerminalState state) { emit connectionStateChanged(toString(state)); });
+    connect(m_controller, &TerminalController::transportChanged, this, [this]() {
+        ++m_inputGeneration;
+        const QPointer<TerminalBridge> self(this);
+        emit inputGenerationChanged();
+        if (self)
+            emit inputTransportChanged(m_inputGeneration);
+    });
 
     // No renderer until the page mounts and calls ready(): everything the pane
     // produces until then belongs in the controller's rolling buffer, not in a
@@ -61,24 +68,51 @@ int TerminalBridge::rows() const
     return m_controller ? m_controller->rows() : 0;
 }
 
+quint64 TerminalBridge::inputGeneration() const
+{
+    return m_inputGeneration;
+}
+
 void TerminalBridge::requestClear()
 {
     emit clearRequested();
 }
 
-void TerminalBridge::sendInput(const QString& data)
-{
-    // A partial write can leave a command prefix at the remote prompt even
-    // while the channel is still open. The page's void slot cannot return that
-    // failure, so report it through pane chrome; never replay old keystrokes.
-    if (m_controller && !data.isEmpty() && !m_controller->sendInput(data.toUtf8()))
-        emit inputRejected();
-}
-
-void TerminalBridge::sendBinaryInput(const QString& base64)
+bool TerminalBridge::sendInput(const QString& data, quint64 generation)
 {
     if (!m_controller)
-        return;
+        return false;
+    const QPointer<TerminalBridge> self(this);
+    if (generation == m_inputGeneration
+        && (data.isEmpty() || m_controller->sendInput(data.toUtf8())))
+        return true;
+    // A stale chunk belongs to the preceding PTY. A partial write may already
+    // have reached that program; neither case may replay its suffix elsewhere.
+    if (self)
+        emit inputRejected();
+    return false;
+}
+
+bool TerminalBridge::sendBinaryInput(const QString& base64, quint64 generation)
+{
+    if (!m_controller)
+        return false;
+    if (generation != m_inputGeneration) {
+        emit inputRejected();
+        return false;
+    }
+    // The page's btoa() encoder produces padded four-character groups. Qt's
+    // abort flag can still accept a dangling sextet (for example "A") as an
+    // empty successful decode, so validate the encoded byte count as well.
+    if (base64.size() % 4 != 0)
+        return false;
+    qsizetype padding = 0;
+    if (base64.endsWith(QLatin1Char('='))) {
+        padding = 1;
+        if (base64.size() >= 2 && base64.at(base64.size() - 2) == QLatin1Char('='))
+            padding = 2;
+    }
+    const qsizetype expectedBytes = base64.size() / 4 * 3 - padding;
     // STRICT decoding, with the abort flag rather than Qt's default tolerance.
     // Base64's alphabet is entirely ASCII, so toLatin1() is lossless for every
     // legitimate payload while anything outside it (a page sending UTF-16 text
@@ -91,10 +125,14 @@ void TerminalBridge::sendBinaryInput(const QString& base64)
         QByteArray::fromBase64Encoding(base64.toLatin1(),
                                        QByteArray::Base64Encoding
                                            | QByteArray::AbortOnBase64DecodingErrors);
-    if (!decoded)
-        return;
-    if (!decoded.decoded.isEmpty() && !m_controller->sendInput(decoded.decoded))
+    if (!decoded || decoded.decoded.size() != expectedBytes)
+        return false;
+    const QPointer<TerminalBridge> self(this);
+    if (decoded.decoded.isEmpty() || m_controller->sendInput(decoded.decoded))
+        return true;
+    if (self)
         emit inputRejected();
+    return false;
 }
 
 void TerminalBridge::resize(int cols, int rows)
@@ -121,7 +159,6 @@ void TerminalBridge::resize(int cols, int rows)
 
 void TerminalBridge::notifyViewVisible(bool visible)
 {
-    m_visibilityReported = true;
     m_viewVisible = visible;
     applyVisibility();
 }
@@ -132,44 +169,27 @@ void TerminalBridge::notifyOutputConsumed(int bytes)
         m_controller->acknowledgeOutput(bytes);
 }
 
-void TerminalBridge::ready()
+void TerminalBridge::ready(bool visible)
 {
-    const bool replacingRenderer = m_rendererReady;
     m_rendererReady = true;
+    m_viewVisible = visible;
     if (!m_controller)
         return;
-    // Re-announce the state a page that loaded late (or reloaded) missed, then
-    // release the buffer: becoming visible replays everything retained while
-    // the renderer was absent as one flushReady batch.
-    emit connectionStateChanged(toString(m_controller->state()));
-    // The handshake IS a visibility report for a replacement page: it has to
-    // reset m_viewVisible rather than merely re-apply it, because the PREVIOUS
-    // page reported hidden on its way out (TerminalHost.dispose() in
-    // src/web/terminal/src/index.ts), and a reload would otherwise leave the
-    // pane retaining output forever behind a page that is very much on screen.
-    // On the first mount, however, preserve a QML/page report that arrived
-    // before ready(); this covers a pane hidden while Chromium is still
-    // loading. Hosts that never report visibility retain the historical
-    // visible default.
-    if (replacingRenderer || !m_visibilityReported)
-        m_viewVisible = true;
-    // A fresh renderer has consumed nothing and is owed nothing. Both sides of
-    // the account are cleared explicitly rather than left to the visibility
-    // change, because a page that vanished without reporting hidden (a crash, a
-    // navigation the pagehide handler did not survive) leaves the controller
-    // already visible — so its replacement's handshake is not a CHANGE, and the
-    // new renderer would inherit a debt it can never pay off.
-    //
-    // The DECODER is part of that account. It can be holding the lead bytes of
-    // a character whose tail went to the page that is being replaced; those
-    // bytes were emitted, so they are not in the controller's retained buffer
-    // and will never arrive. Left in place, that half-character would be
-    // completed from the first bytes of the replay and paint one wrong glyph
-    // at the top of the new renderer's screen.
+    // Reset while hidden: resetting the old renderer's credit while still
+    // visible can replay retained output before the incoming page's hidden
+    // visibility takes effect. The incoming page explicitly owns visibility,
+    // so no outgoing-page report or replacement heuristic can override it.
+    m_controller->setViewVisible(false);
     m_decoder.resetState();
     m_undeliveredBytes = 0;
     m_controller->resetOutputAcknowledgements();
-    applyVisibility();
+    const QPointer<TerminalBridge> self(this);
+    emit inputTransportChanged(m_inputGeneration);
+    if (!self || !m_controller)
+        return;
+    emit connectionStateChanged(toString(m_controller->state()));
+    if (self)
+        applyVisibility();
 }
 
 void TerminalBridge::applyVisibility()

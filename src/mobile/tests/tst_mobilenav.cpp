@@ -147,6 +147,7 @@ private slots:
     void aSessionThatVanishesFromTheWorkspaceReleasesThePane();
     void reselectingTheSameSessionReloadsItRatherThanHanging();
     void anExternalSameSessionReloadPublishesItsNewLayout();
+    void automaticRefreshDoesNotReplaceTheSelectedPane();
     void aSynchronousExternalLoadDoesNotLeaveTheShellWaiting();
     void aReplacementShellLoadsTheAlreadyActiveSession();
     void aRefusedSelectionDoesNotAbandonThePendingSession();
@@ -822,6 +823,57 @@ void TstMobileNav::anExternalSameSessionReloadPublishesItsNewLayout()
     QCOMPARE(f.mobile.navStage(), MobileAppController::Panes);
     QVERIFY(f.mobile.panes()->paneByKey(QStringLiteral("viewer:viewer-1")).isEmpty());
     QVERIFY(!f.mobile.panes()->paneByKey(QStringLiteral("viewer:viewer-2")).isEmpty());
+}
+
+void TstMobileNav::automaticRefreshDoesNotReplaceTheSelectedPane()
+{
+    Fixture f;
+    f.listSessions({QStringLiteral("s1")});
+    f.openSession(QStringLiteral("s1"), QStringLiteral("viewer-1"),
+                  QStringLiteral("terminal-1"));
+    f.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    const QVariantMap selected = f.mobile.selectedPane();
+    const quint64 requestGeneration = f.layouts.generation();
+    const quint64 paneGeneration = f.layouts.paneGeneration();
+    QSignalSpy selection(&f.mobile, &MobileAppController::selectedPaneChanged);
+    QSignalSpy navigation(&f.mobile, &MobileAppController::navStageChanged);
+
+    f.layouts.refresh();
+    QVERIFY(f.layouts.generation() > requestGeneration);
+    QCOMPARE(f.layouts.paneGeneration(), paneGeneration);
+    // The active session can be re-announced while its automatic reread is in
+    // flight, without becoming a new pane/document identity.
+    emit f.controller.activeSessionChanged();
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Pane);
+    QVERIFY(!f.mobile.layoutPending());
+    QCOMPARE(f.mobile.selectedPane(), selected);
+
+    f.answerLayouts(f.takeLayoutRequests(),
+                    viewerTreeFor(QStringLiteral("viewer-1"),
+                                  QStringLiteral("file:///srv/s1/notes.md")),
+                    terminalTreeFor(QStringLiteral("terminal-1"),
+                                    QStringLiteral("row-terminal-1")));
+    emit f.controller.activeSessionChanged();
+    QCOMPARE(f.mobile.selectedPane(), selected);
+    QCOMPARE(selection.count(), 0);
+    QCOMPARE(navigation.count(), 0);
+
+    // A deliberate load of that same session must still release and recreate
+    // its pane. The request/completion guards remain distinct from pane identity.
+    f.controller.activateSession(QStringLiteral("s1"));
+    QVERIFY(f.layouts.paneGeneration() > paneGeneration);
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Sessions);
+    QVERIFY(f.mobile.layoutPending());
+    QVERIFY(f.mobile.selectedPaneKey().isEmpty());
+    QVERIFY(selection.count() > 0);
+    f.answerLayouts(f.takeLayoutRequests(),
+                    viewerTreeFor(QStringLiteral("viewer-1"),
+                                  QStringLiteral("file:///srv/s1/notes.md")),
+                    terminalTreeFor(QStringLiteral("terminal-1"),
+                                    QStringLiteral("row-terminal-1")));
+    QVERIFY(!f.mobile.layoutPending());
+    QCOMPARE(f.mobile.navStage(), MobileAppController::Pane);
+    QCOMPARE(f.mobile.selectedPane(), selected);
 }
 
 void TstMobileNav::aSynchronousExternalLoadDoesNotLeaveTheShellWaiting()

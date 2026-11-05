@@ -21,7 +21,7 @@
 // builds the complete new text of every file in memory before it writes a
 // single byte. A malformed lock file or a pattern that no longer matches
 // therefore leaves the whole tree untouched, instead of half-bumped.
-import { chmodSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const CONFIG_NAME = ".bumpversion.json";
@@ -443,14 +443,22 @@ function commandApply(config, version) {
   const staged = [];
   try {
     for (const file of pending) {
-      const temporary = `${file.absolute}.bumpctl-${process.pid}`;
+      // A predictable temporary filename could already be a symlink. Reserve
+      // a private directory atomically instead of following an existing path.
+      const directory = mkdtempSync(`${file.absolute}.bumpctl-`);
+      const temporary = join(directory, "version");
+      const backup = join(directory, "original");
+      staged.push({ ...file, directory, temporary, backup });
       writeFileSync(temporary, file.content);
       chmodSync(temporary, file.mode);
-      staged.push({ ...file, temporary });
+      // Prepare rollback before publishing anything. Rewriting originals after
+      // a rename failure can itself fail (for example when the disk is full).
+      writeFileSync(backup, file.original);
+      chmodSync(backup, file.mode);
     }
   } catch (error) {
     for (const file of staged) {
-      rmSync(file.temporary, { force: true });
+      rmSync(file.directory, { recursive: true, force: true });
     }
     fail(`could not prepare the new version files, so nothing was changed: ${error.message}`);
   }
@@ -467,16 +475,31 @@ function commandApply(config, version) {
       moved.push(file);
     }
   } catch (error) {
-    for (const file of moved) {
-      writeFileSync(file.absolute, file.original);
+    const unrestored = new Set();
+    const recoveryErrors = [];
+    for (const file of moved.reverse()) {
+      try {
+        renameSync(file.backup, file.absolute);
+      } catch (recoveryError) {
+        unrestored.add(file);
+        recoveryErrors.push(`${file.path}: ${recoveryError.message}; original retained at ${file.backup}`);
+      }
     }
-    for (const file of staged.slice(moved.length)) {
-      rmSync(file.temporary, { force: true });
+    for (const file of staged) {
+      if (!unrestored.has(file)) {
+        rmSync(file.directory, { recursive: true, force: true });
+      }
     }
     fail(
       `could not update ${staged[moved.length].path}: ${error.message}. ` +
-        `Every file already updated was put back, so no version was changed.`,
+        (recoveryErrors.length > 0
+          ? `Some originals could not be restored:\n${recoveryErrors.join("\n")}`
+          : `Every file already updated was put back, so no version was changed.`),
     );
+  }
+
+  for (const file of staged) {
+    rmSync(file.directory, { recursive: true, force: true });
   }
 
   for (const file of pending) {

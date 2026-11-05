@@ -74,7 +74,8 @@ bool isAddressableRegion(const QString& region)
     // Region names become one path component in QSettings. Reject an empty
     // component and separators so malformed QML input cannot create a key
     // outside the documented per-region counter shape.
-    return !region.isEmpty() && !region.contains(QLatin1Char('/'));
+    return !region.isEmpty() && !region.contains(QLatin1Char('/'))
+           && !region.contains(QLatin1Char('\\'));
 }
 } // namespace
 

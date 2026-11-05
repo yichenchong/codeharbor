@@ -175,6 +175,10 @@ export interface ServerInfoResult {
     // Stable, persisted identity of the workspace database on this host
     // (SPEC 3.5). Clients key their stored view of the remote workspace by it.
     serverId: string;
+    // Required since schema 10: the exact shared agent-event producer endpoint.
+    // Clients export it as CODEHARBOR_AGENT_SOCKET because tmux's inherited
+    // HOME/XDG environment may resolve another socket even for a new shell.
+    agentSocket: string;
     // The REMOTE user's data directory for crash-recovery snapshots (SPEC
     // 11.3). Additive and OPTIONAL: an older server omits it and the client
     // degrades to no-recovery rather than failing the compatibility gate.
@@ -526,6 +530,9 @@ export const RPC_WORKSPACE_METHODS = {
     updateTerminalPane: "workspace.updateTerminalPane",
     deleteTerminalPane: "workspace.deleteTerminalPane",
     getLayout: "workspace.getLayout",
+    // Initialize only an absent layout; an existing row, including a cleared
+    // tree, wins. Terminal pane rows and their initial tree are created together.
+    ensureInitialLayout: "workspace.ensureInitialLayout",
     setLayout: "workspace.setLayout",
 } as const;
 

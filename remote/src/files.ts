@@ -614,8 +614,8 @@ async function withWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
 
 export async function writeFile(params: WriteFileParams): Promise<WriteFileResult> {
     // Canonicalize even absent targets so a link and its target share one lock.
-    const key = await resolveLinkChain(params.path);
-    return withWriteLock(key, () => writeFileLocked(params));
+    const target = await resolveLinkChain(params.path);
+    return withWriteLock(target, () => writeFileLocked(params, target));
 }
 
 // Name of the temp file the atomic save renames over `basename`. The random
@@ -655,7 +655,7 @@ function tempName(basename: string): string {
 // so the utf-8 path gets the same treatment.
 const UNPAIRED_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
-async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult> {
+async function writeFileLocked(params: WriteFileParams, target: string): Promise<WriteFileResult> {
     const encoding = params.encoding ?? "utf-8";
     // Buffer.from(s, "base64") is LENIENT: it silently drops every character
     // outside the alphabet and discards a trailing partial group. A payload
@@ -685,7 +685,7 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
             `Invalid utf-8 content for ${params.path}: unpaired surrogate code unit`,
         );
     }
-    const existing = await statOrUndefined(params.path);
+    const existing = await statOrUndefined(target);
     // A directory is not a file this method can replace. Without this check the
     // atomic save ran its whole course against it: `path.dirname(target)` is the
     // directory's PARENT, so a temp file was created — and chmod'd to the
@@ -716,27 +716,21 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
     const buf = Buffer.from(params.content, encoding === "base64" ? "base64" : "utf-8");
 
     // Atomic save (SPEC 8.5): temp file in the same directory, flush, preserve
-    // mode when overwriting, then rename over the target. When the target is a
-    // symlink, resolve it to the file it names so the rename replaces the
-    // linked-to file rather than severing the link — this also keeps the write
-    // consistent with the revision guard above, which stat()'d through the link.
+    // mode when overwriting, then rename over the target. Keep the canonical
+    // path used for the write lock throughout the save. Resolving params.path
+    // again after the revision check could select a different symlink target,
+    // overwriting bytes the client never loaded even if the link points back
+    // at the original file by the final check.
     //
-    // BOTH branches resolve the link, for the same reason. An existing target is
-    // resolved with realpath, which also normalizes symlinked parent
-    // directories. A create needs resolveLinkChain instead, because realpath
-    // refuses a chain that dangles — and a DANGLING link is precisely the path
-    // that reaches the create branch, since statOrUndefined follows links and so
-    // reports "nothing here" for it. Writing the resolved end preserves the
-    // user's link and creates its target, exactly as a plain create through the
-    // link would; renaming over params.path would have replaced the link itself
-    // with a regular file and lost it with no error and no way back.
+    // resolveLinkChain also handles absent targets and dangling links, so a
+    // create preserves the link and creates its target rather than replacing
+    // the link itself.
     //
     // A rename-over also BREAKS a hard link: the other names for the old inode
     // keep the old bytes. That is inherent to an atomic save — there is no way
     // to replace a file's contents in one step while keeping its inode — and
     // rewriting in place instead would trade a rare surprise for the routine
     // risk of a half-written file, so the atomicity wins.
-    const target = existing ? await fsp.realpath(params.path) : await resolveLinkChain(params.path);
     const dir = path.dirname(target);
     const tmp = path.join(dir, tempName(path.basename(target)));
     // An atomic save replaces the file by RENAMING over its name, which needs
@@ -819,8 +813,37 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         // file changed during the write + flush above is caught instead of being
         // silently overwritten (SPEC 8.6). This shrinks but cannot fully close
         // the window; POSIX offers no atomic compare-and-rename.
-        assertRevisionMatches(params.path, params.expectedRevision, await statOrUndefined(params.path));
-        await fsp.rename(tmp, target);
+        assertRevisionMatches(params.path, params.expectedRevision, await statOrUndefined(target));
+        if (params.path !== target) {
+            assertRevisionMatches(params.path, params.expectedRevision, await statOrUndefined(params.path));
+        }
+        if (params.expectedRevision === "") {
+            // A create-only save must remain no-clobber across processes too.
+            // link() publishes the complete flushed inode atomically and fails
+            // if a competing writer created the name after the last stat.
+            try {
+                await fsp.link(tmp, target);
+            } catch (err) {
+                if (
+                    err !== null &&
+                    typeof err === "object" &&
+                    "code" in err &&
+                    err.code === "EEXIST"
+                ) {
+                    const current = await statOrUndefined(target);
+                    throw new RevisionMismatchError(
+                        `File already exists: ${params.path}`,
+                        { path: params.path, currentRevision: current ? revisionFrom(current) : null },
+                    );
+                }
+                throw err;
+            }
+            // The commit already succeeded. A cleanup failure must not turn it
+            // into a reported failed save; the published inode remains valid.
+            await fsp.unlink(tmp).catch(() => {});
+        } else {
+            await fsp.rename(tmp, target);
+        }
         written = await handle.stat();
         await handle.close().catch(() => {});
         handle = undefined;
@@ -833,7 +856,7 @@ async function writeFileLocked(params: WriteFileParams): Promise<WriteFileResult
         throw err;
     }
 
-    // fsync the containing directory so the rename itself is durable across a
+    // fsync the containing directory so the committed name is durable across a
     // crash. Best-effort: some platforms (e.g. Windows) cannot fsync a directory.
     try {
         const dirHandle = await fsp.open(dir, "r");
@@ -1197,39 +1220,34 @@ const LISTING_ENTRY_ENVELOPE_BYTES = 29;
 // Over the cap the request is REFUSED with RPC_RESOURCE_LIMIT rather than
 // answered with a truncated listing. A silently short listing is worse than an
 // error: the viewer would present it as the directory's complete contents, and a
-// user who does not see a file concludes it is not there. Reporting the real
-// entry count tells them what they are looking at and what to do instead.
+// user who does not see a file concludes it is not there. Stop enumeration as
+// soon as the bound is exceeded rather than allocating the entire directory.
 export const MAX_DIRECTORY_LISTING_BYTES = 15 * 1024 * 1024;
 
-/**
- * Refuse a listing whose serialized entries would not fit in one transport
- * frame. Exported as its own contract because the only honest end-to-end test
- * of MAX_DIRECTORY_LISTING_BYTES would have to create tens of thousands of real
- * files; this way the bound, the boundary and the message are all testable
- * directly, and `listDirectory` keeps exactly one call site for it.
- *
- * Takes the dirents themselves rather than a name array so the production path
- * does not copy half a million strings just to measure them.
- */
+function listingEntryBytes(name: string): number {
+    // JSON escaping can expand a control character to six bytes.
+    return LISTING_ENTRY_ENVELOPE_BYTES + Buffer.byteLength(JSON.stringify(name));
+}
+
+function assertListingBytesFit(dirPath: string, bytes: number, count: number): void {
+    if (bytes > MAX_DIRECTORY_LISTING_BYTES) {
+        throw new ResourceLimitError(
+            `Cannot list ${dirPath}: it holds at least ${count} entries, whose listing ` +
+                `exceeds this server's ${MAX_DIRECTORY_LISTING_BYTES}-byte reply limit. ` +
+                `Open a subdirectory, or use a terminal to inspect it.`,
+        );
+    }
+}
+
+// Apply the same byte bound to an already-enumerated collection.
 export function assertListingFits(
     dirPath: string,
     entries: readonly Pick<Dirent, "name">[],
 ): void {
-    // Measure the reply BEFORE building it. The size comes from the SERIALIZED
-    // form of each name (JSON.stringify, not byte length) because escaping is
-    // what actually expands: a filename may hold any byte but NUL and `/`, and a
-    // control byte becomes the six characters \u00XX — so a byte-length estimate
-    // can be off by 6x on exactly the pathological input this bound exists for.
     let bytes = 0;
     for (const entry of entries) {
-        bytes += LISTING_ENTRY_ENVELOPE_BYTES + Buffer.byteLength(JSON.stringify(entry.name));
-        if (bytes > MAX_DIRECTORY_LISTING_BYTES) {
-            throw new ResourceLimitError(
-                `Cannot list ${dirPath}: it holds ${entries.length} entries, whose listing ` +
-                    `exceeds this server's ${MAX_DIRECTORY_LISTING_BYTES}-byte reply limit. ` +
-                    `Open a subdirectory, or use a terminal to inspect it.`,
-            );
-        }
+        bytes += listingEntryBytes(entry.name);
+        assertListingBytesFit(dirPath, bytes, entries.length);
     }
 }
 
@@ -1264,18 +1282,18 @@ function direntKindUnknown(entry: Dirent): boolean {
 export async function listDirectory(
     params: ListDirectoryParams,
 ): Promise<ListDirectoryResult> {
-    const dirents = await fsp.readdir(params.path, { withFileTypes: true });
-    // Filesystem enumeration order is platform-dependent; sort by the raw
-    // filename so the same directory has one stable wire representation.
-    dirents.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
-    assertListingFits(params.path, dirents);
-    const entries: ListDirectoryResult["entries"] = dirents.map((entry) => ({
-        name: entry.name,
-        kind: nodeKind(entry),
-    }));
-    // Re-classify only the entries readdir could not type. On the common
-    // filesystems this list is empty and costs one predicate call per name.
-    const unknown = dirents.flatMap((entry, index) => (direntKindUnknown(entry) ? [index] : []));
+    const directory = await fsp.opendir(params.path);
+    const entries: ListDirectoryResult["entries"] = [];
+    const unknown: number[] = [];
+    let bytes = 0;
+    // The iterator closes the directory on EOF, error, or an over-limit throw.
+    // readdir() materializes every entry before the caller can enforce a cap.
+    for await (const entry of directory) {
+        bytes += listingEntryBytes(entry.name);
+        assertListingBytesFit(params.path, bytes, entries.length + 1);
+        if (direntKindUnknown(entry)) unknown.push(entries.length);
+        entries.push({ name: entry.name, kind: nodeKind(entry) });
+    }
     for (let from = 0; from < unknown.length; from += LISTING_STAT_BATCH) {
         await Promise.all(
             unknown.slice(from, from + LISTING_STAT_BATCH).map(async (index) => {
@@ -1289,6 +1307,9 @@ export async function listDirectory(
             }),
         );
     }
+    // Filesystem enumeration order is platform-dependent; sort by raw filename
+    // after classification so the fallback indexes still name their entries.
+    entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
     return { path: params.path, entries };
 }
 

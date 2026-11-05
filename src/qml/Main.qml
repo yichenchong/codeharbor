@@ -63,6 +63,96 @@ ApplicationWindow {
         return cut < 0 ? trimmed : trimmed.substring(cut + 1);
     }
 
+    // Recovery snapshots are debounced remote writes, not a substitute for
+    // keeping a dirty editor alive until the user agrees to leave it.
+    property var pendingWorkspaceAction: null
+    property string pendingWorkspaceSessionId: ""
+    property double pendingWorkspaceGeneration: 0
+    property bool allowWindowClose: false
+
+    function hasUnsavedEditors() {
+        const cache = viewerRegion.paneCache;
+        for (const id of Object.keys(cache || {})) {
+            if (cache[id] && cache[id].contentDirty)
+                return true;
+        }
+        return false;
+    }
+
+    function requestWorkspaceAction(action) {
+        if (unsavedWorkspaceDialog.visible)
+            return;
+        if (!window.hasUnsavedEditors()) {
+            action();
+            return;
+        }
+        window.pendingWorkspaceAction = action;
+        window.pendingWorkspaceSessionId = String(app.activeSessionId);
+        window.pendingWorkspaceGeneration = app.layouts ? Number(app.layouts.generation) : 0;
+        unsavedWorkspaceDialog.open();
+    }
+
+    function requestSessionActivation(sessionId) {
+        window.requestWorkspaceAction(() => app.activateSession(sessionId));
+    }
+
+    function requestServerConnect(profileId) {
+        window.requestWorkspaceAction(() => app.connectToProfile(profileId));
+    }
+
+    function requestServerDisconnect() {
+        window.requestWorkspaceAction(() => app.disconnectServer());
+    }
+
+    function requestServerUpgrade(profileId) {
+        window.requestWorkspaceAction(() => app.upgradeRemoteService(profileId));
+    }
+
+    onClosing: (close) => {
+        if (window.allowWindowClose || !window.hasUnsavedEditors())
+            return;
+        close.accepted = false;
+        window.requestWorkspaceAction(() => {
+            window.allowWindowClose = true;
+            window.close();
+            window.allowWindowClose = false;
+        });
+    }
+
+    AppDialog {
+        id: unsavedWorkspaceDialog
+        objectName: "unsavedWorkspaceDialog"
+        title: qsTr("Leave unsaved changes?")
+        modal: true
+        standardButtons: Dialog.Discard | Dialog.Cancel
+        defaultButton: Dialog.Cancel
+        preferredWidth: 440
+        anchors.centerIn: Overlay.overlay
+        contentItem: Label {
+            text: qsTr("One or more editors have unsaved changes. Continuing will discard those changes. Save them first, or choose Discard to continue.")
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: Theme.text
+            font.pixelSize: Theme.fontSizeBody
+        }
+        onDiscarded: {
+            const action = window.pendingWorkspaceAction;
+            window.pendingWorkspaceAction = null;
+            unsavedWorkspaceDialog.close();
+            // A remote change can retire the workspace while this modal is up.
+            // Never apply its deferred intent to that replacement workspace.
+            if (String(app.activeSessionId) !== window.pendingWorkspaceSessionId
+                    || (app.layouts ? Number(app.layouts.generation) : 0)
+                       !== window.pendingWorkspaceGeneration) {
+                window.notifyUser(qsTr("The workspace changed. Please repeat the action."));
+                return;
+            }
+            if (action)
+                action();
+        }
+        onRejected: window.pendingWorkspaceAction = null
+    }
+
     // SPEC 4.5 fallback trees for a region with no server tree yet. Declared as
     // properties with dependency-free bindings so each is constructed EXACTLY
     // ONCE and keeps a stable identity for the whole run; see the ViewerRegion /
@@ -335,11 +425,17 @@ ApplicationWindow {
             SplitView.minimumWidth: 180
             // Clicking (or Enter-ing) a session makes it current: AppController
             // loads both region layouts and remembers it for the next launch.
-            onSessionActivated: (devSessionId) => app.activateSession(devSessionId)
+            onSessionActivated: (devSessionId) => window.requestSessionActivation(devSessionId)
             // The sidebar's one settings affordance, in its header and visible
             // at every connection state. The window it opens owns the server
             // profiles as well as the appearance and viewer settings.
             onAppSettingsRequested: settingsWindow.shown = true
+            onArchiveSessionRequested: (devSessionId) => {
+                if (String(devSessionId) === String(app.activeSessionId))
+                    window.requestWorkspaceAction(() => app.archiveSession(devSessionId));
+                else
+                    app.archiveSession(devSessionId);
+            }
         }
 
         // The regions are recursive split trees, inert until given a node. The
@@ -364,8 +460,11 @@ ApplicationWindow {
                   : window.viewerFallbackNode
             // Production writes carry the session/load stamp captured by the
             // region or pane. The region's legacy signals remain test-only.
+            serverId: app.serverId
+            acceptedServerId: app.acceptedServerId
             sessionId: app.activeSessionId
             layoutGeneration: app.layouts ? app.layouts.generation : 0
+            paneGeneration: app.layouts ? app.layouts.paneGeneration : 0
             hostStampsWrites: true
             SplitView.fillWidth: true
             SplitView.minimumWidth: 320
@@ -569,6 +668,7 @@ ApplicationWindow {
     // opens itself on first run; afterwards it is reachable from the palette.
     ConnectSheet {
         id: connectSheet
+        objectName: "connectSheet"
         // Below the title bar, never over it. These sheets fill everything
         // they are given and swallow every click that misses one of their
         // controls, so anchoring them to the whole window buried the ONLY
@@ -589,11 +689,14 @@ ApplicationWindow {
         errorText: app.connectionError
         diagnosticText: app.sshDiagnostics
 
-        onConnectRequested: (profileId) => app.connectToProfile(profileId)
+        onConnectRequested: (profileId) => window.requestServerConnect(profileId)
         // The sheet cannot create a server. Hand the user to the window that
         // can — it sits at z 910, above this sheet, so it is usable while the
         // cold-start sheet is still up with nothing to connect to.
-        onSettingsRequested: settingsWindow.shown = true
+        onSettingsRequested: {
+            settingsWindow.selectedGroup = "server";
+            settingsWindow.shown = true;
+        }
         onHostKeyDecision: (accept) => { pendingHostKey = null; app.resolveHostKey(accept); }
         onCredentialSubmitted: (secret, kind) => {
             // Cleared here BEFORE the secret is handed over, so the sheet is
@@ -621,7 +724,7 @@ ApplicationWindow {
                         || app.connectionState === "connecting")
                         return;
                     if (app.serverProfiles && app.serverProfiles.activeId.length > 0)
-                        app.connectToProfile(app.serverProfiles.activeId);
+                        window.requestServerConnect(app.serverProfiles.activeId);
                 });
             }
         }
@@ -629,6 +732,7 @@ ApplicationWindow {
 
     LogView {
         id: logView
+        objectName: "logSheet"
         anchors.top: titleBar.bottom
         anchors.left: parent.left
         anchors.right: parent.right
@@ -647,6 +751,9 @@ ApplicationWindow {
         z: 910
         visible: shown
         onDismissed: shown = false
+        onConnectRequested: (profileId) => window.requestServerConnect(profileId)
+        onDisconnectRequested: window.requestServerDisconnect()
+        onUpgradeRequested: (profileId) => window.requestServerUpgrade(profileId)
     }
 
     Connections {
@@ -654,12 +761,16 @@ ApplicationWindow {
         // An unknown host key refused the connect; surface the fingerprint and
         // let the user decide (accepting retries the connect).
         function onHostKeyPrompt(host, keyType, fingerprint) {
+            settingsWindow.shown = false;
+            logView.shown = false;
             connectSheet.pendingHostKey = { host: host, keyType: keyType, fingerprint: fingerprint };
             connectSheet.shown = true;
         }
         // ssh-agent and the default keys could not authenticate; the connect was
         // refused so we could ask instead of blocking inside the handshake.
         function onCredentialPrompt(user, host, prompt, kind) {
+            settingsWindow.shown = false;
+            logView.shown = false;
             connectSheet.pendingCredential = {
                 user: user, host: host, prompt: prompt, kind: kind
             };
@@ -670,9 +781,14 @@ ApplicationWindow {
         // hides the very thing the user just connected to behind a dialog they
         // have to discover how to close.
         function onConnectionStateChanged() {
-            if (app.connectionState === "connected") {
+            // Disconnect, failure and a new attempt retire the old question
+            // and wipe any secret typed for it, just as success does.
+            if (app.connectionState !== "hostkey")
                 connectSheet.pendingHostKey = null;
+            if (app.connectionState !== "credential")
                 connectSheet.pendingCredential = null;
+            if (app.connectionState === "connected") {
+                // Prompt state was cleared above.
                 connectSheet.shown = false;
             }
         }
@@ -1200,7 +1316,7 @@ ApplicationWindow {
         { id: "server.connect", title: qsTr("Connect to Server…"), shortcut: "Ctrl+Shift+O",
           invoke: () => { connectSheet.shown = true; } },
         { id: "server.disconnect", title: qsTr("Disconnect from Server"),
-          invoke: () => app.disconnectServer() },
+          invoke: () => window.requestServerDisconnect() },
         { id: "app.logs", title: qsTr("Show Log"),
           invoke: () => { logView.shown = true; } },
         { id: "app.settings", title: qsTr("Settings…"), shortcut: "Ctrl+,",
@@ -1208,7 +1324,7 @@ ApplicationWindow {
         // No profile argument: the controller uses the active profile, which is
         // the one the palette user is looking at in the sidebar.
         { id: "server.upgrade", title: qsTr("Update Remote Service on Server"),
-          invoke: () => app.upgradeRemoteService("") },
+          invoke: () => window.requestServerUpgrade("") },
         // Ctrl+Shift+R, not Ctrl+R: a global Shortcut is matched before the key
         // reaches the focused item, and Ctrl+R is reverse-history-search in every
         // shell a terminal pane hosts (and reload in a WebEngineView). Same rule

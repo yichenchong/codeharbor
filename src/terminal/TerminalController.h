@@ -254,15 +254,15 @@ public:
     // and the `terminal_panes` row id — and they are PARAMETERS on purpose. The
     // target embeds them in its minted name, but that name is a formatted
     // string, not a data source, and parsing ids back out of it would invent a
-    // second, guessing copy of an identity the caller already holds. Both empty
-    // means "identity unknown", and then neither variable is exported: a hook
-    // needs both halves to name a pane.
+    // second, guessing copy of an identity the caller already holds. If either
+    // half is unknown, both provenance fields and routing capabilities are
+    // explicitly cleared so a tmux master's identity cannot leak into this pane.
     //
     // They are exported because an agent hook has no other way to say which
     // pane it is in: remote/src/hooks/oh-my-pi-hook.ts reads exactly these two
     // variables and the daemon drops an event that arrives without them. See
-    // the implementation for what `-A` does and does not repair — in short, a
-    // session (and a process) that already exists is NOT retrofitted.
+    // the implementation for what `-A` does and does not repair: session updates
+    // reach future tmux children, never an already-running shell or its children.
     //
     // `target` is NOT minted here, and deliberately no longer can be. It is the
     // `tmuxTarget` column of this pane's row in the server's `terminal_panes`
@@ -279,6 +279,9 @@ public:
     // here stops a name breaking out of the remote SHELL; it does nothing about
     // names that are meaningful to TMUX itself, which is a separate grammar and
     // a separate check. ch::TerminalFactory::attach() is the gate in production.
+    // Data arguments also encode tmux's trailing-semicolon argv delimiter
+    // before shell quoting, preserving literal ';' and backslash-semicolon
+    // suffixes without narrowing the accepted socket/directory path grammar.
     //
     // The second tmux command switches mouse reporting on for THIS SESSION ONLY
     // (never `-g`, which would reconfigure every tmux session the user owns), so
@@ -287,16 +290,24 @@ public:
     // reasoning and the tmux 3.6 verification.
     // `controlSocket` is the viewer control socket THIS window's daemon reported
     // through server.info (SPEC 6.8), exported as $CODEHARBOR_CONTROL_SOCKET so an
-    // agent in this pane drives the panes of the window that owns it. Empty when
-    // the server reported none (an older server, or one that could not bind);
-    // agents in such a pane are then told so rather than routed to a guessed path.
+    // agent in this pane drives the panes of the window that owns it. Missing
+    // capabilities are explicitly empty at creation and marked removed for
+    // future tmux children; they must not fall back to a master's stale endpoint.
+    // `agentSocket` is the exact accepted server.info event endpoint. It is
+    // exported separately from the window control socket, without changing
+    // HOME/XDG or tmux's global environment. Session updates reach NEW tmux
+    // children only, not processes forked by an already-running old shell.
     static QString tmuxNewSessionCommand(const QString &target, const QString &workingDir,
                                          const QString &devSessionId,
                                          const QString &terminalId,
-                                         const QString &controlSocket = QString());
+                                         const QString &controlSocket,
+                                         const QString &agentSocket);
 
 signals:
     void stateChanged(ch::TerminalState state);
+    // The PTY byte transport was replaced or explicitly detached. Renderer
+    // input already queued for the old transport must not target the new one.
+    void transportChanged();
     // Non-empty output arrived from the remote PTY. Raised on INGEST, before
     // any coalescing, buffering or flow control, and carrying no payload: it
     // reports that the pane is producing, not what it produced.
@@ -379,6 +390,7 @@ private:
     // while the controller outlives it, and setTransport()'s disconnect() on
     // the stale pointer would then be a use-after-free.
     QPointer<QIODevice> m_transport = nullptr;
+    quint64 m_transportGeneration = 0;
     int m_columns = 0;      // last renderer geometry; 0 = never reported
     int m_rows = 0;
 };

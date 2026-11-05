@@ -25,15 +25,14 @@ class EditorFactory : public QObject {
 public:
     explicit EditorFactory(CodeharbordClient* client, QObject* parent = nullptr);
 
-    // Create a controller owned by `owner` (the QML pane Item). Ownership is via
-    // QObject parenting, so the controller — and the file.watch subscription it
-    // holds — is released when the pane is destroyed. `paneId` is the pane's
-    // stable layout id, used to key its crash-recovery snapshot per pane so two
-    // panes editing one path never collide (SPEC 11.3). A NULL `owner` parents
-    // the controller to the factory instead of returning it unparented; see
-    // create() for why that matters to a Q_INVOKABLE.
-    Q_INVOKABLE ch::EditorController* create(QObject* owner = nullptr,
-                                             const QString& paneId = QString());
+    // Every recovery identity is explicit: server identity accepted by App,
+    // owning Dev Session, logical pane, and (on open) the actual file path.
+    // Missing context disables recovery rather than sharing a local pane label.
+    // A null owner parents the controller to this factory.
+    Q_INVOKABLE ch::EditorController* create(QObject* owner,
+                                             const QString& serverId,
+                                             const QString& devSessionId,
+                                             const QString& paneId);
 
     // The server-reported recovery directory (server.info.recoveryDir),
     // forwarded by AppController once the server identity is adopted. Remembered

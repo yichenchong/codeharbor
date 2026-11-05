@@ -3,11 +3,14 @@
 #include <QByteArray>
 #include <QColor>
 #include <QFont>
+#include <QCoreApplication>
+#include <QEvent>
 #include <QFontMetricsF>
 #include <QIODevice>
 #include <QImage>
 #include <QMetaMethod>
 #include <QPainter>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QStringList>
 
@@ -15,6 +18,7 @@
 #include <cstring>
 #include <limits>
 
+#include "MobileNavFixture.h"
 #include "MobileTerminalSession.h"
 #include "MobileTerminalView.h"
 #include "SessionState.h"
@@ -134,6 +138,11 @@ private slots:
     void closeStopsFlushingAndNeverExposesKill();
     void anAnswerThisPaneIsNotWaitingForIsNeverAttached();
     void resizeNeverOutgrowsTheGridTheScreenCanHold();
+    void workspaceReadinessRetriesOnlyTheVisibleOpenIdentity();
+    void retargetingDropsThePreviousPanesBuffersAndModes();
+    void destroyingTheScreenInvalidatesThePaintedView();
+    void fontMetricsNotifyWithoutChangingTheCellCount();
+    void backgroundChangesRepaintTheFractionalBottomGutter();
     void gridIsDerivedFromTheFontMetric();
     void singleRowDamageDoesNotDirtyTheWholeGrid();
     void aScrolledBackViewStaysPinnedWhileOutputArrives();
@@ -546,6 +555,143 @@ void TstMobileTerminal::resizeNeverOutgrowsTheGridTheScreenCanHold()
     opened.open(QStringLiteral("dev-1"), QStringLiteral("terminal-1"),
                 QStringLiteral("row-1"), QString(), 1'000'000, 24);
     QCOMPARE(opened.screen()->columns(), MobileTerminalSession::kMaxColumns);
+}
+
+void TstMobileTerminal::retargetingDropsThePreviousPanesBuffersAndModes()
+{
+    MobileTerminalSession session(nullptr);
+    session.open(QStringLiteral("dev-a"), QStringLiteral("terminal-1"),
+                 QStringLiteral("row-a"), QString(), 40, 12);
+    FakeChannel oldChannel;
+    session.controller()->setTransport(&oldChannel);
+    session.setVisible(false);
+    session.controller()->ingestOutput(QByteArray("old pane output"));
+    QTRY_VERIFY(!session.controller()->hiddenBuffer().isEmpty());
+    session.screen()->write(QByteArray("\x1b[?2004h\x1b[?1h\x1b["));
+    QVERIFY(session.screen()->bracketedPaste());
+    QPointer<TerminalController> previous = session.controller();
+
+    session.open(QStringLiteral("dev-b"), QStringLiteral("terminal-1"),
+                 QStringLiteral("row-b"), QString(), 40, 12);
+    QVERIFY(previous.isNull());
+    QVERIFY(session.controller()->hiddenBuffer().isEmpty());
+    QVERIFY(!session.controller()->viewVisible());
+    QVERIFY(!session.screen()->bracketedPaste());
+    QVERIFY(!session.screen()->applicationCursorKeys());
+    session.sendText(QStringLiteral("must not reach the old shell"));
+    QVERIFY(oldChannel.written().isEmpty());
+    session.screen()->write(QByteArray("new pane"));
+    QCOMPARE(rowText(session.screen(), session.screen()->firstScreenRow()),
+             QStringLiteral("new pane"));
+}
+
+
+// NTC caller migration: a connected SSH transport does not authorize workspace
+// operations until server.info identifies the current remote service.
+void TstMobileTerminal::workspaceReadinessRetriesOnlyTheVisibleOpenIdentity()
+{
+    chtest::FakeTransport transport;
+    CodeharbordClient client;
+    client.setTransport(&transport);
+    WorkspaceDb workspace(&client);
+    AnnouncingFactory factory;
+    factory.setWorkspace(&workspace);
+    factory.setServerId(QStringLiteral("srv"));
+    MobileTerminalSession session(&factory);
+    session.open(QStringLiteral("dev-1"), QStringLiteral("terminal-1"),
+                 QStringLiteral("row-1"), QString(), 40, 12);
+    QVERIFY(chtest::takeRequests(transport).isEmpty());
+
+    factory.setWorkspaceReady(true);
+    const auto first = chtest::takeRequests(transport);
+    QCOMPARE(first.size(), 1);
+    QCOMPARE(first.first().value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.resolveTerminalPane"));
+
+    factory.setWorkspaceReady(false);
+    session.setVisible(false);
+    transport.deliver(chtest::errorFrame(
+        first.first().value(QStringLiteral("id")).toInt(),
+        QStringLiteral("retired lookup failed")));
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+    QVERIFY(!session.statusText().contains(QStringLiteral("retired lookup failed")));
+    factory.setWorkspaceReady(true);
+    QVERIFY(chtest::takeRequests(transport).isEmpty());
+
+    session.setVisible(true);
+    const auto retried = chtest::takeRequests(transport);
+    QCOMPARE(retried.size(), 1);
+    QCOMPARE(retried.first().value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("id")).toString(),
+             QStringLiteral("row-1"));
+    transport.deliver(chtest::errorFrame(
+        retried.first().value(QStringLiteral("id")).toInt(),
+        QStringLiteral("current lookup failed")));
+    QTRY_COMPARE(session.statusText(), QStringLiteral("current lookup failed"));
+
+    session.close();
+    factory.setWorkspaceReady(false);
+    factory.setWorkspaceReady(true);
+    QVERIFY(chtest::takeRequests(transport).isEmpty());
+}
+
+// NMM1: a QPointer becoming null must still notify bindings and erase pixels.
+void TstMobileTerminal::destroyingTheScreenInvalidatesThePaintedView()
+{
+    MobileTerminalView view;
+    view.setSize(QSizeF(view.cellWidth() * 20, view.lineHeight() * 4));
+    auto *screen = new VtScreen;
+    screen->resize(20, 4);
+    screen->write(QByteArray("old visible contents"));
+    view.setScreen(screen);
+    paintOnce(view);
+    QSignalSpy changed(&view, &MobileTerminalView::screenChanged);
+    delete screen;
+    QVERIFY(!view.screen());
+    QCOMPARE(changed.count(), 1);
+    QVERIFY(!view.pendingDamage().isEmpty());
+    const QImage image = paintOnce(view);
+    for (int y = 0; y < image.height(); ++y)
+        for (int x = 0; x < image.width(); ++x)
+            QCOMPARE(image.pixelColor(x, y), view.defaultBackgroundColor());
+}
+
+// NMM2: QML cell hit testing depends on metrics even when the grid still fits.
+void TstMobileTerminal::fontMetricsNotifyWithoutChangingTheCellCount()
+{
+    MobileTerminalView view;
+    QFont font(QStringLiteral("monospace"));
+    font.setPixelSize(16);
+    view.setFont(font);
+    view.setSize(QSizeF(1, 1));
+    const int columns = view.columns();
+    const int rows = view.rows();
+    const qreal oldHeight = view.lineHeight();
+    QSignalSpy changed(&view, &MobileTerminalView::gridChanged);
+    font.setPixelSize(32);
+    view.setFont(font);
+    QCOMPARE(view.columns(), columns);
+    QCOMPARE(view.rows(), rows);
+    QVERIFY(view.lineHeight() != oldHeight);
+    QCOMPARE(changed.count(), 1);
+}
+
+// NMM3: palette changes must invalidate the pixels below the last whole row.
+void TstMobileTerminal::backgroundChangesRepaintTheFractionalBottomGutter()
+{
+    MobileTerminalView view;
+    view.setSize(QSizeF(view.cellWidth() * 20, view.lineHeight() * 4.5));
+    VtScreen screen;
+    screen.resize(20, 4);
+    view.setScreen(&screen);
+    view.setDefaultBackgroundColor(Qt::white);
+    const QImage before = paintOnce(view);
+    const QPoint bottom(before.width() / 2, before.height() - 1);
+    QCOMPARE(before.pixelColor(bottom), QColor(Qt::white));
+    view.setDefaultBackgroundColor(Qt::black);
+    QVERIFY(view.pendingDamage().contains(bottom));
+    const QImage after = paintOnce(view);
+    QCOMPARE(after.pixelColor(bottom), QColor(Qt::black));
 }
 
 void TstMobileTerminal::gridIsDerivedFromTheFontMetric()

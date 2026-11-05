@@ -45,6 +45,7 @@ import { isSafeTmuxTarget, tmuxSafeName, TMUX_TARGET_MAX_LENGTH } from "./tmux.t
 // for "valid request, too big to move". files.ts has no import-time side
 // effects and does not import this module, so there is no cycle.
 import { ResourceLimitError } from "./files.ts";
+import { JsonSizeLimitError, stringifyJson } from "./json.ts";
 
 // Current schema version. Mirrors schema_version in remote/sql/schema.sql and
 // WorkspaceDb::kSchemaVersion (bump all three together — see schema.sql header).
@@ -422,27 +423,28 @@ function toTerminalPane(r: TerminalPaneRow): TerminalPane {
 // though duplicateSession went to the trouble of inserting fresh rows with
 // freshly minted targets for exactly the opposite outcome.
 function remapPaneIds(node: unknown, idMap: ReadonlyMap<string, string>): unknown {
-    if (node === null || typeof node !== "object") return node;
-    const n = node as Record<string, unknown>;
-    if (n.type === "leaf") {
-        // Only a STRING paneId is a pane reference. A leaf carrying anything
-        // else is malformed client data, and it is copied through untouched
-        // rather than rewritten to "" — the copy is supposed to differ from the
-        // original only in which panes it names.
-        const leaf: Record<string, unknown> = { ...n };
-        if (typeof n.paneId === "string") leaf.paneId = idMap.get(n.paneId) ?? n.paneId;
-        if (typeof n.terminalPaneId === "string" && n.terminalPaneId !== "") {
-            // An unmapped row id would name a row in ANOTHER Dev Session, which
-            // resolveTerminalPane refuses. Dropping the field instead lets the
-            // copied leaf mint a row of its own on first use.
-            const mapped = idMap.get(n.terminalPaneId);
-            if (mapped === undefined) delete leaf.terminalPaneId;
-            else leaf.terminalPaneId = mapped;
+    // The caller just parsed this tree for the copy, so it can be rewritten in
+    // place. Use an explicit stack: a deeply nested but serializable layout
+    // must not exhaust the JavaScript call stack while duplicating a session.
+    const pending: unknown[] = [node];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current === null || typeof current !== "object") continue;
+        const n = current as Record<string, unknown>;
+        if (n.type === "leaf") {
+            // Only string fields are pane references; preserve malformed data
+            // rather than replacing it with an invented empty id.
+            if (typeof n.paneId === "string") n.paneId = idMap.get(n.paneId) ?? n.paneId;
+            if (typeof n.terminalPaneId === "string" && n.terminalPaneId !== "") {
+                // A foreign row cannot belong to the duplicate. Without the
+                // field, the copied leaf can resolve its own legacy slot.
+                const mapped = idMap.get(n.terminalPaneId);
+                if (mapped === undefined) delete n.terminalPaneId;
+                else n.terminalPaneId = mapped;
+            }
+        } else if (n.type === "split" && Array.isArray(n.children)) {
+            for (const child of n.children) pending.push(child);
         }
-        return leaf;
-    }
-    if (n.type === "split" && Array.isArray(n.children)) {
-        return { ...n, children: n.children.map((child) => remapPaneIds(child, idMap)) };
     }
     return node;
 }
@@ -460,31 +462,53 @@ function remapPaneIds(node: unknown, idMap: ReadonlyMap<string, string>): unknow
 // matches remapPaneIds above.
 function removePaneFromTree(node: unknown, paneId: string): unknown | null {
     if (node === null || typeof node !== "object") return node;
-    const n = node as Record<string, unknown>;
-    if (n.type === "leaf") {
-        return n.paneId === paneId || n.terminalPaneId === paneId ? null : node;
+    // Stored trees were parsed into fresh objects. Process children before
+    // parents without putting their nesting depth on the JavaScript stack.
+    const nodes: Record<string, unknown>[] = [];
+    const pending: unknown[] = [node];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current === null || typeof current !== "object") continue;
+        const n = current as Record<string, unknown>;
+        nodes.push(n);
+        if (n.type === "split" && Array.isArray(n.children)) {
+            for (const child of n.children) pending.push(child);
+        }
     }
-    if (n.type === "split" && Array.isArray(n.children)) {
+    const repaired = new Map<object, unknown | null>();
+    for (let index = nodes.length - 1; index >= 0; index--) {
+        const n = nodes[index];
+        if (n.type === "leaf") {
+            repaired.set(n, n.paneId === paneId || n.terminalPaneId === paneId ? null : n);
+            continue;
+        }
+        if (n.type !== "split" || !Array.isArray(n.children)) {
+            repaired.set(n, n);
+            continue;
+        }
         const ratios = Array.isArray(n.ratios) ? n.ratios : [];
         const keptChildren: unknown[] = [];
         const keptRatios: number[] = [];
         n.children.forEach((child, i) => {
-            const repaired = removePaneFromTree(child, paneId);
-            if (repaired === null) return;
-            keptChildren.push(repaired);
+            const next = child !== null && typeof child === "object" ? repaired.get(child) : child;
+            if (next === null) return;
+            keptChildren.push(next);
             const r = ratios[i];
             keptRatios.push(typeof r === "number" && Number.isFinite(r) && r > 0 ? r : 1);
         });
-        if (keptChildren.length === 0) return null;
-        if (keptChildren.length === 1) return keptChildren[0];
+        if (keptChildren.length < 2) {
+            repaired.set(n, keptChildren.length === 0 ? null : keptChildren[0]);
+            continue;
+        }
         // Scale before summing so finite ratios cannot overflow their total.
         // Clamp underflow too: a zero ratio makes the repaired tree unloadable.
         const largest = keptRatios.reduce((max, r) => Math.max(max, r), 0);
         const sum = keptRatios.reduce((total, r) => total + r / largest, 0);
-        const normalized = keptRatios.map((r) => Math.max((r / largest) / sum, Number.MIN_VALUE));
-        return { ...n, children: keptChildren, ratios: normalized };
+        n.children = keptChildren;
+        n.ratios = keptRatios.map((r) => Math.max((r / largest) / sum, Number.MIN_VALUE));
+        repaired.set(n, n);
     }
-    return node;
+    return repaired.get(node);
 }
 
 // Does any leaf of this split tree reference `paneId`, by either of the two
@@ -494,11 +518,15 @@ function removePaneFromTree(node: unknown, paneId: string): unknown | null {
 // ratios), so its output is almost never equal to the stored text even when it
 // dropped nothing at all.
 function treeReferencesPane(node: unknown, paneId: string): boolean {
-    if (node === null || typeof node !== "object") return false;
-    const n = node as Record<string, unknown>;
-    if (n.type === "leaf") return n.paneId === paneId || n.terminalPaneId === paneId;
-    if (n.type === "split" && Array.isArray(n.children)) {
-        return n.children.some((child) => treeReferencesPane(child, paneId));
+    const pending: unknown[] = [node];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current === null || typeof current !== "object") continue;
+        const n = current as Record<string, unknown>;
+        if (n.type === "leaf" && (n.paneId === paneId || n.terminalPaneId === paneId)) return true;
+        if (n.type === "split" && Array.isArray(n.children)) {
+            for (const child of n.children) pending.push(child);
+        }
     }
     return false;
 }
@@ -628,6 +656,76 @@ const DB_BUSY_TIMEOUT_MS = 5000;
 // omitting stored data from a listing, which is a worse contract than refusing
 // absurd input on the way in.
 export const MAX_LAYOUT_TREE_BYTES = 256 * 1024;
+
+// Server-derived trees can grow when deletion normalizes terse input weights
+// into finite positive JSON numbers (up to 24 characters each). A child and its
+// separator already consume roughly two input bytes; 16x also covers ratio-key
+// overhead and remapping short legacy pane references to UUIDs. Keep this
+// internal budget separate from the unchanged public-input cap.
+const MAX_DERIVED_LAYOUT_TREE_BYTES = 16 * MAX_LAYOUT_TREE_BYTES;
+
+function serializeLayoutTree(
+    tree: unknown, region: Region, method: string, maxBytes = MAX_LAYOUT_TREE_BYTES,
+): string {
+    try {
+        const serialized = stringifyJson(tree, maxBytes);
+        if (serialized === undefined) throw new Error("value has no JSON representation");
+        return serialized;
+    } catch (err) {
+        if (err instanceof JsonSizeLimitError) {
+            throw new ResourceLimitError(
+                `Cannot store the ${region} layout: its split tree serializes to at least ` +
+                    `${err.bytes} bytes, above this server's ${err.maxBytes}-byte ` +
+                    "per-region limit. Nothing was changed; the previously stored layout is " +
+                    "still in place. Close some panes, or shorten their custom titles.",
+            );
+        }
+        throw new InvalidParamsError(
+            `${method}: 'tree' must be a JSON-serializable split tree (${
+                err instanceof Error ? err.message : String(err)
+            })`,
+        );
+    }
+}
+
+// Initial terminal leaves contain slot labels, not existing row identities.
+// Validate the entire template before creating any of its panes.
+function initialTerminalLeaves(tree: unknown): Record<string, unknown>[] {
+    const leaves: Record<string, unknown>[] = [];
+    const names = new Set<string>();
+    const pending: unknown[] = [tree];
+    while (pending.length > 0) {
+        const node = pending.pop();
+        if (node === null || typeof node !== "object" || Array.isArray(node)) {
+            throw new InvalidParamsError("workspace.ensureInitialLayout: invalid terminal split tree");
+        }
+        const n = node as Record<string, unknown>;
+        if (n.type === "leaf") {
+            if (
+                typeof n.paneId !== "string" ||
+                (n.terminalPaneId !== undefined && n.terminalPaneId !== "")
+            ) {
+                throw new InvalidParamsError(
+                    "workspace.ensureInitialLayout: terminal leaves require a paneId label and no owned terminalPaneId",
+                );
+            }
+            if (n.paneId === "") continue;
+            if (names.has(n.paneId)) {
+                throw new InvalidParamsError(
+                    "workspace.ensureInitialLayout: terminal paneId labels must be distinct",
+                );
+            }
+            names.add(n.paneId);
+            leaves.push(n);
+        } else if (n.type === "split" && Array.isArray(n.children) && n.children.length > 0) {
+            // Reverse the work stack so pane positions follow template order.
+            for (let index = n.children.length - 1; index >= 0; index--) pending.push(n.children[index]);
+        } else {
+            throw new InvalidParamsError("workspace.ensureInitialLayout: invalid terminal split tree");
+        }
+    }
+    return leaves;
+}
 
 /**
  * Apply the connection-level settings every workspace connection needs, in the
@@ -1668,7 +1766,10 @@ export class Workspace {
                     );
                     continue;
                 }
-                const tree = JSON.stringify(remapPaneIds(parsed, idMap));
+                const tree = serializeLayoutTree(
+                    remapPaneIds(parsed, idMap), l.region, "workspace.duplicateSession",
+                    MAX_DERIVED_LAYOUT_TREE_BYTES,
+                );
                 insertLayout.run(randomUUID(), targetServerId, newSessionId, l.region, tree, ts, ts);
             }
 
@@ -2075,6 +2176,42 @@ export class Workspace {
         };
     }
 
+    // Seed a missing region without letting two clients mint different initial
+    // terminals and then overwrite each other's layout. Presence, not tree
+    // truthiness, decides: a stored empty/null tree is still the user's layout.
+    ensureInitialLayout(params: SetLayoutParams): SessionLayout {
+        return this.transaction(() => {
+            this.parentServerId("dev_sessions", params.devSessionId);
+            const exists = this.db
+                .prepare("SELECT 1 FROM session_layouts WHERE dev_session_id = ? AND region = ?")
+                .get(params.devSessionId, params.region);
+            if (exists) {
+                const stored = this.getLayout(params);
+                if (!stored) {
+                    throw new Error(
+                        `workspace.ensureInitialLayout: existing layout is unreadable: ${params.devSessionId}/${params.region}`,
+                    );
+                }
+                return stored;
+            }
+            if (params.region === "viewer") return this.setLayout(params);
+            const tree: unknown = JSON.parse(
+                serializeLayoutTree(params.tree, params.region, "workspace.ensureInitialLayout"),
+            );
+            const leaves = initialTerminalLeaves(tree);
+            for (const leaf of leaves) {
+                const pane = this.createTerminalPane({
+                    serverId: params.serverId,
+                    devSessionId: params.devSessionId,
+                    name: leaf.paneId as string,
+                    harness: "generic",
+                });
+                leaf.terminalPaneId = pane.id;
+            }
+            return this.setLayout({ ...params, tree });
+        });
+    }
+
     // Store the region's split tree, replacing any tree already there. A single
     // upsert keyed on the schema's UNIQUE (dev_session_id, region) does it: the
     // previous SELECT-then-INSERT-or-UPDATE could have two connections both see
@@ -2092,42 +2229,8 @@ export class Workspace {
         // read-back: without it a second connection writing the same region in
         // between makes this call RETURN that other tree as if it were the one
         // it just stored, and the client then renders a layout it never saved.
-        // Serialized BEFORE the transaction opens, and checked: `tree` is
-        // free-form client JSON, and JSON.stringify answers `undefined` for a
-        // value that has no JSON form at all (undefined itself, a function, a
-        // symbol) and THROWS for a circular structure or a BigInt. Both used to
-        // reach node:sqlite, the first as a bind value the driver rejects with
-        // an opaque type error naming no field, the second as an exception
-        // rolling back a transaction that had already been opened. `tree` is
-        // NOT NULL in the schema, so there is no column value to fall back to.
-        let serializedTree: string;
-        try {
-            const json = JSON.stringify(params.tree);
-            if (json === undefined) throw new Error("value has no JSON representation");
-            serializedTree = json;
-        } catch (err) {
-            throw new InvalidParamsError(
-                `workspace.setLayout: 'tree' must be a JSON-serializable split tree (${
-                    err instanceof Error ? err.message : String(err)
-                })`,
-            );
-        }
-        // Bounded here, still before the transaction opens, so an over-cap tree
-        // costs the database nothing at all: no BEGIN, no upsert, no rollback,
-        // and whatever was already stored for the region is left untouched. See
-        // MAX_LAYOUT_TREE_BYTES for the measurement behind the number and for
-        // what an unbounded tree does to `workspace.list`. Raised as a
-        // ResourceLimitError (-32003), not invalid-params: the tree is
-        // well-formed, the server simply will not carry it at that size.
-        const treeBytes = Buffer.byteLength(serializedTree);
-        if (treeBytes > MAX_LAYOUT_TREE_BYTES) {
-            throw new ResourceLimitError(
-                `Cannot store the ${params.region} layout: its split tree serializes to ` +
-                    `${treeBytes} bytes, above this server's ${MAX_LAYOUT_TREE_BYTES}-byte ` +
-                    "per-region limit. Nothing was changed; the previously stored layout is " +
-                    "still in place. Close some panes, or shorten their custom titles.",
-            );
-        }
+        // Validate and bound client JSON before opening the write transaction.
+        const serializedTree = serializeLayoutTree(params.tree, params.region, "workspace.setLayout");
         return this.transaction(() => {
             const serverId = this.parentServerId("dev_sessions", params.devSessionId);
             const ts = Date.now();
@@ -2189,7 +2292,9 @@ export class Workspace {
         if (!treeReferencesPane(tree, paneId)) return;
         const repaired = removePaneFromTree(tree, paneId);
         const finalTree = repaired === null ? { type: "leaf", paneId: "" } : repaired;
-        const serialized = JSON.stringify(finalTree);
+        const serialized = serializeLayoutTree(
+            finalTree, region, "workspace.deletePane", MAX_DERIVED_LAYOUT_TREE_BYTES,
+        );
         if (serialized === row.tree) return;
         this.db
             .prepare("UPDATE session_layouts SET tree = ?, updated_at = ? WHERE id = ?")
@@ -2846,5 +2951,13 @@ export const WORKSPACE_METHODS: Record<RpcWorkspaceMethodName, (params: unknown)
         // the SQLite driver rejects with an opaque type error naming no field.
         const tree = requireDefined(o, "tree", M.setLayout);
         return workspace().setLayout({ serverId, devSessionId, region, tree });
+    },
+    [M.ensureInitialLayout]: (p) => {
+        const o = requireObject(p, M.ensureInitialLayout);
+        const serverId = requireString(o, "serverId", M.ensureInitialLayout);
+        const devSessionId = requireString(o, "devSessionId", M.ensureInitialLayout);
+        const region = requireOneOf(o, "region", M.ensureInitialLayout, REGIONS);
+        const tree = requireDefined(o, "tree", M.ensureInitialLayout);
+        return workspace().ensureInitialLayout({ serverId, devSessionId, region, tree });
     },
 };

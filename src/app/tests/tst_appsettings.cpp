@@ -324,6 +324,20 @@ void TstAppSettings::genericPairsCannotForgeAValidatedKey()
     s.setValue(QStringLiteral("viewerDefaults"), QStringLiteral("md"),
                QStringLiteral("binary"));
 
+    // Windows resolves both native and INI keys without regard to case, and
+    // also interprets backslashes as separators. Reject these portable aliases
+    // before they can reach a named property without its NOTIFY signal.
+    s.setValue(QStringLiteral("Appearance"), QStringLiteral("terminalFontSize"),
+               0);
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("THEME"),
+               QStringLiteral("light"));
+    s.setValue(QStringLiteral("ViewerDefaults"), QStringLiteral("md"),
+               QStringLiteral("binary"));
+    s.setValue(QStringLiteral("appearance\\"), QStringLiteral("theme"),
+               QStringLiteral("light"));
+    s.setValue(QStringLiteral("appearance"), QStringLiteral("\\theme"),
+               QStringLiteral("light"));
+
     // Nothing was written, so nothing moved and nothing was announced.
     QCOMPARE(settingSpy.count(), 0);
     QCOMPARE(fontSpy.count(), 0);

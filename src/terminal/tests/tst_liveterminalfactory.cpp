@@ -31,6 +31,9 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QString>
+#include <QStringList>
+#include <QStringView>
+#include <QTemporaryDir>
 #include <QtTest/QtTest>
 
 #include <functional>
@@ -77,6 +80,34 @@ bool fixtureListenerCommandMatches(QString commandLine, const QString& configPat
     return expected.match(commandLine.trimmed()).hasMatch();
 }
 
+bool fixtureConfigurationMatches(const QStringList& lines, const QString& fixtureDir,
+                                 quint16 port)
+{
+    const QStringList required{
+        QStringLiteral("Port %1").arg(port),
+        QStringLiteral("ListenAddress 127.0.0.1"),
+        QStringLiteral("HostKey \"%1/hostkey\"").arg(fixtureDir),
+        QStringLiteral("AuthorizedKeysFile \"%1/authorized_keys\"").arg(fixtureDir),
+        QStringLiteral("PidFile \"%1/sshd.pid\"").arg(fixtureDir),
+        QStringLiteral("SetEnv \"CODEHARBOR_DB=%1/workspace.sqlite\" "
+                       "\"XDG_RUNTIME_DIR=%1/runtime\" \"XDG_DATA_HOME=%1/data\" "
+                       "\"HISTFILE=/dev/null\" \"TMUX_TMPDIR=%1/tmux\"").arg(fixtureDir),
+    };
+    for (const QString& line : required) {
+        if (!lines.contains(line))
+            return false;
+    }
+    // A second directive could override a namespace after the validated one.
+    // OpenSSH keywords are case-insensitive; do not accept a disguised override.
+    int environmentDirectives = 0;
+    for (const QString& line : lines) {
+        if (QStringView(line).trimmed().startsWith(QStringView(u"SetEnv"),
+                                                 Qt::CaseInsensitive))
+            ++environmentDirectives;
+    }
+    return environmentDirectives == 1;
+}
+
 } // namespace
 
 class TstLiveTerminalFactory : public QObject {
@@ -87,6 +118,8 @@ private slots:
 
     void fixtureListenerMatchingPinsTheGeneratedConfig_data();
     void fixtureListenerMatchingPinsTheGeneratedConfig();
+    void fixtureConfigurationPinsEveryWritableNamespace_data();
+    void fixtureConfigurationPinsEveryWritableNamespace();
     void factoryAttachDeliversRemoteMarkerThroughTheBridge();
     void detachReleasesTheChannelButKeepsTheRemoteSession();
     void anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNothing();
@@ -112,6 +145,7 @@ private:
     // shape of the incident this case exists for.
     bool severTheNetwork();
 
+    QTemporaryDir m_knownHostsDirectory;
     SshConnectionPool m_pool;
     TerminalFactory* m_factory = nullptr;
     QObject* m_pane = nullptr;  // stands in for the QML pane that owns the pair
@@ -147,8 +181,9 @@ void TstLiveTerminalFactory::initTestCase()
     m_repo = env("CH_LIVE_REPO");
     m_knownHostsPath = env("CH_LIVE_KNOWN_HOSTS");
     if (m_knownHostsPath.isEmpty()) {
-        m_knownHostsPath =
-            QDir::temp().filePath(QStringLiteral("ch_live_terminal_factory_known_hosts"));
+        QVERIFY2(m_knownHostsDirectory.isValid(),
+                 qPrintable(m_knownHostsDirectory.errorString()));
+        m_knownHostsPath = m_knownHostsDirectory.filePath(QStringLiteral("known_hosts"));
     }
 
     QVERIFY2(!m_host.isEmpty() && m_port != 0 && !m_user.isEmpty() && !m_repo.isEmpty(),
@@ -198,7 +233,7 @@ void TstLiveTerminalFactory::initTestCase()
 
     // The page has mounted, as far as the bridge is concerned: without this the
     // controller buffers instead of emitting write() (SPEC 5.4).
-    m_bridge->ready();
+    m_bridge->ready(true);
 }
 
 void TstLiveTerminalFactory::cleanupTestCase()
@@ -267,7 +302,8 @@ bool TstLiveTerminalFactory::typeUntil(const QByteArray& command,
     while (!done() && clock.elapsed() < timeoutMs) {
         if (clock.elapsed() >= nextSend) {
             // Through the BRIDGE, i.e. the same slot the xterm.js page calls.
-            m_bridge->sendInput(QString::fromLatin1(command) + QLatin1Char('\n'));
+            m_bridge->sendInput(QString::fromLatin1(command) + QLatin1Char('\n'),
+                                m_bridge->inputGeneration());
             nextSend = clock.elapsed() + kRetypeIntervalMs;
         }
         QTest::qWait(100);
@@ -355,18 +391,8 @@ bool TstLiveTerminalFactory::severTheNetwork()
     if (!config.open(QIODevice::ReadOnly))
         return false;
     const QStringList lines = QString::fromUtf8(config.readAll()).split(QLatin1Char('\n'));
-    const QStringList required{
-        QStringLiteral("Port %1").arg(m_port),
-        QStringLiteral("ListenAddress 127.0.0.1"),
-        QStringLiteral("HostKey \"%1/hostkey\"").arg(fixtureDir),
-        QStringLiteral("AuthorizedKeysFile \"%1/authorized_keys\"").arg(fixtureDir),
-        QStringLiteral("PidFile \"%1/sshd.pid\"").arg(fixtureDir),
-        QStringLiteral("SetEnv \"CODEHARBOR_DB=%1/workspace.sqlite\"").arg(fixtureDir),
-    };
-    for (const QString& line : required) {
-        if (!lines.contains(line))
-            return false;
-    }
+    if (!fixtureConfigurationMatches(lines, fixtureDir, m_port))
+        return false;
     QFile pidFile(pidPath);
     if (!pidFile.open(QIODevice::ReadOnly))
         return false;
@@ -434,6 +460,71 @@ void TstLiveTerminalFactory::fixtureListenerMatchingPinsTheGeneratedConfig()
     QFETCH(bool, matches);
     QCOMPARE(fixtureListenerCommandMatches(command,
                                           QStringLiteral("/fixture/a.[x]/sshd_config")),
+             matches);
+}
+
+void TstLiveTerminalFactory::fixtureConfigurationPinsEveryWritableNamespace_data()
+{
+    QTest::addColumn<QStringList>("lines");
+    QTest::addColumn<bool>("matches");
+    const QString fixtureDir = QStringLiteral("/fixture/a.[x]");
+    const QStringList generated{
+        QStringLiteral("Port 24444"),
+        QStringLiteral("ListenAddress 127.0.0.1"),
+        QStringLiteral("HostKey \"/fixture/a.[x]/hostkey\""),
+        QStringLiteral("AuthorizedKeysFile \"/fixture/a.[x]/authorized_keys\""),
+        QStringLiteral("PidFile \"/fixture/a.[x]/sshd.pid\""),
+        QStringLiteral("SetEnv \"CODEHARBOR_DB=/fixture/a.[x]/workspace.sqlite\" "
+                       "\"XDG_RUNTIME_DIR=/fixture/a.[x]/runtime\" "
+                       "\"XDG_DATA_HOME=/fixture/a.[x]/data\" \"HISTFILE=/dev/null\" "
+                       "\"TMUX_TMPDIR=/fixture/a.[x]/tmux\""),
+    };
+    QTest::newRow("generated-five-namespace-contract") << generated << true;
+    struct Namespace {
+        const char* changedRow;
+        const char* missingRow;
+        QString name;
+        QString expected;
+        QString outside;
+    };
+    const Namespace namespaces[]{
+        {"foreign-database", "missing-database", QStringLiteral("CODEHARBOR_DB"),
+         fixtureDir + QStringLiteral("/workspace.sqlite"), QStringLiteral("/real/workspace.sqlite")},
+        {"foreign-runtime", "missing-runtime", QStringLiteral("XDG_RUNTIME_DIR"),
+         fixtureDir + QStringLiteral("/runtime"), QStringLiteral("/run/user/1000")},
+        {"foreign-data", "missing-data", QStringLiteral("XDG_DATA_HOME"),
+         fixtureDir + QStringLiteral("/data"), QStringLiteral("/home/user/.local/share")},
+        {"enabled-history", "missing-history", QStringLiteral("HISTFILE"),
+         QStringLiteral("/dev/null"), QStringLiteral("/home/user/.bash_history")},
+        {"foreign-tmux", "missing-tmux", QStringLiteral("TMUX_TMPDIR"),
+         fixtureDir + QStringLiteral("/tmux"), QStringLiteral("/tmp")},
+    };
+    for (const Namespace& item : namespaces) {
+        const QString assignment = QStringLiteral("\"%1=%2\"").arg(item.name, item.expected);
+        QStringList changed = generated;
+        changed.last().replace(assignment,
+                               QStringLiteral("\"%1=%2\"").arg(item.name, item.outside));
+        QTest::newRow(item.changedRow) << changed << false;
+        QStringList missing = generated;
+        missing.last().remove(QLatin1Char(' ') + assignment);
+        QTest::newRow(item.missingRow) << missing << false;
+    }
+    QStringList override = generated;
+    override.append(QStringLiteral("sEtEnV \"XDG_RUNTIME_DIR=/run/user/1000\""));
+    QTest::newRow("second-environment-override") << override << false;
+    QStringList duplicate = generated;
+    duplicate.append(generated.last());
+    QTest::newRow("duplicate-environment-directive") << duplicate << false;
+    QStringList foreignPort = generated;
+    foreignPort.first() = QStringLiteral("Port 22");
+    QTest::newRow("foreign-listener-port") << foreignPort << false;
+}
+
+void TstLiveTerminalFactory::fixtureConfigurationPinsEveryWritableNamespace()
+{
+    QFETCH(QStringList, lines);
+    QFETCH(bool, matches);
+    QCOMPARE(fixtureConfigurationMatches(lines, QStringLiteral("/fixture/a.[x]"), 24444),
              matches);
 }
 

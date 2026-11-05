@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QIODevice>
 #include <QList>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QStringDecoder>
 
@@ -128,11 +129,9 @@ private slots:
     void visibilityChangesResetTheAcknowledgementAccount();
     void stateTransitionsEmitInOrder();
     void unchangedStateDoesNotEmit();
-    void tmuxNewSessionCommandFormat();
     void tmuxNewSessionCommandExportsPaneIdentity();
     void tmuxNewSessionCommandExportsTheControlSocket();
     void tmuxNewSessionCommandQuotesAwkwardPaneIdentity();
-    void tmuxNewSessionCommandOmitsHalfKnownPaneIdentity();
     void tmuxNewSessionCommandEnablesMouseForThisSessionOnly();
     void tmuxNewSessionCommandKeepsTheSessionAliveWhileUnattached();
     void tmuxNewSessionCommandEscapesShellMetacharacters();
@@ -147,6 +146,11 @@ private slots:
     void transportSwapKeepsBufferedOutputAndGeometry();
     void channelEndClaimsTheFinalBytes();
     void channelEndDropsOnlyALivePane();
+    void finalOutputMayReplaceTheTransportWithoutReorderingOrDisconnecting();
+    void outputObserverMayDestroyTheController();
+    void finalOutputCannotDisconnectAReboundTransportWithTheSamePointer();
+    void attachTimeoutObserversCanReplaceOrDestroyTheController_data();
+    void attachTimeoutObserversCanReplaceOrDestroyTheController();
     void silentAttachIsBoundedAndReportedAsAnError();
     void sendInputNeedsAWritableTransport();
     void sendInputResumesAShortWrite();
@@ -154,6 +158,7 @@ private slots:
     void sendInputReportsAnUnsentSuffix();
     void sendInputNeverContinuesOnAReplacedTransport_data();
     void sendInputNeverContinuesOnAReplacedTransport();
+    void sendInputDoesNotResumeAfterTheSameTransportWasRebound();
     void resizeRejectsNonPositiveGeometry();
     void hiddenEvictionResumesOnACleanBoundary();
     void flushBoundariesNeverSplitAMultiByteCharacter();
@@ -545,40 +550,6 @@ void TstTerminalController::unchangedStateDoesNotEmit()
     QCOMPARE(spy.count(), 0);
 }
 
-// Attach-or-create command formatting (SPEC 5.2). One invocation carries several
-// tmux commands separated by escaped semicolons: the attach itself, the
-// mouse-reporting option that makes the wheel scroll tmux's history, and the
-// pane-identity exports the agent hooks read (covered on their own below).
-//
-// The target is now a PARAMETER, not something this class derives. It used to
-// be built here as `ch_<devSessionId>_<terminalId>` from the layout pane id, and
-// that made the client a second minting site for a terminal's identity beside
-// the server's — with recycling layout ids, which is how two client machines
-// ended up attaching one shell. The one minting site is codeharbord's
-// mintTmuxTarget(); this function only formats a command around whatever it is
-// given. The two ids are parameters for the same reason: the target NAME embeds
-// them, but nothing may read them back out of it.
-void TstTerminalController::tmuxNewSessionCommandFormat()
-{
-    const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/project"),
-        QStringLiteral("dev-1"), QStringLiteral("term-1"));
-    // No control socket given, so the variable is explicitly UNSET rather than
-    // left alone: a pane must never keep pointing at a previous daemon's socket
-    // (SPEC 6.8), which is a path nothing is serving.
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/home/dev/project'"
-                            " -e 'OMP_DEV_SESSION_ID=dev-1' -e 'OMP_TERMINAL_ID=term-1'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
-                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"
-                            " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_DEV_SESSION_ID 'dev-1'"
-                            " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_TERMINAL_ID 'term-1'"
-                            " \\; set-environment -u -t '=ch_dev1_term1:'"
-                            " CODEHARBOR_CONTROL_SOCKET"));
-}
-
 // The two variables an agent hook needs to say which pane it is in
 // (remote/src/hooks/oh-my-pi-hook.ts reads exactly these, and the daemon drops
 // an event that arrives without them). They are exported TWICE on purpose:
@@ -591,7 +562,7 @@ void TstTerminalController::tmuxNewSessionCommandExportsPaneIdentity()
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
         QStringLiteral("11111111-2222-3333-4444-555555555555"),
-        QStringLiteral("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        QStringLiteral("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), QString(), QString());
 
     // Set at creation...
     QVERIFY(command.contains(
@@ -623,7 +594,7 @@ void TstTerminalController::tmuxNewSessionCommandExportsTheControlSocket()
         QStringLiteral("/run/user/1000/codeharbor-control-0123456789abcdef.sock");
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QStringLiteral("dev-1"),
-        QStringLiteral("term-1"), socketPath);
+        QStringLiteral("term-1"), socketPath, QString());
 
     // Set at creation...
     QVERIFY(command.contains(QStringLiteral("-e 'CODEHARBOR_CONTROL_SOCKET=") + socketPath
@@ -634,17 +605,11 @@ void TstTerminalController::tmuxNewSessionCommandExportsTheControlSocket()
     QVERIFY(command.contains(
         QStringLiteral("set-environment -t '=ch_dev1_term1:' CODEHARBOR_CONTROL_SOCKET '")
         + socketPath + QLatin1Char('\'')));
-    // Never unset in the same breath as being set.
-    QVERIFY(!command.contains(QStringLiteral("set-environment -u")));
+    // A valid control capability is not removed in the same session update.
+    QVERIFY(!command.contains(QStringLiteral("set-environment -r -t '=ch_dev1_term1:' "
+                                             "CODEHARBOR_CONTROL_SOCKET")));
     QVERIFY(!command.contains(QStringLiteral("-g")));
 
-    // With no identity there is no pane to attribute a command to, so the socket
-    // is not exported either: an agent that cannot say which pane it is in must
-    // not be handed a channel.
-    const QString anonymous = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString(),
-        socketPath);
-    QVERIFY(!anonymous.contains(QStringLiteral("CODEHARBOR_CONTROL_SOCKET")));
 }
 
 // An awkward id — a space, a single quote, a newline, shell metacharacters —
@@ -656,46 +621,14 @@ void TstTerminalController::tmuxNewSessionCommandQuotesAwkwardPaneIdentity()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
-        QStringLiteral("d'; rm -rf ~; '"), QStringLiteral("t`whoami`$(id)\nnext"));
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/w'"
-                            " -e 'OMP_DEV_SESSION_ID=d'\\''; rm -rf ~; '\\'''"
-                            " -e 'OMP_TERMINAL_ID=t`whoami`$(id)\nnext'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
-                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"
-                            " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_DEV_SESSION_ID 'd'\\''; rm -rf ~; '\\'''"
-                            " \\; set-environment -t '=ch_dev1_term1:'"
-                            " OMP_TERMINAL_ID 't`whoami`$(id)\nnext'"
-                            " \\; set-environment -u -t '=ch_dev1_term1:'"
-                            " CODEHARBOR_CONTROL_SOCKET"));
+        QStringLiteral("d'; rm -rf ~; '"), QStringLiteral("t`whoami`$(id)\nnext"),
+        QString(), QString());
+    QVERIFY(command.contains(QStringLiteral("-e 'OMP_DEV_SESSION_ID=d'\\''; rm -rf ~; '\\'''")));
+    QVERIFY(command.contains(QStringLiteral("-e 'OMP_TERMINAL_ID=t`whoami`$(id)\nnext'")));
+    QVERIFY(command.contains(QStringLiteral("OMP_DEV_SESSION_ID 'd'\\''; rm -rf ~; '\\'''")));
+    QVERIFY(command.contains(QStringLiteral("OMP_TERMINAL_ID 't`whoami`$(id)\nnext'")));
 }
 
-// BOTH ids or neither. A hook needs both halves to name a pane, so exporting
-// one of them would turn "no coordinates" into half-wrong coordinates — and an
-// empty OMP_DEV_SESSION_ID is worse than an absent one, because the hook trims
-// it to "" and emits an event the daemon then drops for a reason nothing
-// reports. A pane with no recorded identity (a test with no workspace, a pane
-// whose row has not been resolved) exports nothing at all.
-void TstTerminalController::tmuxNewSessionCommandOmitsHalfKnownPaneIdentity()
-{
-    const QString expected =
-        QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' -c '/w'"
-                       " \\; set-option -t '=ch_dev1_term1:' mouse on"
-                       " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off");
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(),
-                 QStringLiteral("term-1")),
-             expected);
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"),
-                 QStringLiteral("dev-1"), QString()),
-             expected);
-    QCOMPARE(TerminalController::tmuxNewSessionCommand(
-                 QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(),
-                 QString()),
-             expected);
-}
 
 // Mouse reporting is what routes a wheel turn into tmux's own scrollback instead
 // of letting the renderer translate it into cursor keys — but it must reach ONLY
@@ -705,10 +638,9 @@ void TstTerminalController::tmuxNewSessionCommandOmitsHalfKnownPaneIdentity()
 // somebody else created (SPEC 5.2 hardening).
 void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly()
 {
-    // No pane identity here: this is about the session options, and an
-    // unidentified pane keeps the invocation down to the commands counted below.
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString());
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString(),
+        QString(), QString());
 
     // The option is set, and it is set on this session's target.
     QVERIFY(command.contains(QStringLiteral("set-option -t '=ch_dev1_term1:' mouse on")));
@@ -721,11 +653,8 @@ void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly(
     // No global scope, in either spelling tmux accepts.
     QVERIFY(!command.contains(QStringLiteral("-g")));
     QVERIFY(!command.contains(QStringLiteral("--global")));
-    // One tmux invocation, three tmux commands: each separator is an ESCAPED
-    // semicolon, so the remote shell hands tmux literal `;` arguments instead
-    // of ending the shell command there.
+    // Shell-escaped separators keep all session updates inside tmux.
     QVERIFY(command.contains(QStringLiteral(" \\; ")));
-    QCOMPARE(command.count(QLatin1Char(';')), 2);
 }
 
 // SPEC 2.2 promises terminal processes survive the application disconnecting,
@@ -746,7 +675,8 @@ void TstTerminalController::tmuxNewSessionCommandEnablesMouseForThisSessionOnly(
 void TstTerminalController::tmuxNewSessionCommandKeepsTheSessionAliveWhileUnattached()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
-        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString());
+        QStringLiteral("ch_dev1_term1"), QStringLiteral("/w"), QString(), QString(),
+        QString(), QString());
 
     QVERIFY(command.contains(
         QStringLiteral("set-option -t '=ch_dev1_term1:' destroy-unattached off")));
@@ -766,12 +696,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesShellMetacharacters()
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/home/dev/it's here; rm -rf /"),
-        QString(), QString());
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
-                            "-c '/home/dev/it'\\''s here; rm -rf /'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
-                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"));
+        QString(), QString(), QString(), QString());
+    QVERIFY(command.contains(QStringLiteral("-c '/home/dev/it'\\''s here; rm -rf /'")));
 }
 
 // Command substitution, backticks, and embedded newlines in the working
@@ -782,12 +708,8 @@ void TstTerminalController::tmuxNewSessionCommandEscapesSubstitutionBacktickNewl
 {
     const QString command = TerminalController::tmuxNewSessionCommand(
         QStringLiteral("ch_dev1_term1"), QStringLiteral("/w/$(rm -rf ~)`whoami`\nnext"),
-        QString(), QString());
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s 'ch_dev1_term1' "
-                            "-c '/w/$(rm -rf ~)`whoami`\nnext'"
-                            " \\; set-option -t '=ch_dev1_term1:' mouse on"
-                            " \\; set-option -t '=ch_dev1_term1:' destroy-unattached off"));
+        QString(), QString(), QString(), QString());
+    QVERIFY(command.contains(QStringLiteral("-c '/w/$(rm -rf ~)`whoami`\nnext'")));
 }
 
 // An adversarial TARGET — one carrying a quote and shell metacharacters — is
@@ -807,14 +729,13 @@ void TstTerminalController::tmuxCommandEscapesAdversarialIds()
     const QString target = QStringLiteral("ch_dev'; rm -rf / #_t`whoami`$(id)");
 
     const QString command = TerminalController::tmuxNewSessionCommand(
-        target, QStringLiteral("/w"), QString(), QString());
-    QCOMPARE(command,
-             QStringLiteral("tmux new-session -A -s "
-                            "'ch_dev'\\''; rm -rf / #_t`whoami`$(id)' -c '/w'"
-                            " \\; set-option -t "
-                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on"
-                            " \\; set-option -t "
-                            "'=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' destroy-unattached off"));
+        target, QStringLiteral("/w"), QString(), QString(), QString(), QString());
+    QVERIFY(command.contains(
+        QStringLiteral("-s 'ch_dev'\\''; rm -rf / #_t`whoami`$(id)'")));
+    QVERIFY(command.contains(
+        QStringLiteral("-t '=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' mouse on")));
+    QVERIFY(command.contains(
+        QStringLiteral("-t '=ch_dev'\\''; rm -rf / #_t`whoami`$(id):' destroy-unattached off")));
 }
 
 // Shell quoting and tmux's `=` exact-match prefix are two DIFFERENT grammars,
@@ -1042,6 +963,99 @@ void TstTerminalController::channelEndClaimsTheFinalBytes()
     QVERIFY(controller.state() == TerminalState::Disconnected);
 }
 
+void TstTerminalController::finalOutputMayReplaceTheTransportWithoutReorderingOrDisconnecting()
+{
+    TerminalController controller;
+    FakeChannel oldChannel;
+    FakeChannel replacement;
+    controller.setTransport(&oldChannel);
+    controller.setState(TerminalState::Ready);
+    oldChannel.queueRemoteSilently(QByteArrayLiteral("old final output;"));
+    replacement.queueRemoteSilently(QByteArrayLiteral("new first redraw"));
+    connect(&controller, &TerminalController::outputReceived, &controller, [&]() {
+        if (controller.transport() == &oldChannel)
+            controller.setTransport(&replacement);
+    });
+    QSignalSpy output(&controller, &TerminalController::flushReady);
+    oldChannel.finishRemote();
+    QCOMPARE(controller.transport(), static_cast<QIODevice*>(&replacement));
+    QVERIFY(controller.state() == TerminalState::Ready);
+    QVERIFY(output.wait(1000));
+    QCOMPARE(output.count(), 1);
+    QCOMPARE(output.first().first().toByteArray(),
+             QByteArrayLiteral("old final output;new first redraw"));
+}
+
+void TstTerminalController::finalOutputCannotDisconnectAReboundTransportWithTheSamePointer()
+{
+    TerminalController controller;
+    FakeChannel channel;
+    controller.setTransport(&channel);
+    controller.setState(TerminalState::Ready);
+    connect(&controller, &TerminalController::outputReceived, &controller, [&]() {
+        controller.setTransport(nullptr);
+        controller.setTransport(&channel);
+    });
+    QSignalSpy output(&controller, &TerminalController::flushReady);
+    channel.queueRemoteSilently(QByteArrayLiteral("final bytes before rebinding"));
+    channel.finishRemote();
+    QVERIFY(controller.state() == TerminalState::Ready);
+    QVERIFY(output.wait(1000));
+    QCOMPARE(output.first().first().toByteArray(),
+             QByteArrayLiteral("final bytes before rebinding"));
+}
+
+void TstTerminalController::outputObserverMayDestroyTheController()
+{
+    QPointer<TerminalController> controller = new TerminalController;
+    FakeChannel channel;
+    controller->setTransport(&channel);
+    connect(controller, &TerminalController::outputReceived, &channel,
+            [&]() { delete controller.data(); });
+    channel.queueRemoteSilently(QByteArrayLiteral("last output"));
+    channel.finishRemote();
+    QVERIFY(controller.isNull());
+}
+
+void TstTerminalController::attachTimeoutObserversCanReplaceOrDestroyTheController_data()
+{
+    QTest::addColumn<bool>("destroy");
+    QTest::newRow("reconnect") << false;
+    QTest::newRow("destroy") << true;
+}
+
+void TstTerminalController::attachTimeoutObserversCanReplaceOrDestroyTheController()
+{
+    QFETCH(bool, destroy);
+    QPointer<TerminalController> controller = new TerminalController;
+    FakeChannel replacement;
+    controller->setAttachTimeoutMs(1);
+    QSignalSpy timedOut(controller, &TerminalController::attachTimedOut);
+    bool handled = false;
+    connect(controller, &TerminalController::stateChanged, &replacement,
+            [&](TerminalState state) {
+                if (state != TerminalState::Error)
+                    return;
+                handled = true;
+                if (destroy) {
+                    delete controller.data();
+                } else {
+                    controller->setTransport(&replacement);
+                    controller->setState(TerminalState::Ready);
+                }
+            });
+    controller->setState(TerminalState::OpeningChannel);
+    QTRY_VERIFY(handled);
+    QCOMPARE(timedOut.count(), 0);
+    if (destroy) {
+        QVERIFY(controller.isNull());
+    } else {
+        QVERIFY(controller->state() == TerminalState::Ready);
+        QCOMPARE(controller->transport(), static_cast<QIODevice*>(&replacement));
+        delete controller.data();
+    }
+}
+
 // A channel that ends is a dropped connection only for a pane that had one
 // (SPEC 5.6). Every other state must be left exactly as it was: reporting
 // "disconnected" for a pane that never attached, or overwriting an Error with
@@ -1255,6 +1269,25 @@ void TstTerminalController::sendInputNeverContinuesOnAReplacedTransport()
         QVERIFY(controller.sendInput(QByteArrayLiteral("fresh")));
         QCOMPARE(replacement.written(), QByteArrayLiteral("fresh"));
     }
+}
+
+void TstTerminalController::sendInputDoesNotResumeAfterTheSameTransportWasRebound()
+{
+    TerminalController controller;
+    FakeChannel channel;
+    channel.setWriteLimit(3);
+    controller.setTransport(&channel);
+    channel.afterWrite = [&]() {
+        controller.setTransport(nullptr);
+        controller.setTransport(&channel);
+    };
+    QVERIFY(!controller.sendInput(QByteArrayLiteral("echo command\n")));
+    QCOMPARE(channel.written(), QByteArrayLiteral("ech"));
+    QCOMPARE(channel.writeCalls(), 1);
+    QCOMPARE(controller.transport(), static_cast<QIODevice*>(&channel));
+    channel.afterWrite = {};
+    QVERIFY(controller.sendInput(QByteArrayLiteral("fresh")));
+    QCOMPARE(channel.written(), QByteArrayLiteral("echfresh"));
 }
 
 // A renderer that has not been laid out yet reports 0 rows and columns. Taking

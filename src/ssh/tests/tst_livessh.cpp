@@ -97,6 +97,7 @@ private:
     QString m_node;
     QString m_repo;
     QString m_knownHostsPath;
+    std::optional<QTemporaryDir> m_temporaryKnownHosts;
     QString m_identityFile;
 };
 
@@ -115,8 +116,10 @@ void TstLiveSsh::initTestCase()
     m_knownHostsPath = env("CH_LIVE_KNOWN_HOSTS");
     m_identityFile = env("CH_LIVE_IDENTITY");
     if (m_knownHostsPath.isEmpty()) {
+        m_temporaryKnownHosts.emplace();
+        QVERIFY(m_temporaryKnownHosts->isValid());
         m_knownHostsPath =
-            QDir::temp().filePath(QStringLiteral("ch_live_known_hosts"));
+            m_temporaryKnownHosts->filePath(QStringLiteral("known_hosts"));
     }
 
     QVERIFY2(!m_host.isEmpty() && m_port != 0 && !m_user.isEmpty()
@@ -294,8 +297,12 @@ void TstLiveSsh::rpcServerInfoOverSshChannel()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    const QString command = QStringLiteral("'%1' '%2/remote/src/codeharbord.ts' rpc --stdio")
-                                .arg(m_node, m_repo);
+    // Even server.info opens the workspace. Never let this fixture touch the
+    // remote account's default database.
+    const QString command =
+        QStringLiteral("CODEHARBOR_DB=:memory: '%1' "
+                       "'%2/remote/src/codeharbord.ts' rpc --stdio")
+            .arg(m_node, m_repo);
 
     SshChannelDevice device(&m_pool);
     QString stderrText;

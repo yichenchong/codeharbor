@@ -5,6 +5,7 @@
 #include "SshConnectionPool.h"
 
 #include <QCryptographicHash>
+#include <QByteArrayView>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -17,6 +18,10 @@
 #include <filesystem>
 #include <system_error>
 #include <utility>
+
+#if CH_HAVE_LIBSSH
+#include <libssh/libssh.h>
+#endif
 
 namespace ch {
 
@@ -88,6 +93,252 @@ bool readWireUint32(const QByteArray& in, qsizetype& offset, quint32& out)
     return true;
 }
 
+// Bounded DER framing for EncryptedPrivateKeyInfo. This checks the envelope,
+// never decrypts it, and borrows the decoded bytes without copying key material.
+bool readDerElement(QByteArrayView& input, quint8& tag, QByteArrayView& value)
+{
+    if (input.size() < 2)
+        return false;
+    tag = quint8(input[0]);
+    if (tag == 0 || (tag & 0x1f) == 0x1f)
+        return false;
+    qsizetype header = 2;
+    quint32 length = quint8(input[1]);
+    if (length & 0x80) {
+        const quint32 count = length & 0x7f;
+        if (count == 0 || count > 4 || input.size() < 2 + count
+            || input[2] == '\0')
+            return false;
+        length = 0;
+        for (quint32 i = 0; i < count; ++i)
+            length = (length << 8) | quint8(input[2 + i]);
+        if (length < 128)
+            return false;
+        header += count;
+    }
+    if (quint64(length) > quint64(input.size() - header))
+        return false;
+    value = input.sliced(header, length);
+    input = input.sliced(header + length);
+    return true;
+}
+
+bool validDerOid(QByteArrayView oid)
+{
+    if (oid.isEmpty() || (quint8(oid.back()) & 0x80))
+        return false;
+    bool atStart = true;
+    for (const char byte : oid) {
+        if (atStart && quint8(byte) == 0x80)
+            return false; // Non-minimal base-128 subidentifier.
+        atStart = !(quint8(byte) & 0x80);
+    }
+    return true;
+}
+
+bool validDerContents(QByteArrayView input, int depth = 0)
+{
+    if (depth > 16)
+        return false;
+    while (!input.isEmpty()) {
+        quint8 tag = 0;
+        QByteArrayView value;
+        if (!readDerElement(input, tag, value))
+            return false;
+        if ((tag & 0x20) && !validDerContents(value, depth + 1))
+            return false;
+        if (tag == 0x06 && !validDerOid(value))
+            return false;
+        if (tag == 0x05 && !value.isEmpty())
+            return false;
+        if (tag == 0x02
+            && (value.isEmpty()
+                || (value.size() > 1 && value[0] == '\0' && !(quint8(value[1]) & 0x80))
+                || (value.size() > 1 && quint8(value[0]) == 0xff
+                    && (quint8(value[1]) & 0x80))))
+            return false;
+    }
+    return true;
+}
+
+bool readDerAlgorithm(QByteArrayView& input, QByteArrayView& oid,
+                      quint8& parameterTag, QByteArrayView& parameters)
+{
+    quint8 tag = 0;
+    QByteArrayView algorithm;
+    if (!readDerElement(input, tag, algorithm) || tag != 0x30
+        || !readDerElement(algorithm, tag, oid) || tag != 0x06 || !validDerOid(oid))
+        return false;
+    parameterTag = 0;
+    parameters = {};
+    if (algorithm.isEmpty())
+        return true; // AlgorithmIdentifier permits absent parameters.
+    const QByteArrayView encodedParameters = algorithm;
+    return readDerElement(algorithm, parameterTag, parameters)
+        && algorithm.isEmpty() && validDerContents(encodedParameters);
+}
+
+bool readPositiveDerInteger(QByteArrayView& input)
+{
+    quint8 tag = 0;
+    QByteArrayView value;
+    if (!readDerElement(input, tag, value) || tag != 0x02 || value.isEmpty()
+        || (quint8(value[0]) & 0x80))
+        return false;
+    return std::any_of(value.begin(), value.end(), [](char byte) { return byte != 0; });
+}
+
+enum class EnvelopeStatus { Valid, Invalid, Unsupported };
+
+EnvelopeStatus checkPbkdf2Parameters(QByteArrayView input)
+{
+    quint8 tag = 0;
+    QByteArrayView salt;
+    if (input.isEmpty())
+        return EnvelopeStatus::Invalid;
+    if (quint8(input[0]) == 0x30) {
+        QByteArrayView saltAlgorithm;
+        QByteArrayView saltParameters;
+        if (!readDerAlgorithm(input, saltAlgorithm, tag, saltParameters))
+            return EnvelopeStatus::Invalid;
+        return EnvelopeStatus::Unsupported; // No external salt-source algorithm.
+    }
+    if (!readDerElement(input, tag, salt) || tag != 0x04
+        || !readPositiveDerInteger(input))
+        return EnvelopeStatus::Invalid;
+    if (!input.isEmpty() && quint8(input[0]) == 0x02 && !readPositiveDerInteger(input))
+        return EnvelopeStatus::Invalid;
+    if (!input.isEmpty()) {
+        QByteArrayView prf;
+        QByteArrayView prfParameters;
+        if (!readDerAlgorithm(input, prf, tag, prfParameters))
+            return EnvelopeStatus::Invalid;
+        // PKCS#5 HMAC-MD5 and HMAC-SHA1/SHA2 identifiers; parameters absent/NULL.
+        if (prf.size() != 8
+            || prf.first(7) != QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x02", 7)
+            || quint8(prf[7]) < 6 || quint8(prf[7]) > 13)
+            return EnvelopeStatus::Unsupported;
+        if (tag != 0 && (tag != 0x05 || !prfParameters.isEmpty()))
+            return EnvelopeStatus::Invalid;
+    }
+    return input.isEmpty() ? EnvelopeStatus::Valid : EnvelopeStatus::Invalid;
+}
+
+bool readPositiveDerUint64(QByteArrayView& input, quint64& result)
+{
+    quint8 tag = 0;
+    QByteArrayView value;
+    if (!readDerElement(input, tag, value) || tag != 0x02 || value.isEmpty()
+        || (quint8(value[0]) & 0x80))
+        return false;
+    if (value[0] == '\0')
+        value = value.sliced(1); // DER's sign padding for unsigned 64-bit values.
+    if (value.isEmpty() || value.size() > 8)
+        return false;
+    result = 0;
+    for (const char byte : value)
+        result = (result << 8) | quint8(byte);
+    return result > 0;
+}
+
+EnvelopeStatus checkScryptParameters(QByteArrayView input)
+{
+    quint8 tag = 0;
+    QByteArrayView salt;
+    quint64 cost = 0;
+    quint64 blockSize = 0;
+    quint64 parallelization = 0;
+    if (!readDerElement(input, tag, salt) || tag != 0x04
+        || !readPositiveDerUint64(input, cost)
+        || !readPositiveDerUint64(input, blockSize)
+        || !readPositiveDerUint64(input, parallelization))
+        return EnvelopeStatus::Invalid;
+    // RFC 7914: N > 1 is a power of two, N < 2^(16*r), and r*p < 2^30.
+    if (cost <= 1 || (cost & (cost - 1)) != 0
+        || blockSize >= (quint64(1) << 30)
+        || parallelization > ((quint64(1) << 30) - 1) / blockSize
+        || (blockSize < 4 && cost >= (quint64(1) << (16 * blockSize))))
+        return EnvelopeStatus::Invalid;
+    if (!input.isEmpty()) {
+        quint64 keyLength = 0;
+        if (!readPositiveDerUint64(input, keyLength))
+            return EnvelopeStatus::Invalid;
+    }
+    return input.isEmpty() ? EnvelopeStatus::Valid : EnvelopeStatus::Invalid;
+}
+
+EnvelopeStatus checkEncryptedPkcs8(QByteArrayView input)
+{
+    quint8 tag = 0;
+    quint8 parameterTag = 0;
+    QByteArrayView sequence;
+    QByteArrayView oid;
+    QByteArrayView parameters;
+    QByteArrayView ciphertext;
+    if (!readDerElement(input, tag, sequence) || tag != 0x30 || !input.isEmpty()
+        || !readDerAlgorithm(sequence, oid, parameterTag, parameters)
+        || !readDerElement(sequence, tag, ciphertext) || tag != 0x04
+        || ciphertext.isEmpty() || !sequence.isEmpty())
+        return EnvelopeStatus::Invalid;
+    if (oid == QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d", 9)) {
+        if (parameterTag != 0x30)
+            return EnvelopeStatus::Invalid;
+        QByteArrayView kdfOid;
+        QByteArrayView kdfParameters;
+        QByteArrayView cipherOid;
+        QByteArrayView cipherParameters;
+        quint8 kdfParameterTag = 0;
+        if (!readDerAlgorithm(parameters, kdfOid, kdfParameterTag, kdfParameters)
+            || !readDerAlgorithm(parameters, cipherOid, tag, cipherParameters)
+            || !parameters.isEmpty())
+            return EnvelopeStatus::Invalid;
+        const bool pbkdf2 =
+            kdfOid == QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0c", 9);
+        const bool scrypt =
+            kdfOid == QByteArrayView("\x2b\x06\x01\x04\x01\xda\x47\x04\x0b", 9);
+        if (!pbkdf2 && !scrypt)
+            return EnvelopeStatus::Unsupported;
+        if (kdfParameterTag != 0x30)
+            return EnvelopeStatus::Invalid;
+        const auto kdfStatus = pbkdf2 ? checkPbkdf2Parameters(kdfParameters)
+                                     : checkScryptParameters(kdfParameters);
+        if (kdfStatus != EnvelopeStatus::Valid)
+            return kdfStatus;
+        int blockBytes = 0;
+        if (cipherOid.size() == 9
+            && cipherOid.first(8) == QByteArrayView("\x60\x86\x48\x01\x65\x03\x04\x01", 8)
+            && (quint8(cipherOid[8]) == 2 || quint8(cipherOid[8]) == 22
+                || quint8(cipherOid[8]) == 42))
+            blockBytes = 16;
+        else if (cipherOid == QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x03\x07", 8))
+            blockBytes = 8;
+        else
+            return EnvelopeStatus::Unsupported;
+        return tag == 0x04 && cipherParameters.size() == blockBytes
+                && ciphertext.size() % blockBytes == 0
+            ? EnvelopeStatus::Valid : EnvelopeStatus::Invalid;
+    }
+    // PBES1 (PKCS#5) and the PKCS#12 PBE families derive their IV from salt.
+    const bool pkcs5 = oid.size() == 9
+        && oid.first(8) == QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x01\x05", 8)
+        && (quint8(oid[8]) == 1 || quint8(oid[8]) == 3 || quint8(oid[8]) == 4
+            || quint8(oid[8]) == 6 || quint8(oid[8]) == 10 || quint8(oid[8]) == 11);
+    const bool pkcs12 = oid.size() == 10
+        && oid.first(9) == QByteArrayView("\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01", 9)
+        && quint8(oid[9]) >= 1 && quint8(oid[9]) <= 6;
+    if (!pkcs5 && !pkcs12)
+        return EnvelopeStatus::Unsupported;
+    QByteArrayView salt;
+    if (parameterTag != 0x30
+        || !readDerElement(parameters, tag, salt) || tag != 0x04
+        || (pkcs5 && salt.size() != 8) || !readPositiveDerInteger(parameters)
+        || !parameters.isEmpty())
+        return EnvelopeStatus::Invalid;
+    const int blockBytes = pkcs12 && quint8(oid[9]) <= 2 ? 1 : 8;
+    return ciphertext.size() % blockBytes == 0
+        ? EnvelopeStatus::Valid : EnvelopeStatus::Invalid;
+}
+
 // Strip the trailing carriage return and any leading/trailing blanks a paste or
 // a mail client added. PEM cares about neither, and a `-----` marker only
 // compares equal once they are gone.
@@ -122,6 +373,13 @@ void wipeKeyMaterial(QByteArray& material)
     material.clear();
 }
 
+#if CH_HAVE_LIBSSH
+int declineKeyPassphrase(const char*, char*, size_t, int, int, void*)
+{
+    return -1;
+}
+#endif
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -147,6 +405,10 @@ bool MobileKeyStore::isUsableKeyName(const QString& name)
 MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& text)
 {
     KeyDescription out;
+    if (text.size() > kMaxKeyBytes) {
+        out.error = tr("That text is far too large to be a private key.");
+        return out;
+    }
 
     const QList<QStringView> rawLines = QStringView(text).split(u'\n');
     QStringList lines;
@@ -227,7 +489,10 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
     // OPENSSH block is base64 that happens to contain a colon and must not be
     // eaten as a header.
     qsizetype bodyStart = beginIndex + 1;
+    int pemBlockBytes = 0;
     if (!openSsh) {
+        bool hasProcType = false;
+        bool hasDekInfo = false;
         while (bodyStart < endIndex) {
             const QString& line = lines.at(bodyStart);
             if (line.isEmpty())
@@ -237,20 +502,69 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
                 break;
             const QString field = line.left(colon);
             const QString value = line.sliced(colon + 1).trimmed();
-            if (field == QLatin1String("Proc-Type")
-                && value.contains(QLatin1String("ENCRYPTED"))) {
+            if (field == QLatin1String("Proc-Type")) {
+                if (hasProcType || value != QLatin1String("4,ENCRYPTED")) {
+                    out.error = tr("The PEM encryption headers are malformed.");
+                    return out;
+                }
+                hasProcType = true;
                 out.encrypted = true;
             } else if (field == QLatin1String("DEK-Info")) {
-                out.kdf = value.section(u',', 0, 0).trimmed();
-                // DEK-Info without Proc-Type is malformed per RFC 1421, but the
-                // header only exists to describe an ENCRYPTION, so its presence
-                // alone is enough to require a passphrase. Reporting such a key
-                // as unencrypted would show the connect page no passphrase field
-                // and cost the user a whole failed authentication round before
-                // the ladder asked for one.
+                static const QRegularExpression dekInfo(
+                    QStringLiteral("^([A-Z0-9][A-Z0-9-]*),([0-9A-Fa-f]*)$"));
+                const auto match = dekInfo.match(value);
+                if (hasDekInfo || !match.hasMatch()) {
+                    out.error = tr("The PEM encryption headers are malformed.");
+                    return out;
+                }
+                hasDekInfo = true;
+                out.kdf = match.captured(1);
+                const qsizetype ivLength = match.capturedLength(2);
+                int ivBytes = 0;
+                static const QRegularExpression block128Cipher(
+                    QStringLiteral("^(AES|CAMELLIA|ARIA)-(128|192|256)-"
+                                   "(CBC|CFB|CFB1|CFB8|OFB|CTR)$"));
+                static const QRegularExpression desCipher(
+                    QStringLiteral("^DES-(EDE-|EDE3-)?(CBC|CFB|CFB1|CFB8|OFB)$"));
+                if (block128Cipher.match(out.kdf).hasMatch()
+                    || out.kdf == QLatin1String("SEED-CBC")
+                    || out.kdf == QLatin1String("SM4-CBC"))
+                    ivBytes = 16;
+                else if (desCipher.match(out.kdf).hasMatch()
+                         || out.kdf == QLatin1String("BF-CBC")
+                         || out.kdf == QLatin1String("CAST5-CBC")
+                         || out.kdf == QLatin1String("RC2-CBC")
+                         || out.kdf == QLatin1String("RC2-40-CBC")
+                         || out.kdf == QLatin1String("RC2-64-CBC")
+                         || out.kdf == QLatin1String("IDEA-CBC"))
+                    ivBytes = 8;
+                else if (out.kdf != QLatin1String("RC4")
+                         && out.kdf != QLatin1String("RC4-40")) {
+                    out.error = tr("This PEM encryption algorithm is unsupported. "
+                                   "Re-export the key as OpenSSH or AES-CBC PEM.");
+                    return out;
+                }
+                const bool validIv = ivLength == 2 * ivBytes;
+                if (!validIv) {
+                    out.error = tr("The PEM encryption initialization vector is malformed.");
+                    return out;
+                }
+                if (out.kdf.endsWith(QLatin1String("-CBC")))
+                    pemBlockBytes = int(ivLength / 2);
                 out.encrypted = true;
             }
             ++bodyStart;
+        }
+        if (hasProcType != hasDekInfo) {
+            out.error = tr("The encrypted PEM key is missing an encryption "
+                           "header. Copy the complete private key file.");
+            return out;
+        }
+        if (hasProcType
+            && (label == QLatin1String("ENCRYPTED PRIVATE KEY")
+                || bodyStart == endIndex || !lines.at(bodyStart).isEmpty())) {
+            out.error = tr("The PEM encryption headers are malformed.");
+            return out;
         }
         // PKCS#8's own encrypted spelling needs no headers at all.
         if (label == QLatin1String("ENCRYPTED PRIVATE KEY")) {
@@ -293,6 +607,19 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
         out.error = truncatedMessage;
         return out;
     }
+    const auto envelope = label == QLatin1String("ENCRYPTED PRIVATE KEY")
+        ? checkEncryptedPkcs8(decoded.decoded) : EnvelopeStatus::Valid;
+    if (envelope == EnvelopeStatus::Unsupported) {
+        out.error = tr("This encrypted PKCS#8 algorithm is unsupported. Re-export "
+                       "the key as OpenSSH or PBKDF2 with AES-CBC.");
+        return out;
+    }
+    if ((!openSsh && pemBlockBytes && decoded.decoded.size() % pemBlockBytes != 0)
+        || envelope == EnvelopeStatus::Invalid) {
+        out.error = tr("The encrypted private key container is malformed. "
+                       "Copy the complete private key file.");
+        return out;
+    }
 
     if (openSsh) {
         const QByteArray& blob = *decoded;
@@ -321,6 +648,39 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
                            "reformatting.");
             return out;
         }
+        int blockBytes = 8;
+        bool validEncryption = false;
+        if (cipher == QByteArrayLiteral("none")) {
+            validEncryption = kdfName == QByteArrayLiteral("none") && kdfOptions.isEmpty();
+        } else {
+            const bool aes = cipher == QByteArrayLiteral("aes128-cbc")
+                || cipher == QByteArrayLiteral("aes192-cbc")
+                || cipher == QByteArrayLiteral("aes256-cbc")
+                || cipher == QByteArrayLiteral("aes128-ctr")
+                || cipher == QByteArrayLiteral("aes192-ctr")
+                || cipher == QByteArrayLiteral("aes256-ctr")
+                || cipher == QByteArrayLiteral("aes128-gcm@openssh.com")
+                || cipher == QByteArrayLiteral("aes256-gcm@openssh.com");
+            const bool supportedCipher = aes || cipher == QByteArrayLiteral("3des-cbc")
+                || cipher == QByteArrayLiteral("chacha20-poly1305@openssh.com");
+            blockBytes = aes ? 16 : 8;
+            qsizetype kdfOffset = 0;
+            quint32 saltLength = 0;
+            quint32 rounds = 0;
+            if (supportedCipher && kdfName == QByteArrayLiteral("bcrypt")
+                && readWireUint32(kdfOptions, kdfOffset, saltLength)
+                && saltLength > 0
+                && quint64(saltLength) <= quint64(kdfOptions.size() - kdfOffset)) {
+                kdfOffset += saltLength;
+                validEncryption = readWireUint32(kdfOptions, kdfOffset, rounds)
+                    && rounds > 0 && kdfOffset == kdfOptions.size();
+            }
+        }
+        if (!validEncryption) {
+            out.error = tr("The OpenSSH key's encryption parameters are malformed "
+                           "or unsupported. Choose a complete private key file.");
+            return out;
+        }
         // OpenSSH appends AEAD authentication data outside the private string's
         // declared length (sshkey_private_to_blob2 / cipher_authlen).
         const quint32 authenticationBytes =
@@ -330,6 +690,7 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
                 ? 16 : 0;
         quint32 privateLength = 0;
         if (!readWireUint32(blob, offset, privateLength) || privateLength == 0
+            || privateLength % blockBytes != 0
             || quint64(privateLength) + authenticationBytes
                 != quint64(blob.size() - offset)) {
             out.error = tr("The OpenSSH key container has no complete private "
@@ -345,6 +706,24 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
                            "so the file was altered or truncated.");
             return out;
         }
+#if CH_HAVE_LIBSSH
+        ssh_key publicKey = nullptr;
+        const QByteArray publicBase64 = publicBlob.toBase64();
+        const int publicResult = ssh_pki_import_pubkey_base64(
+            publicBase64.constData(), ssh_key_type_from_name(keyType.constData()),
+            &publicKey);
+        if (publicKey)
+            ssh_key_free(publicKey);
+        if (publicResult != SSH_OK) {
+            out.error = tr("The OpenSSH key has a damaged or unsupported public "
+                           "key section. Choose a complete private key file.");
+            return out;
+        }
+#else
+        out.error = tr("This build cannot validate private keys because SSH "
+                       "support is unavailable.");
+        return out;
+#endif
         out.keyType = QString::fromLatin1(keyType);
         out.encrypted = (cipher != QByteArrayLiteral("none"));
         if (kdfName != QByteArrayLiteral("none"))
@@ -361,6 +740,38 @@ MobileKeyStore::KeyDescription MobileKeyStore::describeKeyText(const QString& te
     for (qsizetype i = beginIndex; i <= endIndex; ++i) {
         normalized += lines.at(i).toLatin1();
         normalized += '\n';
+    }
+    // Framing alone cannot validate a clear private key. Use the same parser as
+    // authentication, with prompting disabled, before retaining or saving it.
+    // Encrypted contents can only be validated once the user supplies a secret.
+    if (!out.encrypted) {
+#if CH_HAVE_LIBSSH
+        ssh_key key = nullptr;
+        const int result = ssh_pki_import_privkey_base64(
+            normalized.constData(), nullptr, declineKeyPassphrase, nullptr, &key);
+        bool matchesPublicKey = true;
+        if (result == SSH_OK && key && openSsh) {
+            char* publicText = nullptr;
+            matchesPublicKey = ssh_pki_export_pubkey_base64(key, &publicText) == SSH_OK;
+            if (matchesPublicKey) {
+                matchesPublicKey = sha256Fingerprint(
+                    QByteArray::fromBase64(QByteArray(publicText))) == out.fingerprint;
+            }
+            if (publicText)
+                ssh_string_free_char(publicText);
+        }
+        if (key)
+            ssh_key_free(key);
+        if (result != SSH_OK || !matchesPublicKey) {
+            out.error = tr("The private key is damaged or is not supported by "
+                           "this build. Choose a complete private key file.");
+            return out;
+        }
+#else
+        out.error = tr("This build cannot validate private keys because SSH "
+                       "support is unavailable.");
+        return out;
+#endif
     }
     out.normalized = normalized;
     out.valid = true;

@@ -41,11 +41,9 @@ QString viewKindFor(ViewerResolution resolution)
     case ViewerResolution::Error:
         break;
     }
-    // Download and Error both fall back to the binary view, which shows
-    // metadata plus a download/open affordance. This is the "unclaimed
-    // resource" disposition SPEC 7.5 mandates: an unrecognised resource stays
-    // with the browser and becomes a download/metadata view, never a text
-    // buffer.
+    // Download and Error both fall back to the binary view, which shows the
+    // filename/path and a download action, not an editor or an external-open
+    // action. This is the "unclaimed resource" disposition of SPEC 7.5.
     return QStringLiteral("binary");
 }
 

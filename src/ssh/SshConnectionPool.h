@@ -187,14 +187,13 @@ private:
 // not drive PTY I/O, reconnect scheduling, or the live handshake loop — those
 // belong to TerminalController and the remote client.
 //
-// The handshake is deliberately SYNCHRONOUS and runs on the calling thread. Its
-// worst-case freeze is therefore bounded: connectToHost() sets an explicit
-// SSH_OPTIONS_TIMEOUT (kHandshakeTimeoutSeconds, 15s) BEFORE parsing
-// ~/.ssh/config, so a ConnectTimeout the user really did configure still wins
-// while everyone else keeps the bound. A black-holed endpoint therefore stalls
-// the UI thread for at most that timeout rather than libssh's much longer
-// version-dependent default. Channel writes are bounded by the same session
-// timeout (see SshChannelDevice::writeData).
+// The handshake is deliberately SYNCHRONOUS and runs on the calling thread.
+// connectToHost() sets SSH_OPTIONS_TIMEOUT (kHandshakeTimeoutSeconds, 15s)
+// BEFORE parsing ~/.ssh/config, so a configured ConnectTimeout still wins
+// while everyone else gets a finite libssh timeout. This is not an overall
+// handshake deadline: key exchange and the authentication ladder can perform
+// several blocking operations. Channel writes use the same session timeout
+// for each libssh call (see SshChannelDevice::writeData).
 class SshConnectionPool : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString diagnosticLog READ diagnosticLog NOTIFY diagnosticLogChanged)
@@ -388,10 +387,13 @@ public:
     // server that requires SEVERAL methods (`AuthenticationMethods
     // publickey,password`) is satisfied one step at a time. `identityFile` is a
     // local private key; empty leaves OpenSSH config and libssh defaults in
-    // charge. The synchronous handshake is bounded by kHandshakeTimeoutSeconds
+    // charge. The handshake uses kHandshakeTimeoutSeconds as its libssh timeout
     // (see the class comment) unless the user configured their own ConnectTimeout.
     bool connectToHost(const QString& host, quint16 port, const QString& user,
                        const QString& identityFile = QString());
+    // A request made from a synchronous handshake callback or state signal is
+    // deferred until libssh is off the stack, including the final Error signal.
+    // connectToHost() then returns false with state() == Disconnected.
     void disconnectFromHost();
 
     // ---- in-memory identity (mobile clients; SPEC 12.1) --------------------

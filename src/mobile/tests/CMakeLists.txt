@@ -153,6 +153,26 @@ add_test(NAME tst_mobileshell COMMAND tst_mobileshell)
 set_tests_properties(tst_mobileshell PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software")
 
+# Exercise the production WKWebView adapter directly, without QtWebView's
+# plugin: the fixture supplies Qt's delegate identity and checks native policy.
+# This remains useful even when the optional Qt module is not installed.
+if(APPLE)
+    qt_add_executable(tst_mobilewebviewpolicydarwin
+        tst_mobilewebviewpolicydarwin.mm
+        ../MobileWebViewPolicyDarwin.mm)
+    target_link_libraries(tst_mobilewebviewpolicydarwin PRIVATE
+        Qt6::Core Qt6::Gui Qt6::Test ${_ch_mobile_webview_frameworks})
+    target_compile_options(tst_mobilewebviewpolicydarwin PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+    set_target_properties(tst_mobilewebviewpolicydarwin PROPERTIES
+        AUTOMOC ON
+        OBJCXX_STANDARD ${CMAKE_CXX_STANDARD}
+        OBJCXX_STANDARD_REQUIRED ON
+        OBJCXX_EXTENSIONS OFF)
+    add_test(NAME tst_mobilewebviewpolicydarwin COMMAND tst_mobilewebviewpolicydarwin)
+    set_tests_properties(tst_mobilewebviewpolicydarwin PROPERTIES TIMEOUT 90)
+endif()
+
 # Console-mode on Windows for EVERY QTest target here, without exception.
 # qt_add_executable marks executables as GUI subsystem, which on Windows
 # swallows QTest's stdout and stderr — a failing assertion then reports nothing
@@ -170,3 +190,13 @@ if(WIN32)
         tst_mobileshell
         PROPERTIES WIN32_EXECUTABLE FALSE)
 endif()
+
+# Resolve both real generated mobile modules from the same URI import tree.
+# A small fully typed component catches missing metadata without inheriting
+# unrelated dynamic-context diagnostics from the complete application pages.
+add_test(NAME tst_mobile_qml_imports
+    COMMAND $<TARGET_FILE:Qt6::qmllint>
+        --ignore-settings --max-warnings 0
+        -I "${_ch_mobile_qml_import_root}"
+        "${PROJECT_SOURCE_DIR}/tests/mobile_qml_imports.qml")
+set_tests_properties(tst_mobile_qml_imports PROPERTIES TIMEOUT 30)

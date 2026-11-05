@@ -16,8 +16,9 @@
 
 import { isEntrypoint } from "./entrypoint.ts";
 
-import { CONTROL_OPS, type ControlOp } from "../control.ts";
+import { CONTROL_OPS, MAX_CONTROL_LINE_BYTES, type ControlOp } from "../control.ts";
 import { sendControlRequest } from "../control-client.ts";
+import { stringifyJson } from "../json.ts";
 
 export const USAGE =
     "usage: codeharbor-view <list|open|close|split|focus|reload> [options]\n" +
@@ -99,6 +100,25 @@ export function parseArgv(argv: readonly string[]): ParsedArgv {
     return { op: op as ControlOp, args };
 }
 
+/** Wait for output errors as well as synchronous stream failures. */
+function writeOutput(stream: NodeJS.WritableStream, text: string): Promise<boolean> {
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    const onError = (): void => { resolve(false); };
+    stream.once("error", onError);
+    try {
+        stream.write(text, (error?: Error | null) => {
+            // Failed write callbacks run before the stream's error event.
+            // Leave its listener installed until that event consumes it.
+            if (!error) stream.off("error", onError);
+            resolve(!error);
+        });
+    } catch {
+        stream.off("error", onError);
+        resolve(false);
+    }
+    return promise;
+}
+
 /** Run one command and return the process exit code. */
 export async function main(
     argv: readonly string[] = process.argv.slice(2),
@@ -110,21 +130,20 @@ export async function main(
     try {
         parsed = parseArgv(argv);
     } catch (parseError) {
-        err.write(`codeharbor-view: ${parseError instanceof Error ? parseError.message : String(parseError)}\n`);
-        err.write(USAGE);
+        await writeOutput(err,
+            `codeharbor-view: ${parseError instanceof Error ? parseError.message : String(parseError)}\n${USAGE}`);
         return 2;
     }
 
     const response = await sendControlRequest(parsed.op, parsed.args, env);
     if (response.ok) {
-        out.write(`${JSON.stringify(response.data ?? {})}\n`);
-        return 0;
+        return await writeOutput(out, `${stringifyJson(response.data ?? {}, MAX_CONTROL_LINE_BYTES)}\n`) ? 0 : 1;
     }
     // The refusal goes to STDOUT as JSON, not to stderr: it is the command's
     // answer, and a caller that pipes this into `jq` needs it either way. The
     // human-readable copy on stderr is what a person sees in the pane.
-    out.write(`${JSON.stringify(response.error)}\n`);
-    err.write(`codeharbor-view: ${response.error?.code}: ${response.error?.message}\n`);
+    await writeOutput(out, `${stringifyJson(response.error, MAX_CONTROL_LINE_BYTES)}\n`);
+    await writeOutput(err, `codeharbor-view: ${response.error?.code}: ${response.error?.message}\n`);
     return 1;
 }
 

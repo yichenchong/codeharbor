@@ -7,6 +7,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 import {
     main,
     readHookInput,
@@ -16,9 +17,10 @@ import {
     missingCoordinates,
     toBridgeMessage,
     type HookInput,
+    type BridgeMessage,
 } from "../src/hooks/bridge-emit.ts";
 import { PassThrough } from "node:stream";
-import { resolveSocketPath, type AgentEvent } from "../src/events.ts";
+import { AGENT_SOCKET_ENV, resolveSocketPath, type AgentEvent } from "../src/events.ts";
 import {
     BRIDGE_MESSAGE_VERSION,
     bridgeLineFits,
@@ -28,8 +30,16 @@ import {
     makeStreamSink,
     MAX_BRIDGE_LINE_BYTES,
     MAX_BRIDGE_PENDING_BYTES,
+    MAX_BRIDGE_JSON_DEPTH,
     type EventSink,
 } from "../src/bridge.ts";
+import {
+    BridgeSubscribers,
+    BRIDGE_SUBSCRIBE_ACK,
+    BRIDGE_SUBSCRIBE_PROTOCOL,
+    BRIDGE_SUBSCRIBE_VERSION,
+} from "../src/bridge-relay.ts";
+import { startFakeBridge } from "./fake-bridge.ts";
 
 test("toBridgeMessage wraps the raw native event without mapping", () => {
     const message = toBridgeMessage({
@@ -273,8 +283,12 @@ test("readHookInput falls back to OMP_HOOK_EVENT and ignores a false OMP_ERROR",
 async function captureStderr(body: () => Promise<void>): Promise<string[]> {
     const written: string[] = [];
     const real = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    process.stderr.write = ((chunk: string | Uint8Array, encodingOrCallback?: unknown, callback?: () => void): boolean => {
         written.push(String(chunk));
+        // Honor successful write completion so the hook removes its temporary
+        // stream-error guard just as it does with the real diagnostics stream.
+        if (typeof encodingOrCallback === "function") encodingOrCallback();
+        else callback?.();
         return true;
     }) as unknown as typeof process.stderr.write;
     try {
@@ -519,6 +533,29 @@ test("concurrent bridge starts cannot orphan the winner", async () => {
     }
 });
 
+test("closing an old bridge does not unlink a replacement ownership lock (NDA1)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-lock-owner-"));
+    const socketPath = path.join(dir, "bridge.sock");
+    const lockPath = `${socketPath}.lock`;
+    const server = await startBridge(socketPath, () => {});
+    try {
+        // Keep the old inode alive so this tests ownership, not inode reuse.
+        fs.renameSync(lockPath, `${lockPath}.old`);
+        fs.writeFileSync(lockPath, "replacement owner\n");
+        const closed = once(server, "close");
+        server.close();
+        await closed;
+        assert.equal(fs.readFileSync(lockPath, "utf8"), "replacement owner\n");
+    } finally {
+        if (server.listening) {
+            const closed = once(server, "close");
+            server.close();
+            await closed;
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("startBridge unlinks a stale socket left by a dead bridge (RR12)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-stale-"));
     const socketPath = path.join(dir, "bridge.sock");
@@ -706,6 +743,53 @@ test("relay compaction drops metadata before readable summary (BH26-BRIDGE-02)",
     assert.equal(source.destroyed, false);
     assert.equal(relayed.summary, "finished");
     assert.equal(relayed.metadata, undefined);
+});
+
+test("the bridge sink preserves state while shedding metadata beyond desktop depth (NDA4)", () => {
+    for (const containers of [2000, 10000]) {
+        const metadata = JSON.parse(
+            '{"n":'.repeat(containers - 1) + "{}" + "}".repeat(containers - 1),
+        ) as Record<string, unknown>;
+        const event = { ...RELAY_EVENT, summary: "still running", metadata };
+        const out = new PassThrough();
+        const source = fakeSource();
+        makeStreamSink(out)(event, source.socket);
+        const output = out.read().toString();
+        assert.ok(output.endsWith("\n"));
+        assert.ok(Buffer.byteLength(output) - 1 <= MAX_BRIDGE_LINE_BYTES);
+        const relayed = JSON.parse(output) as AgentEvent;
+        assert.equal(source.destroyed, false);
+        assert.equal(relayed.state, "running");
+        assert.equal(relayed.summary, "still running");
+        assert.equal(relayed.metadata, undefined);
+        assert.equal(event.metadata, metadata, "shedding must not mutate the source event");
+    }
+});
+
+test("the bridge sink counts the event envelope in its desktop depth limit (NDA4)", () => {
+    for (const eventDepth of [MAX_BRIDGE_JSON_DEPTH, MAX_BRIDGE_JSON_DEPTH + 1]) {
+        const metadataContainers = eventDepth - 1;
+        const metadata = JSON.parse(
+            '{"n":'.repeat(metadataContainers - 1) + "{}" + "}".repeat(metadataContainers - 1),
+        ) as Record<string, unknown>;
+        const out = new PassThrough();
+        const source = fakeSource();
+        makeStreamSink(out)({ ...RELAY_EVENT, metadata }, source.socket);
+        const output = out.read().toString();
+        assert.ok(Buffer.byteLength(output) - 1 <= MAX_BRIDGE_LINE_BYTES);
+        const relayed = JSON.parse(output) as AgentEvent;
+        assert.equal(source.destroyed, false);
+        assert.equal(relayed.state, "running");
+        if (eventDepth === MAX_BRIDGE_JSON_DEPTH) {
+            let value: unknown = relayed.metadata;
+            for (let i = 1; i < metadataContainers; i += 1) {
+                value = (value as Record<string, unknown>).n;
+            }
+            assert.deepEqual(value, {});
+        } else {
+            assert.equal(relayed.metadata, undefined);
+        }
+    }
 });
 // A sink can tear a producer down mid-chunk. Everything after that point in the
 // SAME write must be abandoned, otherwise a producer that has already been
@@ -1781,51 +1865,302 @@ test("makeStreamSink destroys stalled producers when the output fails", () => {
     );
 });
 
-// The relay's own CLI entry point, which nothing in the portable suite ran. Two
-// things have to hold and neither is visible from the exported functions: the
-// entry point must recognise itself, and a signalled stop must leave nothing
-// behind on disk.
-test("the bridge CLI announces itself and cleans up on SIGTERM", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-cli-"));
-    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir } as NodeJS.ProcessEnv);
-    // The relay derives its ownership lock from the socket path this way; the
-    // suffix is internal, but a leftover FILE is observable and is precisely
-    // what breaks the next run.
-    const lockPath = `${socketPath}.lock`;
-    const bridgePath = fileURLToPath(new URL("../src/bridge.ts", import.meta.url));
-    const child = spawn(process.execPath, [bridgePath], {
-        // Minimal environment: inheriting this process's would let a stray
-        // XDG_RUNTIME_DIR on the developer's machine choose the socket path.
-        env: { PATH: process.env.PATH ?? "", XDG_RUNTIME_DIR: dir },
+function spawnBridgeProxy(dir: string, idleMs = 500) {
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL("../src/bridge.ts", import.meta.url)),
+    ], {
+        env: {
+            PATH: process.env.PATH ?? "",
+            XDG_RUNTIME_DIR: dir,
+            CODEHARBOR_BRIDGE_RELAY_IDLE_MS: String(idleMs),
+        },
         stdio: ["ignore", "pipe", "pipe"],
     });
+    const ready = Promise.withResolvers<void>();
+    const closed = Promise.withResolvers<number | null>();
+    const lines: string[] = [];
+    const waiting: { resolve(value: string): void; reject(reason?: unknown): void }[] = [];
     let stdout = "";
     let stderr = "";
-    const banner = Promise.withResolvers<void>();
     child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        let newline = stdout.indexOf("\n");
+        while (newline >= 0) {
+            const line = stdout.slice(0, newline);
+            stdout = stdout.slice(newline + 1);
+            const receiver = waiting.shift();
+            if (receiver) receiver.resolve(line);
+            else lines.push(line);
+            newline = stdout.indexOf("\n");
+        }
+    });
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
     child.stderr.on("data", (chunk: string) => {
         stderr += chunk;
-        if (stderr.includes(`codeharbor-bridge listening on ${socketPath}`)) banner.resolve();
+        if (stderr.includes(`codeharbor-bridge listening on ${socketPath}`)) ready.resolve();
     });
-    const exited = Promise.withResolvers<number | null>();
-    child.on("close", (code) => exited.resolve(code));
-    try {
-        await banner.promise;
-        assert.ok(fs.lstatSync(socketPath).isSocket(), "the relay owns its socket while running");
-        assert.ok(fs.existsSync(lockPath), "and the ownership lock that keeps a second one out");
+    child.once("error", (error) => ready.reject(error));
+    child.once("close", (code) => {
+        closed.resolve(code);
+        ready.reject(new Error(`bridge proxy exited ${code}: ${stderr}`));
+        for (const receiver of waiting) receiver.reject(new Error("bridge proxy closed"));
+    });
+    return {
+        child, ready: ready.promise, closed: closed.promise,
+        stderr: () => stderr,
+        nextLine(): Promise<string> {
+            const line = lines.shift();
+            if (line !== undefined) return Promise.resolve(line);
+            const receiver = Promise.withResolvers<string>();
+            waiting.push(receiver);
+            return receiver.promise;
+        },
+    };
+}
 
-        child.kill("SIGTERM");
-        assert.equal(await exited.promise, 0, "a signalled stop is a clean stop");
-        assert.equal(fs.existsSync(socketPath), false, "the socket file must not be left behind");
-        // The expensive half: a leftover lock records a pid, and once the
-        // operating system recycles that pid onto any live process the relay
-        // refuses to start at all until somebody deletes the file by hand.
-        assert.equal(fs.existsSync(lockPath), false, "nor the ownership lock");
-        assert.equal(stdout, "", "the banner is stderr; stdout carries only relayed events");
+async function waitForBridgeIdleCleanup(socketPath: string): Promise<void> {
+    const removed = Promise.withResolvers<void>();
+    const check = (): void => {
+        if (!fs.existsSync(socketPath) && !fs.existsSync(`${socketPath}.lock`)) removed.resolve();
+    };
+    const watcher = fs.watch(path.dirname(socketPath), check);
+    watcher.once("error", removed.reject);
+    // Child-process idle timing cannot use this process's fake clock. Success
+    // comes from filesystem events; this timer is only a failure watchdog.
+    const timeout = setTimeout(() => removed.reject(new Error("shared bridge did not clean up after its last reader")), 10000);
+    try {
+        check();
+        await removed.promise;
     } finally {
-        child.kill("SIGKILL");
+        clearTimeout(timeout);
+        watcher.close();
+    }
+}
+
+test("the bridge CLI subscribes and last-reader shutdown cleans up after idle (NAC11)", { timeout: 15000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-cli-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const proxy = spawnBridgeProxy(dir);
+    try {
+        await proxy.ready;
+        assert.ok(fs.lstatSync(socketPath).isSocket());
+        assert.ok(fs.existsSync(`${socketPath}.lock`));
+        proxy.child.kill("SIGTERM");
+        assert.equal(await proxy.closed, 0, proxy.stderr());
+        await waitForBridgeIdleCleanup(socketPath);
+        assert.equal(fs.existsSync(socketPath), false);
+        assert.equal(fs.existsSync(`${socketPath}.lock`), false);
+    } finally {
+        proxy.child.kill("SIGKILL");
+        await waitForBridgeIdleCleanup(socketPath);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("two bridge CLI readers share events and closing the first preserves the second (NAC11)", { timeout: 15000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-readers-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const first = spawnBridgeProxy(dir);
+    let second: typeof first | undefined;
+    try {
+        await first.ready;
+        const owner = fs.lstatSync(socketPath);
+        second = spawnBridgeProxy(dir);
+        await second.ready;
+        await emitHookEvent({
+            event: "tool_call", tool: "ask", devSessionId: "shared-dev", terminalId: "shared-term",
+        }, socketPath);
+        const [firstLine, secondLine] = await Promise.all([first.nextLine(), second.nextLine()]);
+        for (const line of [firstLine, secondLine]) {
+            const event = JSON.parse(line) as AgentEvent;
+            assert.equal(event.state, "waiting_input");
+            assert.equal(event.devSessionId, "shared-dev");
+            assert.equal(event.terminalId, "shared-term");
+        }
+        first.child.kill("SIGTERM");
+        assert.equal(await first.closed, 0, first.stderr());
+        assert.equal(fs.lstatSync(socketPath).ino, owner.ino, "the first proxy must not replace or unlink the shared relay");
+        await emitHookEvent({
+            event: "agent_end", devSessionId: "shared-dev", terminalId: "shared-term",
+        }, socketPath);
+        assert.equal((JSON.parse(await second.nextLine()) as AgentEvent).state, "idle_unseen");
+        second.child.kill("SIGTERM");
+        assert.equal(await second.closed, 0, second.stderr());
+        await waitForBridgeIdleCleanup(socketPath);
+    } finally {
+        first.child.kill("SIGKILL");
+        second?.child.kill("SIGKILL");
+        await waitForBridgeIdleCleanup(socketPath);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("concurrent bridge CLI startup converges on one usable relay (NAC11)", { timeout: 15000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-readers-race-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const readers = Array.from({ length: 4 }, () => spawnBridgeProxy(dir, 1000));
+    try {
+        await Promise.all(readers.map((reader) => reader.ready));
+        assert.ok(fs.lstatSync(socketPath).isSocket());
+        assert.ok(fs.existsSync(`${socketPath}.lock`));
+        await emitHookEvent({
+            event: "agent_start", devSessionId: "shared-race", terminalId: "shared-term",
+        }, socketPath);
+        for (const line of await Promise.all(readers.map((reader) => reader.nextLine()))) {
+            const event = JSON.parse(line) as AgentEvent;
+            assert.equal(event.state, "running");
+            assert.equal(event.devSessionId, "shared-race");
+        }
+        for (const reader of readers) reader.child.kill("SIGTERM");
+        assert.deepEqual(await Promise.all(readers.map((reader) => reader.closed)), [0, 0, 0, 0]);
+        await waitForBridgeIdleCleanup(socketPath);
+    } finally {
+        for (const reader of readers) reader.child.kill("SIGKILL");
+        await waitForBridgeIdleCleanup(socketPath);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("an old single-output bridge receives an explicit upgrade refusal without unlink (NAC11)", { timeout: 15000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-old-reader-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on("data", () => {});
+        socket.once("close", () => sockets.delete(socket));
+    });
+    server.listen(socketPath);
+    await once(server, "listening");
+    const owner = fs.lstatSync(socketPath);
+    const proxy = spawnBridgeProxy(dir);
+    try {
+        await assert.rejects(proxy.ready);
+        assert.notEqual(await proxy.closed, 0);
+        assert.match(proxy.stderr(), /upgrade|restart/i);
+        assert.equal(server.listening, true);
+        assert.equal(fs.lstatSync(socketPath).ino, owner.ino);
+        await emitHookEvent({
+            event: "agent_start", devSessionId: "old-reader", terminalId: "old-term",
+        }, socketPath);
+        assert.equal(fs.lstatSync(socketPath).ino, owner.ino);
+    } finally {
+        proxy.child.kill("SIGKILL");
+        for (const socket of sockets) socket.destroy();
+        const closed = once(server, "close");
+        server.close();
+        await closed;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a backpressured CLI reader is retired without interrupting a draining reader (NAC11)", { timeout: 20000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-slow-reader-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const fast = spawnBridgeProxy(dir);
+    let slow: typeof fast | undefined;
+    try {
+        await fast.ready;
+        slow = spawnBridgeProxy(dir);
+        await slow.ready;
+        slow.child.stdout.pause();
+        // The paused OS pipe backs up the proxy, then its Unix subscriber. This
+        // finite burst exceeds the per-reader queue plus kernel pipe buffers;
+        // the fast reader supplies an actual delivery barrier on every event.
+        const summary = "x".repeat(128 * 1024);
+        for (let i = 0; i < 64; i += 1) {
+            await emitHookEvent({
+                event: "agent_start", devSessionId: "slow-reader", terminalId: "term",
+                summary: `${i}:${summary}`,
+            }, socketPath);
+            const delivered = JSON.parse(await fast.nextLine()) as AgentEvent;
+            assert.equal(delivered.state, "running");
+            assert.ok(delivered.summary?.startsWith(`${i}:`));
+        }
+        // Draining the blocked local pipe exposes the independently retired
+        // remote subscription; it must not hold the healthy proxy or producer.
+        slow.child.stdout.resume();
+        assert.equal(await slow.closed, 1, slow.stderr());
+        assert.match(slow.stderr(), /disconnect|closed/i);
+        await emitHookEvent({
+            event: "agent_end", devSessionId: "slow-reader", terminalId: "term",
+        }, socketPath);
+        assert.equal((JSON.parse(await fast.nextLine()) as AgentEvent).state, "idle_unseen");
+        fast.child.kill("SIGTERM");
+        assert.equal(await fast.closed, 0, fast.stderr());
+        await waitForBridgeIdleCleanup(socketPath);
+    } finally {
+        fast.child.kill("SIGKILL");
+        slow?.child.kill("SIGKILL");
+        await waitForBridgeIdleCleanup(socketPath);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("global subscriber pressure retires the backlogged socket rather than the next healthy reader (NAC11)", { timeout: 10000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-global-readers-"));
+    const socketPath = path.join(dir, "readers.sock");
+    const line = `${JSON.stringify({ ...RELAY_EVENT, summary: "x".repeat(256) })}\n`;
+    const bytes = Buffer.byteLength(line);
+    const totalLimit = bytes * 4;
+    const subscribers = new BridgeSubscribers(() => {}, {
+        maxReaderBytes: bytes * 8,
+        maxTotalBytes: totalLimit,
+    });
+    const server = net.createServer();
+    server.listen(socketPath);
+    await once(server, "listening");
+    const firstAccepted = once(server, "connection");
+    const slowClient = net.createConnection(socketPath);
+    slowClient.on("error", () => {});
+    slowClient.resume();
+    const [slowSocket] = await firstAccepted as [net.Socket];
+    // Corking a real socket deterministically holds its write callback. The
+    // production queue must account for this in-flight ACK and later events.
+    slowSocket.cork();
+    const slowClosed = once(slowClient, "close");
+    const nextAccepted = once(server, "connection");
+    const fastClient = net.createConnection(socketPath);
+    fastClient.on("error", () => {});
+    const [fastSocket] = await nextAccepted as [net.Socket];
+    const lines = createInterface({ input: fastClient });
+    const received = lines[Symbol.asyncIterator]();
+    try {
+        assert.equal(subscribers.add(fastSocket), true);
+        const acknowledgement = JSON.parse((await received.next()).value!);
+        assert.equal(acknowledgement.protocol, BRIDGE_SUBSCRIBE_ACK);
+        assert.equal(acknowledgement.ok, true);
+        assert.equal(subscribers.add(slowSocket), true);
+        for (let i = 0; i < 2; i += 1) {
+            subscribers.broadcast(line);
+            const event = JSON.parse((await received.next()).value!) as AgentEvent;
+            assert.equal(event.state, "running");
+            assert.ok(subscribers.pendingBytes() <= totalLimit);
+        }
+        // Fast is visited first. Its larger next event fits the individual
+        // budget but not the aggregate while slow retains both earlier events.
+        // Retiring the current enqueue target would sacrifice the wrong reader.
+        subscribers.broadcast(`${JSON.stringify({
+            ...RELAY_EVENT, state: "idle_unseen", summary: "y".repeat(bytes * 2),
+        })}\n`);
+        assert.equal((JSON.parse((await received.next()).value!) as AgentEvent).state, "idle_unseen");
+        assert.ok(subscribers.pendingBytes() <= totalLimit);
+        assert.equal(subscribers.readerCount(), 1);
+        assert.equal(slowSocket.destroyed, true);
+        assert.equal(fastSocket.destroyed, false);
+        await slowClosed;
+        subscribers.broadcast(line);
+        assert.equal((JSON.parse((await received.next()).value!) as AgentEvent).state, "running");
+    } finally {
+        lines.close();
+        subscribers.close();
+        slowClient.destroy();
+        fastClient.destroy();
+        const closed = once(server, "close");
+        server.close();
+        await closed;
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
@@ -1900,5 +2235,239 @@ test("a symlinked hook CLI still runs its configuration checks (RI2)", () => {
         assert.match(result.stderr, /OMP_DEV_SESSION_ID and OMP_TERMINAL_ID/);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the hook CLI delivers valid deeply nested metadata within its byte bound (NIN6)", { timeout: 10000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-hook-deep-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const received = Promise.withResolvers<string>();
+    const server = net.createServer((socket) => {
+        let line = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk: string) => {
+            line += chunk;
+            const newline = line.indexOf("\n");
+            if (newline >= 0) received.resolve(line.slice(0, newline));
+        });
+    });
+    server.listen(socketPath);
+    await once(server, "listening");
+    const depth = 10000;
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL("../src/hooks/oh-my-pi-hook.ts", import.meta.url)), "agent_start",
+    ], {
+        env: {
+            PATH: process.env.PATH ?? "",
+            XDG_RUNTIME_DIR: dir,
+            OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t",
+            OMP_METADATA: '{"n":'.repeat(depth) + "0" + "}".repeat(depth),
+        },
+        timeout: 5000,
+    });
+    let errors = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { errors += chunk; });
+    child.stdout.resume();
+    try {
+        const [status] = await once(child, "close");
+        assert.equal(status, 0, errors);
+        assert.equal(errors, "");
+        const line = await received.promise;
+        assert.ok(Buffer.byteLength(line) <= MAX_BRIDGE_LINE_BYTES);
+        const message = JSON.parse(line);
+        assert.equal(message.native.type, "agent_start");
+        let value: unknown = message.metadata;
+        for (let i = 0; i < depth; i += 1) value = (value as Record<string, unknown>).n;
+        assert.equal(value, 0);
+    } finally {
+        child.kill();
+        server.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a relay that never acquired a subscriber exits and cleans its owned endpoints (NAC11)", { timeout: 10000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-no-readers-"));
+    const socketPath = resolveSocketPath({ XDG_RUNTIME_DIR: dir });
+    const child = spawn(process.execPath, [
+        fileURLToPath(new URL("../src/bridge.ts", import.meta.url)), "--relay",
+    ], {
+        env: {
+            PATH: process.env.PATH ?? "", XDG_RUNTIME_DIR: dir,
+            CODEHARBOR_BRIDGE_RELAY_IDLE_MS: "1000",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ready = Promise.withResolvers<void>();
+    let output = "";
+    let errors = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+        errors += chunk;
+        if (errors.includes(`codeharbor-bridge relay listening on ${socketPath}`)) ready.resolve();
+    });
+    const closed = once(child, "close");
+    void closed.then(
+        () => ready.reject(new Error(`relay exited before listening: ${errors}`)),
+        ready.reject,
+    );
+    try {
+        await ready.promise;
+        await emitHookEvent({
+            event: "agent_start", devSessionId: "no-readers", terminalId: "term",
+        }, socketPath);
+        const [status] = await closed;
+        assert.equal(status, 0, errors);
+        assert.equal(output, "", "the shared relay owns no window stdout");
+        assert.equal(fs.existsSync(socketPath), false);
+        assert.equal(fs.existsSync(`${socketPath}.lock`), false);
+    } finally {
+        child.kill("SIGKILL");
+        await waitForBridgeIdleCleanup(socketPath);
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("producer broadcasts do not extend readerless relay idle lifetime (NAC11)", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let idleCalls = 0;
+    const subscribers = new BridgeSubscribers(() => { idleCalls += 1; }, { idleTimeoutMs: 10 });
+    try {
+        t.mock.timers.tick(9);
+        subscribers.broadcast(`${JSON.stringify(RELAY_EVENT)}\n`);
+        t.mock.timers.tick(1);
+        assert.equal(idleCalls, 1);
+    } finally {
+        subscribers.close();
+    }
+});
+
+test("registered readers cannot inject producer events and ordinary producers remain usable (NAC11)", { timeout: 10000 }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-bridge-reader-role-"));
+    const socketPath = path.join(dir, "readers.sock");
+    const delivered: AgentEvent[] = [];
+    const genuineProducer = Promise.withResolvers<AgentEvent>();
+    const subscribers = new BridgeSubscribers(() => {});
+    const server = await startBridge(socketPath, (event) => {
+        delivered.push(event);
+        if (event.devSessionId === "genuine") genuineProducer.resolve(event);
+    }, { onSubscribe: (socket, version) => subscribers.subscribe(socket, version) });
+    const reader = net.createConnection(socketPath);
+    reader.on("error", () => {});
+    const lines = createInterface({ input: reader });
+    const received = lines[Symbol.asyncIterator]();
+    try {
+        reader.write(`${JSON.stringify({
+            protocol: BRIDGE_SUBSCRIBE_PROTOCOL, version: BRIDGE_SUBSCRIBE_VERSION,
+        })}\n`);
+        const acknowledgement = JSON.parse((await received.next()).value!);
+        assert.equal(acknowledgement.ok, true);
+        const closed = once(reader, "close");
+        reader.write(`${JSON.stringify(toBridgeMessage({
+            event: "agent_start", devSessionId: "injected", terminalId: "term",
+        }))}\n`);
+        await closed;
+        assert.deepEqual(delivered, []);
+        await emitHookEvent({
+            event: "agent_start", devSessionId: "genuine", terminalId: "term",
+        }, socketPath);
+        assert.equal((await genuineProducer.promise).state, "running");
+        assert.equal(delivered.length, 1);
+    } finally {
+        lines.close();
+        reader.destroy();
+        subscribers.close();
+        const closed = once(server, "close");
+        server.close();
+        await closed;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("CLI and default hook producers reach the advertised endpoint despite inherited runtime paths (NTC9)", { timeout: 10000 }, async () => {
+    const target = await startFakeBridge();
+    const inherited = await startFakeBridge();
+    const names = [AGENT_SOCKET_ENV, "XDG_RUNTIME_DIR", "HOME"];
+    const previous = new Map(names.map((name) => [name, process.env[name]]));
+    const wrongEndpoint = inherited.waitForLines(1).then(() => false);
+    try {
+        const env = {
+            [AGENT_SOCKET_ENV]: target.socketPath,
+            XDG_RUNTIME_DIR: inherited.dir,
+            HOME: path.join(inherited.dir, "old-home"),
+            OMP_DEV_SESSION_ID: "advertised", OMP_TERMINAL_ID: "term",
+            OMP_TOOL: "ask",
+        };
+        const cli = await runHookScript(["tool_call"], env);
+        assert.equal(cli.code, 0, cli.stderr);
+        assert.equal(cli.stdout, "");
+        assert.equal(cli.stderr, "");
+        assert.equal(await Promise.race([
+            target.waitForLines(1).then(() => true), wrongEndpoint,
+        ]), true, "the CLI must not route through the inherited tmux directory");
+        assert.equal(processBridgeLine(target.lines[0])?.state, "waiting_input");
+        process.env[AGENT_SOCKET_ENV] = target.socketPath;
+        process.env.XDG_RUNTIME_DIR = inherited.dir;
+        process.env.HOME = env.HOME;
+        await emitHookEvent({ event: "agent_end", devSessionId: "advertised", terminalId: "term" });
+        assert.equal(await Promise.race([
+            target.waitForLines(2).then(() => true), wrongEndpoint,
+        ]), true, "the default emitter must use the same advertised route");
+        assert.equal(processBridgeLine(target.lines[1])?.state, "idle_unseen");
+        assert.equal(inherited.connections, 0);
+    } finally {
+        for (const [name, value] of previous) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+        await target.close();
+        await inherited.close();
+    }
+});
+
+test("default hook resolution rejects invalid explicit routes asynchronously without fallback (NTC9)", { timeout: 10000 }, async () => {
+    const inherited = await startFakeBridge();
+    const previousEndpoint = process.env[AGENT_SOCKET_ENV];
+    const previousRuntime = process.env.XDG_RUNTIME_DIR;
+    try {
+        process.env.XDG_RUNTIME_DIR = inherited.dir;
+        for (const endpoint of ["", "relative.sock"]) {
+            process.env[AGENT_SOCKET_ENV] = endpoint;
+            let pending: Promise<BridgeMessage> | undefined;
+            assert.doesNotThrow(() => {
+                pending = emitHookEvent({ event: "agent_start", devSessionId: "s", terminalId: "t" });
+            });
+            assert.ok(pending);
+            await assert.rejects(pending, /CODEHARBOR_AGENT_SOCKET/);
+        }
+        assert.equal(inherited.connections, 0);
+    } finally {
+        if (previousEndpoint === undefined) delete process.env[AGENT_SOCKET_ENV];
+        else process.env[AGENT_SOCKET_ENV] = previousEndpoint;
+        if (previousRuntime === undefined) delete process.env.XDG_RUNTIME_DIR;
+        else process.env.XDG_RUNTIME_DIR = previousRuntime;
+        await inherited.close();
+    }
+});
+
+test("the hook entrypoint reports invalid explicit endpoints without throwing or fallback (NTC9)", { timeout: 10000 }, async () => {
+    const inherited = await startFakeBridge();
+    try {
+        for (const endpoint of ["", "relative.sock", "/run/invalid\0.sock"]) {
+            const diagnostics = await captureStderr(async () => {
+                await assert.doesNotReject(main(["node", "hook.ts", "agent_start"], {
+                    [AGENT_SOCKET_ENV]: endpoint,
+                    XDG_RUNTIME_DIR: inherited.dir,
+                    OMP_DEV_SESSION_ID: "s", OMP_TERMINAL_ID: "t",
+                }));
+            });
+            assert.match(diagnostics.join(""), /CODEHARBOR_AGENT_SOCKET/);
+        }
+        assert.equal(inherited.connections, 0);
+    } finally {
+        await inherited.close();
     }
 });

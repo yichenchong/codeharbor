@@ -56,7 +56,7 @@ public:
     // How often to ask. Five seconds is chosen against what the answer is worth:
     // the reading it carries has one-second granularity, the state it feeds is a
     // coarse busy/idle badge in a sidebar, and the request is a single small
-    // frame that costs the daemon one `tmux list-sessions`. Polling faster would
+    // frame that costs the daemon one `tmux list-windows -a`. Polling faster would
     // buy resolution the underlying field does not have.
     static constexpr int kPollIntervalMs = 5000;
     // Policy, not physics; a test compresses it instead of spending real
@@ -76,10 +76,10 @@ signals:
     // server's clock; `alive` is whether tmux still has a session for the pane's
     // target at all.
     //
-    // Emitted ONLY for a pane the server could date. A pane whose activity time
-    // came back null produces no signal, because "the daemon does not know" is
-    // not the same claim as "the pane has been quiet", and the consumer must not
-    // have to tell them apart from an age.
+    // Emitted ONLY for a pane whose activity time and listing clock are
+    // non-negative JavaScript-safe integers. Null or malformed times produce
+    // no signal: "the daemon does not know" is not the same claim as "the pane
+    // has been quiet".
     void activityObserved(const QString& devSessionId, const QString& terminalId,
                           qint64 ageMs, bool alive);
 
@@ -98,11 +98,10 @@ private:
     QSet<QString> m_devSessionIds;
     QTimer m_timer;
     int m_pollIntervalMs = kPollIntervalMs;
-    // Whether a request issued to m_client is still unanswered. A tick that
-    // finds this set is SKIPPED rather than queued: a daemon that has gone slow
-    // or wedged would otherwise accumulate one identical outstanding request per
-    // five seconds, forever, and every one of them would be answered at once
-    // when it recovered. Nothing is lost by skipping — the next tick asks the
+    // Whether a request issued to m_client is unanswered or publishing its
+    // result. Nested polls and ticks that find this set are skipped: a slow
+    // daemon must not accumulate requests, and an activity slot must not let a
+    // newer listing overtake the one being published. The next tick asks the
     // same question and gets a fresher answer than the one that was dropped.
     bool m_inFlight = false;
 };

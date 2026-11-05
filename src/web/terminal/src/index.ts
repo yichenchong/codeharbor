@@ -45,15 +45,17 @@ import {
 } from "./theme.ts";
 
 export interface TerminalBridge {
-    /** Forward user keystrokes to the remote PTY (SPEC 5.1). */
-    sendInput(data: string): void;
+    /** Snapshot stamped on queued input; changes whenever the PTY is replaced. */
+    readonly inputGeneration: number;
+    /** Completion reports whether the entire chunk reached that same PTY. */
+    sendInput(data: string, generation: number, done: (accepted: boolean) => void): void;
     /** Forward input the terminal produced as raw BYTES rather than text, with
      *  `base64` decoding to those exact bytes (SPEC 5.1). xterm emits a mouse
      *  report this way when the negotiated encoding is the default X10 one,
      *  because such a report can carry bytes above 0x7f; sendInput() would lose
      *  them to the C++ side's UTF-8 encode. Both slots feed the same PTY through
      *  the same queue, so ordering between a report and a keystroke is kept. */
-    sendBinaryInput(base64: string): void;
+    sendBinaryInput(base64: string, generation: number, done: (accepted: boolean) => void): void;
     /** Notify the controller of a renderer resize (SPEC 5.1). */
     resize(cols: number, rows: number): void;
     /** Report view visibility so the controller can suspend/resume the
@@ -80,6 +82,8 @@ export interface TerminalHost {
     /** Called by C++ with the current connection lifecycle state; the value is
      *  a ch::TerminalState string from SessionState.h (SPEC 5.6). */
     setConnectionState(state: string): void;
+    /** Update input ownership before output from a replacement PTY is parsed. */
+    setInputGeneration(generation: number): void;
     /** Called by C++ to clear the visible screen buffer (SPEC 5.1). */
     clear(): void;
     /** Tear down the renderer: dispose xterm.js (and its addons) and disconnect
@@ -98,6 +102,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     }
     const pixelRatio: DevicePixelRatioController =
         createDevicePixelRatioController(pageWindow);
+    let disposed = false;
+    let recoveryReloadTimer: number | undefined;
+    let repaintResizeTimer: number | undefined;
     // MOUSE REPORTING: the tmux session this pane attaches to is created with
     // `mouse on` scoped to that session (see
     // ch::TerminalController::tmuxNewSessionCommand), so tmux asks this page to
@@ -273,6 +280,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             surface,
             preferDom: recoveredFromContextLoss,
             recover: () => {
+                if (disposed) {
+                    return true;
+                }
                 try {
                     if (!pageWindow.sessionStorage
                         || pageWindow.sessionStorage.getItem(kDomOnlyKey) === "1") {
@@ -285,7 +295,11 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 console.warn("CodeHarbor terminal is reloading without WebGL");
                 // Deferred: this runs inside a browser event handler, and
                 // navigating from one is refused by some embedders.
-                pageWindow.setTimeout(() => pageWindow.location.reload(), 0);
+                recoveryReloadTimer = pageWindow.setTimeout(() => {
+                    if (!disposed) {
+                        pageWindow.location.reload();
+                    }
+                }, 0);
                 return true;
             },
         },
@@ -295,9 +309,12 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // belongs to the program running in the terminal — is set up further down,
     // next to the copy helper and the focus helper it needs.
 
+    let inputGeneration = bridge.inputGeneration;
     const input = new TerminalInputWriter({
-        sendInput: (data) => bridge.sendInput(data),
-        sendBinaryInput: (base64) => bridge.sendBinaryInput(base64),
+        get inputGeneration() { return inputGeneration; },
+        sendInput: (data, generation, done) => bridge.sendInput(data, generation, done),
+        sendBinaryInput: (base64, generation, done) =>
+            bridge.sendBinaryInput(base64, generation, done),
     });
 
 
@@ -411,7 +428,7 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // size in place, and the ResizeObserver fires again the moment the pane
     // regains a box.
     function fitToSurface(): void {
-        if (surface.clientWidth === 0 || surface.clientHeight === 0) {
+        if (disposed || surface.clientWidth === 0 || surface.clientHeight === 0) {
             return;
         }
         fit.fit();
@@ -456,7 +473,11 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // user's screen back without a C++ round trip.
     if (recoveredFromContextLoss && term.cols > 2) {
         bridge.resize(term.cols - 1, term.rows);
-        pageWindow.setTimeout(() => bridge.resize(term.cols, term.rows), 120);
+        repaintResizeTimer = pageWindow.setTimeout(() => {
+            if (!disposed) {
+                bridge.resize(term.cols, term.rows);
+            }
+        }, 120);
     }
 
     // Re-fit on container resize; fit() emits onResize only when dims change.
@@ -494,8 +515,8 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     //     item is precisely what stops the WebEngineView rendering, which is
     //     what turns document.visibilityState to "hidden"; it says nothing
     //     about an in-document collapse.
-    //   * ch::TerminalBridge::ready() — reports visible when this page mounts,
-    //     to release the buffer retained while the page was loading.
+    //   * ch::TerminalBridge::ready(false) — mounts the renderer but retains
+    //     output until this page's first real visibility observation.
     // They exist because they can speak before this page has a renderer.
     //
     // Consequence: another caller can move ch::TerminalController's flag behind
@@ -511,6 +532,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // in a collapsed splitter before this observer's asynchronous callback.
     let intersecting = false;
     function reportVisibility(): void {
+        if (disposed) {
+            return;
+        }
         bridge.notifyViewVisible(
             isRendererVisible(intersecting, element.ownerDocument.visibilityState),
         );
@@ -540,7 +564,6 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
     // gone. Both are covered by refusing to touch the terminal once it is
     // disposed: xterm.js' write buffer has no disposal guard of its own, so a
     // single late batch of output would throw inside the signal dispatch.
-    let disposed = false;
     type TerminalPageApi = typeof pageWindow & {
         applyTheme?: (roles: unknown) => void;
         codeharborSetTerminalPreferences?: (fontPoints: number, pixelRatio: number) => void;
@@ -646,9 +669,10 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 console.warn("CodeHarbor terminal cannot read the clipboard");
                 return;
             }
+            const pasteGeneration = inputGeneration;
             void clipboard.readText().then(
                 (text) => {
-                    if (text.length > 0 && !disposed) {
+                    if (text.length > 0 && !disposed && inputGeneration === pasteGeneration) {
                         term.paste(text);
                     }
                 },
@@ -699,6 +723,9 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             // ratio changes, which is only checkable if both are reported.
             cols: term.cols,
             rows: term.rows,
+            inputGeneration,
+            documentHasFocus: element.ownerDocument.hasFocus(),
+            inputFocused: element.ownerDocument.activeElement === term.textarea,
             // What the mouse is doing: whether the page holds a selection of
             // its own, whether this application's menu is on screen, and
             // whether a program on the far end is asking for mouse reports at
@@ -741,9 +768,18 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
             }
             writer.write(data, bytes);
         },
+        setInputGeneration(generation: number): void {
+            if (!disposed && inputGeneration !== generation) {
+                inputGeneration = generation;
+                input.cancelPending();
+            }
+        },
         setConnectionState(state: string): void {
             if (disposed) {
                 return;
+            }
+            if (state !== "ready") {
+                input.cancelPending();
             }
             status.dataset.state = state;
             status.textContent = state;
@@ -759,6 +795,8 @@ export function mountTerminal(element: HTMLElement, bridge: TerminalBridge): Ter
                 return;
             }
             disposed = true;
+            pageWindow.clearTimeout(recoveryReloadTimer);
+            pageWindow.clearTimeout(repaintResizeTimer);
             input.close();
             if (pageApi.applyTheme === applyPageTheme) {
                 delete pageApi.applyTheme;
@@ -826,12 +864,12 @@ export interface TerminalChannelObject extends TerminalBridge {
     write: Signal<(data: string, bytes: number) => void>;
     /** Lifecycle transition -> host.setConnectionState. */
     connectionStateChanged: Signal<(state: string) => void>;
+    inputTransportChanged: Signal<(generation: number) => void>;
     /** The app asked for the visible screen buffer to be dropped -> host.clear. */
     clearRequested: Signal<() => void>;
-    /** Optional handshake: the renderer is mounted, so the controller may stop
-     *  buffering and replay what the pane missed while the page was loading
-     *  (SPEC 5.4). Optional so an older host without the slot still works. */
-    ready?(): void;
+    /** Mount handshake with this renderer's visibility. False keeps output
+     *  retained until the first intersection report (SPEC 5.4). */
+    ready?(visible: boolean): void;
 }
 
 /** Minimal ambient shape of the qwebchannel.js runtime injected by the host. */
@@ -914,9 +952,12 @@ export function connectTerminal(element: HTMLElement): void {
         // as long as the channel exists.
         const onWrite = (data: string, bytes: number): void => host.write(data, bytes);
         const onConnectionStateChanged = (state: string): void => host.setConnectionState(state);
+        const onInputTransportChanged = (generation: number): void =>
+            host.setInputGeneration(generation);
         const onClearRequested = (): void => host.clear();
         bridge.write.connect(onWrite);
         bridge.connectionStateChanged.connect(onConnectionStateChanged);
+        bridge.inputTransportChanged.connect(onInputTransportChanged);
         bridge.clearRequested.connect(onClearRequested);
         // The state reached before this page finished loading is already in the
         // property cache, so the strip is correct without waiting for a signal.
@@ -935,14 +976,15 @@ export function connectTerminal(element: HTMLElement): void {
         (element.ownerDocument.defaultView ?? window).addEventListener("pagehide", () => {
             bridge.write.disconnect(onWrite);
             bridge.connectionStateChanged.disconnect(onConnectionStateChanged);
+            bridge.inputTransportChanged.disconnect(onInputTransportChanged);
             bridge.clearRequested.disconnect(onClearRequested);
             connectingElements.delete(element);
             host.dispose();
         }, { once: true });
-        // Handshake LAST, once every host callback is connected: the controller
-        // has been buffering output since the channel opened and replays it into
-        // a renderer that is now listening (SPEC 5.4).
-        bridge.ready?.();
+        // Handshake LAST, once every host callback is connected. The first
+        // intersection is still unknown during this synchronous mount, so the
+        // page stays hidden until its observer reports the real visibility.
+        bridge.ready?.(false);
     };
     try {
         // The constructor sends the handshake immediately and can throw if the

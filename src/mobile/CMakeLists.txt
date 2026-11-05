@@ -28,6 +28,9 @@ qt_add_library(ch_mobile STATIC
     MobileAppController.cpp
     MobileCapabilities.h
     MobileCapabilities.cpp
+    MobileWebViewPolicy.h
+    MobileWebViewPolicy.cpp
+    MobileWebViewPolicyAdapter.h
     PaneListModel.h
     PaneListModel.cpp
     MobileTerminalSession.h
@@ -90,10 +93,14 @@ target_link_libraries(ch_mobile PUBLIC
 # The SEPARATE URI is therefore deliberate: CodeHarbor.Mobile is the QML module
 # (src/mobile/qml), CodeHarbor.Mobile.Core is this C++ type module. Two targets
 # cannot share one URI.
+# Parent QML pages and their C++ submodule must share one filesystem import
+# root, just as their URIs share CodeHarbor.Mobile. Runtime resources still use
+# the same qrc URIs; this root is for generated qmldir/qmltypes tooling.
+set(_ch_mobile_qml_import_root "${CMAKE_CURRENT_BINARY_DIR}")
 qt_add_qml_module(ch_mobile
     URI CodeHarbor.Mobile.Core
     VERSION 1.0
-    OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/CodeHarbor/Mobile/Core
+    OUTPUT_DIRECTORY ${_ch_mobile_qml_import_root}/CodeHarbor/Mobile/Core
 )
 
 # Feature probes owned by the root CMakeLists (optional find_package of Qt6::Pdf
@@ -126,6 +133,29 @@ endif()
 # statically linked binary (Qt for iOS), which is a blank page at runtime.
 if(CH_HAVE_QTWEBVIEW AND TARGET Qt6::WebView AND TARGET Qt6::WebViewQuick)
     target_link_libraries(ch_mobile PUBLIC Qt6::WebView Qt6::WebViewQuick)
+endif()
+
+if(APPLE)
+    enable_language(OBJCXX)
+    set_target_properties(ch_mobile PROPERTIES
+        OBJCXX_STANDARD ${CMAKE_CXX_STANDARD}
+        OBJCXX_STANDARD_REQUIRED ON
+        OBJCXX_EXTENSIONS OFF)
+    set(_ch_mobile_webview_frameworks "-framework Foundation" "-framework WebKit")
+    if(IOS)
+        list(APPEND _ch_mobile_webview_frameworks "-framework UIKit")
+    else()
+        list(APPEND _ch_mobile_webview_frameworks "-framework AppKit")
+    endif()
+endif()
+
+if(CH_HAVE_QTWEBVIEW AND ANDROID)
+    target_sources(ch_mobile PRIVATE MobileWebViewPolicyAndroid.cpp)
+elseif(CH_HAVE_QTWEBVIEW AND APPLE)
+    target_sources(ch_mobile PRIVATE MobileWebViewPolicyDarwin.mm)
+    set_source_files_properties(MobileWebViewPolicyDarwin.mm
+                               PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(ch_mobile PRIVATE ${_ch_mobile_webview_frameworks})
 endif()
 
 # Resolving a persisted key reference back to bytes is platform work: an Android

@@ -49,6 +49,8 @@ Page {
     readonly property string paneId: pane && pane.paneId ? String(pane.paneId) : ""
     readonly property string repoRoot: page.host ? page.host.activeSessionRepoRoot : ""
     readonly property string devSessionId: page.host ? page.host.activeSessionId : ""
+    readonly property string acceptedServerId: page.host && page.host.acceptedServerId
+                                              ? String(page.host.acceptedServerId) : ""
 
     // What the pane currently has open. Seeded from the layout leaf's stored url
     // and then reassigned in place by an in-pane navigation (a directory listing
@@ -146,6 +148,12 @@ Page {
         };
         if (file === "ViewerUnsupportedPage.qml")
             properties["kind"] = kind;
+        if (file === "ViewerEditorPage.qml") {
+            // Recovery belongs to the accepted server/session/leaf identity,
+            // never the profile, repository path or a mobile-generated id.
+            properties["acceptedServerId"] = Qt.binding(() => page.acceptedServerId);
+            properties["devSessionId"] = Qt.binding(() => page.devSessionId);
+        }
         return properties;
     }
 

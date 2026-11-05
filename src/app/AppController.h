@@ -51,6 +51,9 @@ class AppController : public QObject {
     // `app.settings.<name>` without a null check.
     Q_PROPERTY(ch::AppSettings* settings READ settings CONSTANT)
     Q_PROPERTY(QString serverId READ serverId WRITE setServerId NOTIFY serverIdChanged)
+    // Unlike serverId (retained for reconnect), this is usable only after the
+    // current wire's server.info has been accepted. Recovery scopes use it.
+    Q_PROPERTY(QString acceptedServerId READ acceptedServerId NOTIFY acceptedServerIdChanged)
     // Connection surface (workstream U integration). These are null until
     // setConnection() injects them, so a test constructing a bare AppController
     // keeps working exactly as before.
@@ -67,7 +70,10 @@ class AppController : public QObject {
                    NOTIFY viewerCommandsChanged)
 
 public:
-    explicit AppController(CodeharbordClient* client, QObject* parent = nullptr);
+    // Empty settingsPath uses the native production store. An explicit path
+    // keeps embedded/test object graphs off native user settings.
+    explicit AppController(CodeharbordClient* client, QObject* parent = nullptr,
+                           QString settingsPath = QString());
     ~AppController() override;
 
     SessionsModel* sessionsModel() const { return m_sessionsModel; }
@@ -76,6 +82,11 @@ public:
     LogBuffer* logBuffer() const { return m_logBuffer; }
 
     QString serverId() const { return m_serverId.value; }
+    QString acceptedServerId() const
+    {
+        return !m_identityPending && m_acceptedServerId == m_serverId.value
+            ? m_acceptedServerId : QString();
+    }
     void setServerId(const QString& serverId);
 
     // Wire the live agent-status monitor (SPEC 6.4) whose per-terminal state is
@@ -90,7 +101,9 @@ public:
     // main.cpp. TerminalFactory reports only server-resolved terminal_panes
     // identities; AppController keeps the current server's state map and
     // merges it into each authoritative workspace row without inventing
-    // client-side terminal identities.
+    // client-side terminal identities. This controller also owns its server-id
+    // and workspaceReady handoff: only accepted server.info plus the completed
+    // layout-context switch may release terminal resolution/attachment.
     void setTerminalFactory(TerminalFactory* factory);
 
     // Wire the per-pane editor factory (workstream E). Ownership stays with the
@@ -131,7 +144,9 @@ public:
     // (server.info), never from the local profile id: workspace rows are keyed
     // by it on the remote side, so a client-minted id would orphan the user's
     // real groups/sessions whenever a profile was re-added or a second machine
-    // connected.
+    // connected. Explicit connects retire the previous visible workspace before
+    // dialing, but preserve its remembered session. Workspace edits wait for
+    // the new wire's server.info; automatic reconnect keeps its existing panes.
     Q_INVOKABLE void connectToProfile(QString profileId);
     Q_INVOKABLE void disconnectServer();
 
@@ -176,10 +191,13 @@ public:
     // Session it is not attached to — against a v7 server every generic-harness
     // pane the user is not looking at reports Unknown forever, since
     // ch::TmuxActivityPoller's request is refused and nothing else can speak
-    // for a detached pane. Against anything older the user gets a healthy SSH
-    // session with a permanently empty sidebar, or terminals that never attach.
-    // See adoptServerIdentity().
-    static constexpr int kMinimumServerSchemaVersion = 8;
+    // for a detached pane; 9 adds workspace.ensureInitialLayout, which creates
+    // the first layout and its terminal identities atomically. Older servers
+    // cannot safely initialize a new Dev Session with this client. 10 requires
+    // the actual agent-event socket so tmux children cannot route through a
+    // stale master environment. This is the RPC compatibility version, not the
+    // SQLite schema migration version. See adoptServerIdentity().
+    static constexpr int kMinimumServerSchemaVersion = 10;
 
     // Make a Dev Session current: loads both region layouts and remembers it so
     // the next launch reopens the same session.
@@ -243,6 +261,7 @@ public:
 
 signals:
     void serverIdChanged();
+    void acceptedServerIdChanged();
     void error(QString message);
     void refreshed();
     void connectionChanged();
@@ -269,6 +288,7 @@ private:
     // Emit `error` from an optional RpcError; returns true when an error was
     // present (caller should not treat the op as successful).
     bool reportIfError(const std::optional<RpcError>& err);
+    bool canMutateWorkspace();
 
     // Build the sidebar rows from the last successful list() result cached in
     // m_lastNodes, merging live per-terminal agent state from m_agentMonitor
@@ -326,6 +346,8 @@ private:
     // the pane at all. terminalPaneHarness() flattens both to an empty string,
     // which is ambiguous here: an empty harness is also "plain shell".
     std::optional<QString> lookupTerminalPaneHarness(const QString& terminalPaneId) const;
+    void persistTerminalPaneHarness(QString terminalPaneId, QString harness);
+    void setAcceptedServerId(QString serverId);
 
     // The name to blame in a kill-failure message: the Dev Session's or the
     // group's own name from the last authoritative tree, falling back to the id
@@ -353,18 +375,19 @@ private:
                                const QString& subject);
 
     // Build a WorkspaceDb callback that, once the async response arrives, is a
-    // no-op if this controller was already destroyed (the shared client keeps
-    // pending callbacks alive past our lifetime), emits `error` verbatim on
-    // RpcError, and otherwise reloads the sidebar from authoritative server
-    // state. `Payload...` matches the callback's leading result argument: empty
+    // no-op if this controller was already destroyed or its workspace context
+    // was superseded, emits `error` verbatim on a current RpcError, and otherwise
+    // reloads the sidebar from authoritative server state. `Payload...` matches
+    // the callback's leading result argument: empty
     // for an OkCallback, one std::optional<T> for a typed-result callback (the
     // payload is ignored — refresh() always re-reads the full tree).
     template <typename... Payload>
     std::function<void(Payload..., std::optional<RpcError>)> refreshOnSuccess()
     {
         QPointer<AppController> self(this);
-        return [self](Payload..., std::optional<RpcError> err) {
-            if (!self)
+        const quint64 generation = m_workspaceGeneration;
+        return [self, generation](Payload..., std::optional<RpcError> err) {
+            if (!self || generation != self->m_workspaceGeneration)
                 return;
             if (self->reportIfError(err))
                 return;
@@ -383,9 +406,15 @@ private:
     // while the log sheet is closed.
     LogBuffer* m_logBuffer = nullptr;
     ServerId m_serverId;
+    QString m_acceptedServerId;
     // Monotonic stamp so a stale (out-of-order) refresh result never overwrites
     // a newer one; see refresh().
     quint64 m_refreshGeneration = 0;
+    // Server switches may be superseded synchronously by model/layout signals.
+    quint64 m_serverGeneration = 0;
+    // Mutations and multi-call delete cleanup belong to one server/connect
+    // context, even when a signal synchronously switches to another one.
+    quint64 m_workspaceGeneration = 0;
     // Live agent-status monitor (SPEC 6.4), not owned; set via setAgentMonitor.
     // QPointer turns null if the caller destroys its monitor before this
     // controller, so a late rebuild cannot dereference a dead observer.
@@ -422,6 +451,9 @@ private:
     // re-derive rows (and re-merge agent state) without another server round-
     // trip when an agent event arrives.
     QVector<GroupNode> m_lastNodes;
+    // Retained rows are not authority for automatic harness adoption until this
+    // wire's accepted identity has produced a fresh workspace.list.
+    bool m_workspaceSnapshotReady = false;
 
     // Observations that arrived before any tree could judge them: Dev Session id
     // -> terminal pane id -> observed harness. Nested rather than keyed by a
@@ -460,6 +492,11 @@ private:
     // A reply and any deferred refusal belong to one wire only. Replacing the
     // connection or beginning a newer identity lookup retires that work.
     quint64 m_identityGeneration = 0;
+    // A wired SSH/RPC transport alone does not establish the workspace identity.
+    bool m_identityPending = false;
+    // A user connect chain is distinct from the server.info lookup: bootstrap
+    // state changes advance the latter while the same connect is still active.
+    quint64 m_connectGeneration = 0;
     // Refuse a server we are wired to but cannot drive (too old, or one that
     // reports no identity): report `message`, then drop the link and land on
     // `failed`. Both callers run INSIDE a CodeharbordClient response callback
@@ -543,6 +580,7 @@ private:
     // may turn out to be the EXPECTED host-key refusal rather than a fault.
     QString m_heldConnectError;
     QString m_activeSessionId;
+    quint64 m_activeSessionGeneration = 0;
     // Guards against a second connect being started while one is in flight or a
     // host-key decision is pending. Stays set across the prompt: the attempt is
     // not over until resolveHostKey() answers it.

@@ -34,8 +34,13 @@ Rectangle {
     // The host stamps every write with the session and layout load generation
     // that was current when the gesture began. A delayed pane callback can
     // therefore be rejected in C++ even if QML has already switched sessions.
+    property string serverId: ""
+    property string acceptedServerId: ""
     property string sessionId: ""
     property double layoutGeneration: 0
+    // Explicit layout loads retire document objects; reconnect refreshes only
+    // advance layoutGeneration so unchanged authoritative leaves retain RAM.
+    property double paneGeneration: 0
     // Main.qml sets this for production. Leaving it false is only for the
     // standalone QML component tests, which exercise the legacy signals.
     property bool hostStampsWrites: false
@@ -224,6 +229,8 @@ Rectangle {
             pane.messageRequested.connect(
                 message => region.paneOwner.messageRequested(message));
         }
+        pane.acceptedServerId = region.paneOwner.acceptedServerId;
+        pane.sessionId = region.paneOwner.sessionId;
         // Refreshed on EVERY take, not only at mint: this is the moment the
         // pane becomes part of whatever tree is on screen now, so it is the
         // moment its reports start belonging to that session.
@@ -549,7 +556,10 @@ Rectangle {
         if (!leaf)
             return;
         const url = region.node.url ? region.node.url : "";
-        const pane = region.paneOwner.takePane(key, paneHost, { url: url });
+        const pane = region.paneOwner.takePane(key, paneHost,
+                                               { url: url, placeholder: key.length === 0,
+                                                 acceptedServerId: region.paneOwner.acceptedServerId,
+                                                 sessionId: region.paneOwner.sessionId });
         if (!pane)
             return;
         // `forcedKind` is a transient "Open as" choice, and it belongs to the
@@ -625,20 +635,38 @@ Rectangle {
     }
 
     onSessionIdChanged: region.resetPanesForNewTree()
+    onServerIdChanged: region.resetPanesForNewTree()
 
-    // A reload of the SAME session bumps the generation without changing the
-    // session id, and a reloaded tree can name the same panes, so no take would
-    // run and the old panes and their stamps would survive into a tree they no
-    // longer belong to.
-    onLayoutGenerationChanged: region.resetPanesForNewTree()
+    onAcceptedServerIdChanged: {
+        if (!region.rootRegion) {
+            for (const key in region.paneCache)
+                region.paneCache[key].acceptedServerId = region.acceptedServerId;
+        }
+    }
+
+    function advanceLayoutGeneration() {
+        if (region.rootRegion)
+            return;
+        region.pendingOpenTargets = ({});
+        for (const key in region.paneCache) {
+            region.paneCache[key].retireLayoutRequests();
+            region.paneStamps[key] = {
+                sessionId: String(region.sessionId),
+                generation: Number(region.layoutGeneration)
+            };
+        }
+    }
+
+    onLayoutGenerationChanged: region.advanceLayoutGeneration()
+    onPaneGenerationChanged: region.resetPanesForNewTree()
 
     // Rebuild the leaf this region was showing after the owner threw the cache
     // away. Every region in the tree listens, the owner included: a region's
     // record of "I am showing pane X" outlives X itself, so without this it
     // goes on believing a destroyed pane is on screen and stays BLANK until
     // its `node` happens to change shape. `node` need not change at all — the
-    // host binds `node` and `layoutGeneration` to the same object, and a reload
-    // that republishes an identical tree only moves the generation.
+    // host binds node and paneGeneration to the same facade; an explicit load
+    // that republishes an identical tree only moves the document generation.
     Connections {
         target: region.paneOwner
         function onPaneEpochChanged() {
@@ -762,7 +790,12 @@ Rectangle {
             // off `onResizingChanged`, and SplitView only reports `resizing`
             // for a pointer drag, so a split resized with the arrow keys would
             // move on screen and then be forgotten at the next reload.
-            handle: AppSplitHandle { onResized: split.publishRatios() }
+            handle: AppSplitHandle {
+                id: keyHandle
+                onResizeStarted: split.beginKeyboardResize(keyHandle)
+                onResizeCancelled: split.cancelKeyboardResize()
+                onResized: split.finishKeyboardResize(keyHandle)
+            }
 
             // SplitView stretches only the FIRST fillWidth/fillHeight item, so
             // every later child would fall back to a Loader's implicit size of 0
@@ -787,6 +820,33 @@ Rectangle {
             // when publishRatios() is called directly; it then uses the path
             // the branch has now.
             property var resizePath: null
+            property var keyboardHandle: null
+
+            function beginKeyboardResize(handle) {
+                split.keyboardHandle = handle;
+                split.resizeSessionId = region.paneOwner.sessionId;
+                split.resizeGeneration = region.paneOwner.layoutGeneration;
+                split.resizePath = region.nodePath.slice();
+            }
+
+            function finishKeyboardResize(handle) {
+                if (split.keyboardHandle !== handle)
+                    return;
+                split.publishRatios();
+                split.cancelKeyboardResize();
+            }
+
+            function cancelKeyboardResize() {
+                const handle = split.keyboardHandle;
+                split.keyboardHandle = null;
+                if (handle)
+                    handle.cancelResize();
+                if (!split.resizing) {
+                    split.resizePath = null;
+                    split.resizeSessionId = "";
+                    split.resizeGeneration = 0;
+                }
+            }
 
             // The extent along the split axis that the sizes currently on the
             // children were computed for. A resize scales them by the ratio
@@ -921,6 +981,7 @@ Rectangle {
 
             onResizingChanged: {
                 if (resizing) {
+                    split.cancelKeyboardResize();
                     split.resizeSessionId = region.paneOwner.sessionId;
                     split.resizeGeneration = region.paneOwner.layoutGeneration;
                     split.resizePath = region.nodePath;
@@ -939,13 +1000,17 @@ Rectangle {
             Connections {
                 target: region
                 function onNodeChanged() {
+                    split.cancelKeyboardResize();
                     split.ratiosApplied = false;
                     split.applyRatios();
                     split.updateNodePaths();
                 }
                 function onNodePathChanged() {
+                    split.cancelKeyboardResize();
                     split.updateNodePaths();
                 }
+                function onSessionIdChanged() { split.cancelKeyboardResize(); }
+                function onLayoutGenerationChanged() { split.cancelKeyboardResize(); }
             }
             Repeater {
                 id: childRepeater
@@ -997,10 +1062,16 @@ Rectangle {
                                                        rootRegion: region.paneOwner,
                                                        nodePath: region.nodePath.concat(
                                                            [String(childLoader.index)]),
+                                                       serverId: Qt.binding(
+                                                           () => region.paneOwner.serverId),
+                                                       acceptedServerId: Qt.binding(
+                                                           () => region.paneOwner.acceptedServerId),
                                                        sessionId: Qt.binding(
                                                            () => region.paneOwner.sessionId),
                                                        layoutGeneration: Qt.binding(
                                                            () => region.paneOwner.layoutGeneration),
+                                                       paneGeneration: Qt.binding(
+                                                           () => region.paneOwner.paneGeneration),
                                                        hostStampsWrites: Qt.binding(
                                                            () => region.paneOwner.hostStampsWrites) })
                     onLoaded: {
