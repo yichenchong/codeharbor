@@ -138,6 +138,7 @@ private slots:
     void closeStopsFlushingAndNeverExposesKill();
     void anAnswerThisPaneIsNotWaitingForIsNeverAttached();
     void resizeNeverOutgrowsTheGridTheScreenCanHold();
+    void reopeningAnIdentityKeepsTheControllerAndScreenGeometryInSync();
     void workspaceReadinessRetriesOnlyTheVisibleOpenIdentity();
     void retargetingDropsThePreviousPanesBuffersAndModes();
     void destroyingTheScreenInvalidatesThePaintedView();
@@ -148,6 +149,7 @@ private slots:
     void aScrolledBackViewStaysPinnedWhileOutputArrives();
     void theCursorIsFilledOnlyWhileThePaneOwnsTheKeyboard();
     void aFocusedCursorNeverRevealsConcealedText();
+    void terminalGlyphPositionsDoNotDependOnInvisibleAttributeBoundaries();
 };
 
 // The flow-control round trip ch::TerminalBridge used to carry through the page.
@@ -557,6 +559,27 @@ void TstMobileTerminal::resizeNeverOutgrowsTheGridTheScreenCanHold()
     QCOMPARE(opened.screen()->columns(), MobileTerminalSession::kMaxColumns);
 }
 
+void TstMobileTerminal::reopeningAnIdentityKeepsTheControllerAndScreenGeometryInSync()
+{
+    MobileTerminalSession session(nullptr);
+    session.open(QStringLiteral("dev"), QStringLiteral("terminal-1"),
+                 QStringLiteral("row"), QString(), 80, 24);
+    FakeChannel channel;
+    session.controller()->setTransport(&channel);
+    session.open(QStringLiteral("dev"), QStringLiteral("terminal-1"),
+                 QStringLiteral("row"), QString(), 40, 12);
+    QCOMPARE(session.screen()->columns(), 40);
+    QCOMPARE(session.screen()->rows(), 12);
+    QCOMPARE(session.controller()->columns(), session.screen()->columns());
+    QCOMPARE(session.controller()->rows(), session.screen()->rows());
+
+    // Retargeting creates a fresh controller, even when the grid stays equal.
+    session.open(QStringLiteral("dev"), QStringLiteral("terminal-2"),
+                 QStringLiteral("other-row"), QString(), 40, 12);
+    QCOMPARE(session.controller()->columns(), session.screen()->columns());
+    QCOMPARE(session.controller()->rows(), session.screen()->rows());
+}
+
 void TstMobileTerminal::retargetingDropsThePreviousPanesBuffersAndModes()
 {
     MobileTerminalSession session(nullptr);
@@ -894,6 +917,31 @@ void TstMobileTerminal::aFocusedCursorNeverRevealsConcealedText()
     // The comparison is sensitive to the glyph, not merely to a failed draw.
     screen.write(QByteArray("W\r"));
     QVERIFY(paintOnce(view) != blank);
+}
+
+// MobileMarkdown owner's rendering fix: VT cells have fixed positions, not a
+// paragraph whose bidi ordering may change at an invisible attribute boundary.
+void TstMobileTerminal::terminalGlyphPositionsDoNotDependOnInvisibleAttributeBoundaries()
+{
+    MobileTerminalView view;
+    QFont font(QStringLiteral("monospace"));
+    font.setPixelSize(20);
+    view.setFont(font);
+    view.setSize(QSizeF(view.cellWidth() * 12, view.lineHeight() * 2));
+    VtScreen uniform;
+    uniform.resize(12, 2);
+    uniform.write(QByteArray("\x1b[?25l"));
+    view.setScreen(&uniform);
+    const QImage blank = paintOnce(view);
+    uniform.write(QStringLiteral("\u05d0\u05d1\u05d2").toUtf8());
+    const QImage continuous = paintOnce(view);
+    QVERIFY(continuous != blank);
+
+    VtScreen split;
+    split.resize(12, 2);
+    split.write(QStringLiteral("\x1b[?25l\u05d0\x1b[5m\u05d1\x1b[25m\u05d2").toUtf8());
+    view.setScreen(&split);
+    QCOMPARE(paintOnce(view), continuous);
 }
 
 QTEST_MAIN(TstMobileTerminal)

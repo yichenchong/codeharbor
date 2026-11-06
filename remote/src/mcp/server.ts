@@ -308,9 +308,12 @@ export async function handleMessage(
                 !Array.isArray(message.params)
                     ? (message.params as Record<string, unknown>)
                     : {};
+            if (typeof params.name !== "string") {
+                return failure(id, MCP_INVALID_PARAMS, "Tool name must be a string");
+            }
             const tool = toolByName(params.name);
             if (!tool) {
-                return failure(id, MCP_INVALID_PARAMS, `Unknown tool: ${String(params.name)}`);
+                return failure(id, MCP_INVALID_PARAMS, `Unknown tool: ${params.name}`);
             }
             const args = params.arguments === undefined ? {} : params.arguments;
             const argumentError = invalidToolArguments(tool, args);

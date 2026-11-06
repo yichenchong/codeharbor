@@ -11,6 +11,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDeadlineTimer>
+#include <QDir>
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -26,6 +27,7 @@
 #include <QSet>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QWebEngineUrlScheme>
 #include <QWebEngineUrlRequestJob>
@@ -785,9 +787,14 @@ void TstViewers::profileIsolation()
     if (!qobject_cast<QGuiApplication *>(QCoreApplication::instance()))
         QSKIP("WebEngine profiles require a QGuiApplication");
 
-    ViewerProfiles profiles(nullptr);
+    QTemporaryDir profileRoot;
+    QVERIFY(profileRoot.isValid());
+    ViewerProfiles profiles(nullptr, profileRoot.path());
     QQuickWebEngineProfile *external = profiles.externalProfile();
     QQuickWebEngineProfile *internal = profiles.internalProfile();
+    // Persistent initialization must create its data directory inside the
+    // owned fixture, not consult the native user's profile first.
+    QVERIFY(QDir(profileRoot.path()).exists(QStringLiteral("data")));
     QVERIFY(external != nullptr);
     QVERIFY(internal != nullptr);
 
@@ -1228,28 +1235,25 @@ void TstViewers::viewerModelWithoutClientReportsErrors()
     // views bind unconditionally, so both calls must answer with an error
     // signal rather than doing nothing and leaving a permanently blank pane.
     //
-    // Both answer SYNCHRONOUSLY, and that is deliberate rather than accidental.
-    // Each is identified by a PATH the caller already composed before calling,
-    // and every caller sets its matching state before it calls
-    // (ViewerDirectoryView.reload, ViewerPane.submitAddress /
-    // ViewerPane.checkRepoRoot), so a reply delivered inside the call is still
-    // matched correctly.
+    // Both answer SYNCHRONOUSLY. Callers allocate the directory request token
+    // and matching state before dispatch, just as they compose paths before a
+    // resolve request, so an immediate reply is still matched correctly.
     ViewerModel viewers;
     QSignalSpy dirErrors(&viewers, &ViewerModel::directoryError);
     QSignalSpy dirLists(&viewers, &ViewerModel::directoryListed);
     QSignalSpy resolveErrors(&viewers, &ViewerModel::pathResolveError);
     QSignalSpy resolved(&viewers, &ViewerModel::pathResolved);
 
-    viewers.listDirectory(QStringLiteral("/p"));
+    viewers.listDirectory(QStringLiteral("/p"), QStringLiteral("offline-listing"));
     viewers.resolvePath(QStringLiteral("/p/README.md"), QStringLiteral("/p"));
 
     QCOMPARE(dirErrors.size(), 1);
     QCOMPARE(resolveErrors.size(), 1);
     QCOMPARE(dirLists.size(), 0);
     QCOMPARE(resolved.size(), 0);
-    // Each failure echoes the path it is about, which is how a pane tells its
-    // own answer from another pane's on this shared model.
+    // Failures identify the request, including when two panes list one path.
     QCOMPARE(dirErrors.first().at(0).toString(), QStringLiteral("/p"));
+    QCOMPARE(dirErrors.first().at(2).toString(), QStringLiteral("offline-listing"));
     QCOMPARE(resolveErrors.first().at(0).toString(),
              QStringLiteral("/p/README.md"));
 }
@@ -1322,7 +1326,7 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
     QSignalSpy listings(&viewers, &ViewerModel::directoryListed);
     QSignalSpy failures(&viewers, &ViewerModel::directoryError);
 
-    viewers.listDirectory(QStringLiteral("/p"));
+    viewers.listDirectory(QStringLiteral("/p"), viewers.newDirectoryRequestId());
     const QJsonObject request = pair.nextRequest();
     QCOMPARE(request.value(QStringLiteral("method")).toString(),
              QString::fromLatin1(ch::rpc::kMethodListDirectory));
@@ -1366,7 +1370,7 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
 
     // An empty directory is a successful listing, not an error: the pane has to
     // be able to say "nothing here" rather than "something went wrong".
-    viewers.listDirectory(QStringLiteral("/p/empty"));
+    viewers.listDirectory(QStringLiteral("/p/empty"), viewers.newDirectoryRequestId());
     pair.respondResult(pair.nextRequest(),
                        QJsonObject{{QStringLiteral("entries"), QJsonArray{}}});
     QTRY_COMPARE(listings.size(), 2);
@@ -1375,7 +1379,7 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
     QCOMPARE(failures.size(), 0);
     // A malformed success payload is an error, not an empty directory. Treating
     // a missing array as empty would hide a protocol mismatch from the user.
-    viewers.listDirectory(QStringLiteral("/p/malformed"));
+    viewers.listDirectory(QStringLiteral("/p/malformed"), viewers.newDirectoryRequestId());
     pair.respondResult(pair.nextRequest(), QJsonObject{});
     QTRY_COMPARE(failures.size(), 1);
     QCOMPARE(failures.at(0).at(0).toString(), QStringLiteral("/p/malformed"));
@@ -1398,7 +1402,7 @@ void TstViewers::directoryListingIsSortedDirectoriesFirst()
     for (const QJsonArray &entries : malformedEntries) {
         const QString path =
             QStringLiteral("/p/bad%1").arg(expected);
-        viewers.listDirectory(path);
+        viewers.listDirectory(path, viewers.newDirectoryRequestId());
         pair.respondResult(pair.nextRequest(),
                            QJsonObject{{QStringLiteral("entries"), entries}});
         ++expected;
@@ -1751,8 +1755,10 @@ void TstViewers::internalRequestFailuresReachQml()
 {
     // The reason has to travel all the way to the pane, which only talks to
     // ViewerModel. ViewerProfiles owns the handler, so the model forwards.
+    QTemporaryDir profileRoot;
+    QVERIFY(profileRoot.isValid());
     ViewerModel viewers;
-    auto *profiles = new ViewerProfiles(nullptr, &viewers);
+    auto *profiles = new ViewerProfiles(nullptr, profileRoot.path(), &viewers);
     viewers.setProfiles(profiles);
     InternalUrlSchemeHandler *const handler = profiles->internalSchemeHandler();
     QVERIFY(handler);
@@ -1772,7 +1778,7 @@ void TstViewers::internalRequestFailuresReachQml()
 
     // Re-pointing the model at other profiles must not leave the old handler
     // forwarding as well: a pane would then see one failure reported twice.
-    auto *replacement = new ViewerProfiles(nullptr, &viewers);
+    auto *replacement = new ViewerProfiles(nullptr, profileRoot.path(), &viewers);
     viewers.setProfiles(replacement);
     emit handler->requestFailed(address,
                                 InternalUrlSchemeHandler::Failure::NoClient,
@@ -1785,8 +1791,10 @@ void TstViewers::internalRequestFailuresReachQml()
 }
 void TstViewers::viewerModelRecoversAfterInjectedProfilesDestroyed()
 {
+    QTemporaryDir profileRoot;
+    QVERIFY(profileRoot.isValid());
     ViewerModel viewers;
-    auto *profiles = new ViewerProfiles(nullptr, &viewers);
+    auto *profiles = new ViewerProfiles(nullptr, profileRoot.path(), &viewers);
     viewers.setProfiles(profiles);
     QVERIFY(profiles->internalSchemeHandler() != nullptr);
 
@@ -1795,6 +1803,9 @@ void TstViewers::viewerModelRecoversAfterInjectedProfilesDestroyed()
     // calling through a dangling pointer.
     delete profiles;
     QVERIFY(viewers.externalProfile() != nullptr);
+    // Recreating profiles must retain the injected isolation root as well as
+    // recovering a usable object: the native user's disk is never a fallback.
+    QVERIFY(QDir(profileRoot.path()).exists(QStringLiteral("data")));
     QVERIFY(viewers.internalProfile() != nullptr);
 }
 

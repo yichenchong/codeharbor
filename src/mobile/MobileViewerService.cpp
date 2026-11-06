@@ -14,6 +14,11 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 
+#if CH_HAVE_QTPDF
+#include <QPdfDocument>
+#include <QtQml/qqml.h>
+#endif
+
 #include <algorithm>
 #include <utility>
 
@@ -140,6 +145,8 @@ MobileViewerService::MobileViewerService(CodeharbordClient *client,
 
 MobileViewerService::~MobileViewerService()
 {
+    m_pdfShuttingDown = true;
+    m_pdfRequests.clear();
     purgePdfSpool();
 }
 
@@ -164,8 +171,12 @@ QString MobileViewerService::pdfSpoolDir()
 
 void MobileViewerService::purgePdfSpool()
 {
+    // Revoke reopening authority BEFORE close() can synchronously call QML.
+    // Keep the retired files alive until all their decoders have closed, while
+    // isolating any replacement spool created by a new-generation callback.
+    const auto retiredDirectory = std::move(m_pdfDirectory);
     m_pdfSpool.clear();
-    m_pdfDirectory.reset();
+    closePdfDocuments();
 }
 
 void MobileViewerService::resetPeerState()
@@ -204,12 +215,12 @@ bool MobileViewerService::decodeRead(const QJsonObject &result, ReadReply *out,
     // CHECKED, never coerced: QJsonValue::toBool() on an absent member is false,
     // which would present a prefix of an over-cap file as the whole file.
     const QJsonValue truncatedValue = result.value(QStringLiteral("truncated"));
-    if (!truncatedValue.isUndefined() && !truncatedValue.isBool()) {
+    if (!truncatedValue.isBool()) {
         *error = QStringLiteral("the server's reply carried an untrustworthy "
                                 "truncation flag");
         return false;
     }
-    out->truncated = truncatedValue.toBool(false);
+    out->truncated = truncatedValue.toBool();
 
     const QJsonValue revisionValue = result.value(QStringLiteral("revision"));
     out->revision = revisionValue.isString() ? revisionValue.toString()
@@ -356,7 +367,7 @@ void MobileViewerService::writeFile(const QString &path, const QString &content,
             }
             const QJsonValue revision =
                 result.toObject().value(QStringLiteral("revision"));
-            if (!revision.isString()) {
+            if (!revision.isString() || revision.toString().isEmpty()) {
                 emit guard->fileError(
                     path,
                     QStringLiteral("the server confirmed the write without a "
@@ -590,6 +601,10 @@ void MobileViewerService::forgetImage(const QString &path)
 
 void MobileViewerService::requestPdf(const QString &path)
 {
+    if (m_pdfShuttingDown) {
+        emit pdfError(path, QStringLiteral("viewer service is shutting down"));
+        return;
+    }
     if (path.isEmpty()) {
         emit pdfError(path, QStringLiteral("no document path"));
         return;
@@ -682,6 +697,68 @@ void MobileViewerService::requestPdf(const QString &path)
         });
 }
 
+bool MobileViewerService::setPdfDocumentSource(QObject *document, const QUrl &source)
+{
+#if CH_HAVE_QTPDF
+    if (!document)
+        return false;
+    auto *native = qobject_cast<QPdfDocument *>(qmlExtendedObject(document));
+    if (!native)
+        return false;
+    if (!source.isEmpty()) {
+        if (m_pdfShuttingDown)
+            return false;
+        const bool owned = std::any_of(m_pdfSpool.cbegin(), m_pdfSpool.cend(),
+            [&source](const QString &file) { return source == QUrl::fromLocalFile(file); });
+        if (!owned)
+            return false;
+    }
+    if (!m_pdfDocuments.contains(document)) {
+        m_pdfDocuments.insert(document, {});
+        connect(document, &QObject::destroyed, this, [this, document] {
+            m_pdfDocuments.remove(document);
+        });
+    }
+    m_pdfDocuments[document] = source;
+    if (source.isEmpty()) {
+        // The QML wrapper's empty setter attempts load("") instead of close().
+        // Keep its resolvedSource intact for the next real load, but close the
+        // native document now, before any spool release can unlink its file.
+        native->close();
+        return true;
+    }
+    if (document->property("source").toUrl() == source) {
+        native->load(source.toLocalFile());
+        return true; // Decode errors travel through the document's status.
+    }
+    return document->setProperty("source", source);
+#else
+    Q_UNUSED(document);
+    Q_UNUSED(source);
+    return false;
+#endif
+}
+
+void MobileViewerService::closePdfDocuments(const QUrl &source)
+{
+    // close() emits synchronous signals that may retire another wrapper.
+    // Keep guarded identities across that reentrancy, without copying the map.
+    QList<QPair<QPointer<QObject>, QUrl>> documents;
+    documents.reserve(m_pdfDocuments.size());
+    for (auto it = m_pdfDocuments.cbegin(); it != m_pdfDocuments.cend(); ++it) {
+        if (!it->isEmpty() && (source.isEmpty() || *it == source))
+            documents.append({QPointer<QObject>(it.key()), *it});
+    }
+    for (const auto &entry : documents) {
+        QObject *document = entry.first.data();
+        if (!document)
+            continue;
+        const auto current = m_pdfDocuments.constFind(document);
+        if (current != m_pdfDocuments.cend() && *current == entry.second)
+            setPdfDocumentSource(document, {});
+    }
+}
+
 void MobileViewerService::releasePdf(const QString &path)
 {
     // The pending request is retired FIRST, and unconditionally: while the read
@@ -690,11 +767,11 @@ void MobileViewerService::releasePdf(const QString &path)
     // leave a multi-megabyte file behind in the app cache for the rest of the
     // process's life. See claimRequest().
     m_pdfRequests.remove(path);
-    const auto spooled = m_pdfSpool.constFind(path);
-    if (spooled == m_pdfSpool.constEnd())
+    const QString spooled = m_pdfSpool.take(path);
+    if (spooled.isEmpty())
         return;
-    QFile::remove(*spooled);
-    m_pdfSpool.erase(spooled);
+    closePdfDocuments(QUrl::fromLocalFile(spooled));
+    QFile::remove(spooled);
 }
 
 QUrl MobileViewerService::imageUrl(const QString &path) const

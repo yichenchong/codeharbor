@@ -14,11 +14,16 @@
 #include "GroupPaletteService.h"
 #include "WindowChromeNative.h"
 
+#include <QDebug>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 #include <QtQuickControls2/QQuickStyle>
+#include <QtGlobal>
+
+#include <cstdlib>
 
 // Process entry point.
 //
@@ -30,18 +35,31 @@
 //
 // Exit codes:
 //   0    the window was closed normally (QGuiApplication::exec() returned 0).
+//   1    CH_SETTINGS_PATH was set but is not a non-empty absolute local path.
 //   255  the QML graph failed to instantiate. objectCreationFailed below calls
 //        QCoreApplication::exit(-1), and a negative status is truncated to a
 //        byte by the operating system, so the shell reports 255.
 //   Any other value is one a QML `Qt.exit(n)` chose.
 //
-// Environment: nothing is read here. The remote session spine reads CH_LIVE_SSH
-// and its CH_LIVE_HOST/PORT/USER/NODE/REPO companions inside
+// Environment: CH_SETTINGS_PATH optionally selects an absolute local INI file
+// shared by preferences, profiles, and UI state; unset keeps the native store.
+// An explicitly empty or relative path is a startup error, never a fallback to
+// the user's native settings. The remote session spine reads CH_LIVE_SSH and
+// its CH_LIVE_HOST/PORT/USER/NODE/REPO companions inside
 // SessionBootstrap::connectAndWireFromEnvironment(), called below. Note that
 // QQuickStyle::setStyle() overrides QT_QUICK_CONTROLS_STYLE: the shell is drawn
 // against the Basic style and nothing else.
 int main(int argc, char *argv[])
 {
+    QString settingsPath;
+    if (qEnvironmentVariableIsSet("CH_SETTINGS_PATH")) {
+        settingsPath = qEnvironmentVariable("CH_SETTINGS_PATH");
+        if (settingsPath.isEmpty() || !QFileInfo(settingsPath).isAbsolute()) {
+            qCritical("CH_SETTINGS_PATH must name a non-empty absolute local INI path");
+            return EXIT_FAILURE;
+        }
+    }
+
     // Custom URL schemes must be registered before WebEngine and the GUI
     // application are set up (SPEC 7.4). Idempotent; safe to call once here.
     ch::ViewerProfiles::registerUrlScheme();
@@ -96,10 +114,14 @@ int main(int argc, char *argv[])
     // UI shell (workstream U) and viewer subsystem (workstream V) share the one
     // client. ViewerModel and ViewerProfiles share the same profiles so QML
     // WebEngineViews and the internal scheme handler use one security context.
-    ch::AppController appController(&client);
+    ch::AppController appController(&client, nullptr, settingsPath);
     appController.setAgentMonitor(&agentMonitor);
     appController.setViewerCommands(&viewerCommands);
-    ch::ViewerProfiles profiles(&client);
+    // An explicit settings file also scopes persistent external browser state;
+    // native launches retain the profile's normal platform storage locations.
+    ch::ViewerProfiles profiles(
+        &client, settingsPath.isEmpty() ? QString()
+                                        : settingsPath + QStringLiteral(".webengine"));
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
     // ch_viewers deliberately does not link ch_app; push the validated,
@@ -115,7 +137,7 @@ int main(int argc, char *argv[])
     // only way to reach a server before one is reachable) and the per-session
     // split layouts read back from that server. The workspace is keyed by the
     // SERVER's own id, taken from server.info once wired.
-    ch::ServerProfiles serverProfiles;
+    ch::ServerProfiles serverProfiles(settingsPath);
     ch::SessionLayouts sessionLayouts(appController.workspaceDb(),
                                       appController.uiState());
     appController.setConnection(&sshPool, &sessionBootstrap, &serverProfiles,

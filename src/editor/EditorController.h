@@ -63,7 +63,7 @@ public:
     QString fileState() const { return toString(m_fileState); }
     bool readOnly() const { return m_readOnly; }
     bool dirty() const { return m_dirty; }
-    bool recoveryEnabled() const { return !m_recoveryPath.isEmpty(); }
+    bool recoveryEnabled() const { return !m_serverDetached && !m_recoveryPath.isEmpty(); }
     quint64 recoveryContextRevision() const { return m_recoveryGeneration; }
 
     // Retire the previous document BEFORE open/navigation, then register this
@@ -80,6 +80,13 @@ public:
     Q_INVOKABLE bool preparePageReload(QString content, quint64 expectedRecoveryContext);
     // Retry a failed replacement only from the current document's retained RAM.
     Q_INVOKABLE bool hasPageReloadContent(QObject* pageBridge) const;
+    // Restore an offered snapshot without treating its unsaved text as the
+    // disk baseline. Only the still-current, clean document may accept it.
+    Q_INVOKABLE bool restoreRecovery(QString content, quint64 expectedRecoveryContext,
+                                    QString expectedRevision);
+    // Permanently retire this document's server authority without destroying
+    // its live page or dirty RAM. The borrowed client is not owned or destroyed.
+    Q_INVOKABLE void detachFromServer();
 
     // Currently open remote path and the revision the buffer is guarded at.
     // Exposed for host/tests; not part of the JS bridge surface.
@@ -190,7 +197,7 @@ private slots:
     // silently stopped. Leave FileState::Disconnected, re-subscribe, and
     // reconcile whatever changed while the session was down. Never touches the
     // buffer's dirty state.
-    void onTransportBound();
+    void onTransportBound(quint64 generation);
     // The old transport hit EOF: that codeharbord is unreachable forever, so
     // the subscription id it minted is dead. Forget it WITHOUT an unwatch RPC —
     // the only peer that could receive one is its replacement, which never
@@ -269,7 +276,7 @@ private:
     // reply still in flight for it (by bumping m_recoveryGeneration). Shared by
     // open() and by both recovery-key setters, which face the same problem: the
     // slot they described is not the slot the next write will touch.
-    void resetRecoverySlot();
+    void resetRecoverySlot(bool notify = true);
     // Probe the recovery slot for the file already open, used by the two
     // recovery-key setters. A no-op unless a clean, writable, fully loaded
     // buffer is on screen — the same conditions open() checks before it probes.
@@ -305,6 +312,7 @@ private:
     // QPointer: see the lifetime note at the top of this file — the client may
     // be destroyed before this controller, and the destructor still touches it.
     QPointer<CodeharbordClient> m_client = nullptr;
+    bool m_serverDetached = false;
     QString m_recoveryServerId;
     QString m_recoverySessionId;
     QString m_recoveryPaneId;
@@ -423,6 +431,7 @@ private:
     std::optional<FileState> m_resumeState;
 
     QString m_watchSubscriptionId;
+    quint64 m_watchTransportGeneration = 0;
     // Generation of the watch this controller WANTS, bumped by every open() and
     // every transport swap. A file.watch response that names a superseded
     // generation must not install its (now meaningless) subscription id, nor

@@ -29,6 +29,7 @@
 // by the code under test.
 
 #include "MobileKeyStore.h"
+#include "ServerProfiles.h"
 
 #include "SshConnectionPool.h"
 
@@ -399,6 +400,8 @@ private slots:
     void refusesADirectoryReference();
     void registerReferenceRepairsAnUnusableName();
     void registerReferenceDoesNotShadowASavedKey();
+    void savedKeyReferenceRoundTripsWithoutAnAlias();
+    void savedKeyReferenceRefusesAMissingFile();
     void registerReferenceSuffixFitsAMaximumLengthName();
     void registerReferenceRefusesAnEmptyReference();
     void refusesAReferenceWhoseFileStoppedBeingAKey();
@@ -1507,12 +1510,86 @@ void TestMobileKeyStore::registerReferenceDoesNotShadowASavedKey()
     QCOMPARE(adopted, QStringLiteral("kept-2"));
     QCOMPARE(reopened.allKeyNames(),
              (QStringList{QStringLiteral("kept-2"), QStringLiteral("kept")}));
-    QVERIFY(reopened.referenceFor(QStringLiteral("kept")).isEmpty());
+    QCOMPARE(reopened.referenceFor(QStringLiteral("kept")),
+             savedKeyPath(appData.path(), QStringLiteral("kept")));
     QVERIFY(reopened.removeKey(adopted));
+    QVERIFY(QFile::exists(m_userKeyPath));
     QVERIFY(reopened.isSavedOnDevice(QStringLiteral("kept")));
     QVERIFY(QFile::exists(savedKeyPath(appData.path(), QStringLiteral("kept"))));
     QCOMPARE(reopened.keyFingerprint(QStringLiteral("kept")),
              QString::fromLatin1(kPlainFingerprint));
+}
+
+void TestMobileKeyStore::savedKeyReferenceRoundTripsWithoutAnAlias()
+{
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    QString reference;
+    QString profileId;
+    const QString iniPath = appData.filePath(QStringLiteral("profiles.ini"));
+    {
+        MobileKeyStore store(appData.path());
+        QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                       QString::fromLatin1(kPlainKey)));
+        QVERIFY(store.referenceFor(QStringLiteral("kept")).isEmpty());
+        QVERIFY2(store.saveKeyOnDevice(QStringLiteral("kept")),
+                 qPrintable(store.lastError()));
+        reference = store.referenceFor(QStringLiteral("kept"));
+        QVERIFY(!reference.isEmpty());
+        QCOMPARE(store.keyInfo(QStringLiteral("kept"))
+                     .value(QStringLiteral("reference")).toString(), reference);
+        ch::ServerProfiles profiles(iniPath);
+        profileId = profiles.addProfile({
+            {QStringLiteral("host"), QStringLiteral("test.invalid")},
+            {QStringLiteral("user"), QStringLiteral("test-user")},
+            {QStringLiteral("identityFile"), reference},
+        });
+        QVERIFY(!profileId.isEmpty());
+    }
+
+    SshConnectionPool pool;
+    MobileKeyStore reopened(appData.path());
+    reopened.setConnectionPool(&pool);
+    ch::ServerProfiles profiles(iniPath);
+    const QString persistedReference = profiles.profile(profileId)
+                                           .value(QStringLiteral("identityFile")).toString();
+    const QString selected = reopened.registerReference(persistedReference, QString());
+    QCOMPARE(selected, QStringLiteral("kept"));
+    QCOMPARE(reopened.registerReference(reference, QStringLiteral("different")), selected);
+    QCOMPARE(reopened.allKeyNames(), QStringList{selected});
+    QVERIFY(reopened.referenceNames().isEmpty());
+    QVERIFY2(reopened.applyIdentityForConnect(selected), qPrintable(reopened.lastError()));
+    QVERIFY(pool.hasInMemoryIdentity());
+
+    QVERIFY(reopened.forgetSavedKey(selected));
+    QVERIFY(!pool.hasInMemoryIdentity());
+    QVERIFY(reopened.allKeyNames().isEmpty());
+    QVERIFY(!QFile::exists(reference));
+    QVERIFY(reopened.registerReference(reference, QString()).isEmpty());
+}
+
+void TestMobileKeyStore::savedKeyReferenceRefusesAMissingFile()
+{
+    if (!CH_HAVE_LIBSSH)
+        QSKIP("This case requires the native SSH key parser.");
+    QTemporaryDir appData;
+    QVERIFY(appData.isValid());
+    {
+        MobileKeyStore store(appData.path());
+        QVERIFY(store.importKeyFromText(QStringLiteral("kept"),
+                                       QString::fromLatin1(kPlainKey)));
+        QVERIFY(store.saveKeyOnDevice(QStringLiteral("kept")));
+    }
+
+    MobileKeyStore reopened(appData.path());
+    const QString reference = reopened.referenceFor(QStringLiteral("kept"));
+    QVERIFY(!reference.isEmpty());
+    QVERIFY(QFile::remove(reference));
+    QVERIFY(reopened.registerReference(reference, QString()).isEmpty());
+    QVERIFY(!reopened.lastError().isEmpty());
+    QVERIFY(reopened.referenceNames().isEmpty());
 }
 
 void TestMobileKeyStore::registerReferenceSuffixFitsAMaximumLengthName()
@@ -1734,7 +1811,6 @@ void TestMobileKeyStore::savesAPastedKeyForTheNextLaunch()
     const QVariantMap info = reopened.keyInfo(QStringLiteral("kept"));
     QCOMPARE(info.value(QStringLiteral("saved")).toBool(), true);
     QCOMPARE(info.value(QStringLiteral("referenced")).toBool(), false);
-    QVERIFY(info.value(QStringLiteral("reference")).toString().isEmpty());
     QCOMPARE(info.value(QStringLiteral("fingerprint")).toString(),
              QString::fromLatin1(kPlainFingerprint));
     // The saved bytes are the same key, byte for byte, so it still authenticates.
@@ -2023,10 +2099,9 @@ void TestMobileKeyStore::savingAKeyPutsNothingInQSettings()
              qPrintable(store.lastError()));
     QVERIFY(store.applyIdentityForConnect(QStringLiteral("kept")));
     QVERIFY(!store.keyInfo(QStringLiteral("kept")).isEmpty());
-    // referenceFor() is the only value that ever leaves this class for a profile,
-    // and a saved key has no reference to record: what the profile would carry is
-    // an empty string, not the key and not even the path to it.
-    QVERIFY(store.referenceFor(QStringLiteral("kept")).isEmpty());
+    // Profiles may carry the saved file's path, but never its private bytes.
+    QCOMPARE(store.referenceFor(QStringLiteral("kept")),
+             savedKeyPath(appData.path(), QStringLiteral("kept")));
     store.forgetSession();
 
     const QString keysDirectory = savedKeysDirectory(appData.path());

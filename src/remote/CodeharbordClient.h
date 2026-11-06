@@ -258,7 +258,10 @@ signals:
     // consumer that re-established there would only write into a client with
     // nothing bound. Peer-owned state is invalidated by transportChanging() on
     // explicit swaps/detaches and by transportClosed() on transport loss.
-    void transportBound();
+    // `generation` identifies this binding. An earlier slot may rebind and emit
+    // a newer transportBound before later slots receive this one; ignore events
+    // whose generation no longer equals transportGeneration().
+    void transportBound(quint64 generation);
 
 private slots:
     void onReadyRead();

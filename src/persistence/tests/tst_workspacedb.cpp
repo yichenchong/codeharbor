@@ -92,6 +92,8 @@ private slots:
     void resolveTerminalPaneSendsTheSlotAddressAndParsesTheRow();
     void resolveTerminalPaneAddressesARowByIdWithoutItsLabel();
     void setLayoutMalformedTreeDeliversRpcError();
+    void resolveTerminalPaneRejectsUnrelatedRows_data();
+    void resolveTerminalPaneRejectsUnrelatedRows();
     void resolveTerminalPaneWithNoAddressFailsWithoutAskingTheServer();
     void setLayoutRefusesATreeItCouldNotReadBack();
     void workspaceDbCannotBeBuiltWithoutAClient();
@@ -1608,6 +1610,87 @@ void TstWorkspaceDb::resolveTerminalPaneAddressesARowByIdWithoutItsLabel()
         readRequest().value(QStringLiteral("params")).toObject();
     QCOMPARE(params.value(QStringLiteral("id")).toString(), QStringLiteral("row-uuid"));
     QVERIFY(!params.contains(QStringLiteral("name")));
+}
+
+void TstWorkspaceDb::resolveTerminalPaneRejectsUnrelatedRows_data()
+{
+    QTest::addColumn<bool>("byRow");
+    QTest::addColumn<QJsonObject>("record");
+    QTest::addColumn<bool>("accepted");
+    const QJsonObject row{{"id", "row-uuid"}, {"serverId", "srv-1"},
+                          {"devSessionId", "s1"}, {"name", "renamed-pane"},
+                          {"tmuxTarget", "ch_s1_row-uuid"}, {"position", 0}};
+    QTest::newRow("row-id-allows-renamed-label") << true << row << true;
+
+    QJsonObject changed = row;
+    changed[QStringLiteral("id")] = QStringLiteral("unrelated-row");
+    QTest::newRow("wrong-row-id") << true << changed << false;
+    changed = row;
+    changed[QStringLiteral("serverId")] = QStringLiteral("other-server");
+    QTest::newRow("wrong-server") << true << changed << false;
+    changed = row;
+    changed[QStringLiteral("devSessionId")] = QStringLiteral("other-session");
+    QTest::newRow("wrong-session") << true << changed << false;
+    changed = row;
+    changed.remove(QStringLiteral("serverId"));
+    QTest::newRow("missing-server") << true << changed << false;
+    changed = row;
+    changed.remove(QStringLiteral("devSessionId"));
+    QTest::newRow("missing-session") << true << changed << false;
+
+    QJsonObject legacy = row;
+    legacy[QStringLiteral("name")] = QStringLiteral("terminal-slot");
+    QTest::newRow("legacy-slot") << false << legacy << true;
+    QTest::newRow("legacy-wrong-label") << false << row << false;
+    changed = legacy;
+    changed[QStringLiteral("serverId")] = QStringLiteral("other-server");
+    QTest::newRow("legacy-wrong-server") << false << changed << false;
+    changed = legacy;
+    changed[QStringLiteral("devSessionId")] = QStringLiteral("other-session");
+    QTest::newRow("legacy-wrong-session") << false << changed << false;
+    changed = legacy;
+    changed.remove(QStringLiteral("name"));
+    QTest::newRow("legacy-missing-label") << false << changed << false;
+}
+
+void TstWorkspaceDb::resolveTerminalPaneRejectsUnrelatedRows()
+{
+    QFETCH(bool, byRow);
+    QFETCH(QJsonObject, record);
+    QFETCH(bool, accepted);
+    makePair();
+    int callbacks = 0;
+    std::optional<ch::TerminalPane> resolved;
+    std::optional<RpcError> failure;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    m_db->resolveTerminalPane(
+        ch::ResolveTerminalPaneParams{
+            .serverId = ServerId{QStringLiteral("srv-1")},
+            .devSessionId = ch::DevSessionId{QStringLiteral("s1")},
+            .id = ch::TerminalId{byRow ? QStringLiteral("row-uuid") : QString()},
+            .name = QStringLiteral("terminal-slot")},
+        [&](std::optional<ch::TerminalPane> pane, std::optional<RpcError> error) {
+            ++callbacks;
+            resolved = std::move(pane);
+            failure = std::move(error);
+        });
+    const QJsonObject request = readRequest();
+    m_serverSide->write(jsonLine({{"jsonrpc", "2.0"},
+                                 {"id", request.value(QStringLiteral("id"))},
+                                 {"result", record}}));
+    m_serverSide->flush();
+    QTRY_COMPARE(callbacks, 1);
+    QCOMPARE(resolved.has_value(), accepted);
+    QCOMPARE(failure.has_value(), !accepted);
+    if (accepted) {
+        QCOMPARE(resolved->id.value, QStringLiteral("row-uuid"));
+        QCOMPARE(resolved->tmuxTarget, QStringLiteral("ch_s1_row-uuid"));
+        QCOMPARE(resolved->name,
+                 byRow ? QStringLiteral("renamed-pane") : QStringLiteral("terminal-slot"));
+    } else {
+        QCOMPARE(failure->code, ch::rpc::kInternalError);
+    }
+    QCOMPARE(m_client->pendingCount(), 0);
 }
 
 // Neither address is not a question: there is no row id and no slot label, so

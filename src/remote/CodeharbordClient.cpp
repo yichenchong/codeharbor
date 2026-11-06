@@ -273,7 +273,7 @@ void CodeharbordClient::finishTransportBinding()
         if (m_closed || m_transportGeneration != transportGeneration)
             return;
     }
-    emit transportBound();
+    emit transportBound(transportGeneration);
 }
 
 qint64 CodeharbordClient::call(const QString& method, const QJsonValue& params,

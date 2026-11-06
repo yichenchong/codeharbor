@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs, type Dir, type PathLike } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -336,13 +337,6 @@ test("listDirectory (RPC) sorts entries, includes hidden files, and classifies t
     assert.equal(byName["readme.md"], "file");
     assert.equal(byName["sub"], "directory");
     assert.equal(byName[".hidden"], "file");
-
-    // revisionFrom folds mtime, ctime, inode, and size so a same-size edit
-    // within one mtime tick still changes the token (SPEC 8.6).
-    assert.equal(
-        revisionFrom({ mtimeMs: 12.5, ctimeMs: 13.5, ino: 42, size: 7 }),
-        "12.5-13.5-42-7",
-    );
 
     await fs.rm(dir, { recursive: true, force: true });
 });
@@ -2538,6 +2532,137 @@ test("create-only writeFile preserves a file created after its final revision ch
         );
         assert.equal(await fs.readFile(file, "utf-8"), "other writer");
         assert.deepEqual(await fs.readdir(dir), ["new.txt"]);
+    } finally {
+        t.mock.restoreAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile rejects a symlink retargeted to a cloned inode on another device", async (t) => {
+    const dir = await tmpDir();
+    const original = path.join(dir, "original.txt");
+    const unrelated = path.join(dir, "unrelated.txt");
+    const link = path.join(dir, "current.txt");
+    const statFile = fs.stat;
+    try {
+        await fs.writeFile(original, "original bytes");
+        await fs.writeFile(unrelated, "unrelated data");
+        await fs.symlink(original, link);
+        const loaded = await readFile({ path: link });
+        const originalStats = await statFile(original);
+        await fs.unlink(link);
+        await fs.symlink(unrelated, link);
+        // Model two mounted copies of a filesystem: inode and timestamps can
+        // be identical, but the kernel's device ID still distinguishes them.
+        t.mock.method(fs, "stat", async (file: PathLike) => {
+            const result = await statFile(file);
+            if (file === unrelated || file === link) {
+                Object.assign(result, {
+                    dev: originalStats.dev + 1,
+                    ino: originalStats.ino,
+                    mtimeMs: originalStats.mtimeMs,
+                    ctimeMs: originalStats.ctimeMs,
+                    size: originalStats.size,
+                });
+            }
+            return result;
+        });
+        await assert.rejects(
+            writeFile({ path: link, content: "edited original", expectedRevision: loaded.revision }),
+            isRevisionMismatch,
+        );
+        assert.equal(await fs.readFile(original, "utf-8"), "original bytes");
+        assert.equal(await fs.readFile(unrelated, "utf-8"), "unrelated data");
+        assert.deepEqual((await fs.readdir(dir)).sort(), ["current.txt", "original.txt", "unrelated.txt"]);
+    } finally {
+        t.mock.restoreAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeFile does not collapse a missing directory before '..'", async () => {
+    const dir = await tmpDir();
+    const link = path.join(dir, "link.txt");
+    const target = path.join(dir, "target.txt");
+    try {
+        for (const raw of ["missing/../target.txt", "missing/nested/../../target.txt"]) {
+            await fs.symlink(raw, link);
+            assert.equal((await stat({ path: link })).writable, false);
+            for (const file of [link, `${dir}/${raw}`]) {
+                await assert.rejects(
+                    writeFile({ path: file, content: "must not appear elsewhere", expectedRevision: "" }),
+                    { code: "ENOENT" },
+                );
+                await assert.rejects(fs.lstat(target), { code: "ENOENT" });
+                await assert.rejects(fs.lstat(path.join(dir, "missing")), { code: "ENOENT" });
+                assert.deepEqual(await fs.readdir(dir), ["link.txt"]);
+            }
+            assert.equal(await fs.readlink(link), raw);
+            await fs.unlink(link);
+        }
+    } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("closeAll rejects reentrant watches but permits a later subscription", async () => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "watched.txt");
+    const service = new FileWatchService();
+    const attempts: Promise<unknown>[] = [];
+    const off = service.onWatchClosed(() => {
+        service.closeAll();
+        attempts.push(service.watch({ path: file }));
+    });
+    try {
+        await fs.writeFile(file, "contents");
+        const first = await service.watch({ path: file });
+        service.closeAll();
+        assert.equal(service.hasSubscription(first.subscriptionId), false);
+        assert.equal(attempts.length, 1);
+        await assert.rejects(attempts[0]!);
+        off();
+        const later = await service.watch({ path: file });
+        assert.equal(service.hasSubscription(later.subscriptionId), true);
+        service.unwatch(later);
+        assert.equal(service.hasSubscription(later.subscriptionId), false);
+    } finally {
+        off();
+        service.closeAll();
+        await fs.rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("readFile marks an initially empty file as stale when it grows after EOF", async (t) => {
+    const dir = await tmpDir();
+    const file = path.join(dir, "empty.txt");
+    const open = fs.open;
+    let grew = false;
+    try {
+        await fs.writeFile(file, "");
+        t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+            const handle = await open(...args);
+            if (args[0] !== file) return handle;
+            // Keep real descriptor reads/stats, but schedule an external append
+            // precisely after EOF was read and before the final metadata check.
+            return {
+                stat: () => handle.stat(),
+                read: async (buffer: Buffer, offset: number, length: number, position: number) => {
+                    const result = await handle.read(buffer, offset, length, position);
+                    if (result.bytesRead === 0 && !grew) {
+                        grew = true;
+                        await fs.appendFile(file, "external bytes");
+                    }
+                    return result;
+                },
+                close: () => handle.close(),
+            } as unknown as FileHandle;
+        });
+        const result = await readFile({ path: file });
+        assert.equal(grew, true);
+        assert.equal(result.content, "");
+        assert.equal(result.truncated, true);
+        assert.equal(await fs.readFile(file, "utf-8"), "external bytes");
     } finally {
         t.mock.restoreAll();
         await fs.rm(dir, { recursive: true, force: true });

@@ -160,6 +160,8 @@ private slots:
     void steppingBackToTheServerFormKeepsTheConnectionAndItsCredential();
     void theConnectFormSavesTheServerItIsShowingOnATap();
     void steppingBackToTheFormEditsTheServerRatherThanDuplicatingIt();
+    void retryingAConnectionFromTheSameFormDoesNotDuplicateItsProfile();
+    void aReentrantFormRetargetDoesNotAdoptThePreviousConnectionsProfile();
     void anEditedProfileRoundTripsThroughTheSharedStore();
     void nothingSecretInTheFormReachesTheProfileStore();
 
@@ -944,8 +946,8 @@ void TstMobileNav::aRefusedProfileEditIsReportedRatherThanDiallingTheOldOne()
                         {QStringLiteral("host"), QStringLiteral("box.example")},
                         {QStringLiteral("port"), 22},
                         {QStringLiteral("user"), QStringLiteral("dev")}};
-    f.mobile.connectToServer(profile);
-    const QString id = profiles.activeId();
+    const QString id = f.mobile.connectToServer(profile);
+    QCOMPARE(profiles.activeId(), id);
     QVERIFY(!id.isEmpty());
     QCOMPARE(profiles.profile(id).value(QStringLiteral("host")).toString(),
              QStringLiteral("box.example"));
@@ -953,7 +955,7 @@ void TstMobileNav::aRefusedProfileEditIsReportedRatherThanDiallingTheOldOne()
     // The same profile, edited into something unconnectable.
     profile.insert(QStringLiteral("id"), id);
     profile.insert(QStringLiteral("user"), QString());
-    f.mobile.connectToServer(profile);
+    QVERIFY(f.mobile.connectToServer(profile).isEmpty());
 
     QCOMPARE(f.mobile.statusText(),
              QStringLiteral("That server needs at least a host name and a user "
@@ -965,7 +967,7 @@ void TstMobileNav::aRefusedProfileEditIsReportedRatherThanDiallingTheOldOne()
 
     // And a valid edit of the same profile still goes through, in place.
     profile.insert(QStringLiteral("user"), QStringLiteral("ops"));
-    f.mobile.connectToServer(profile);
+    QCOMPARE(f.mobile.connectToServer(profile), id);
     QCOMPARE(profiles.profiles().size(), 1);
     QCOMPARE(profiles.profile(id).value(QStringLiteral("user")).toString(),
              QStringLiteral("ops"));
@@ -1138,6 +1140,74 @@ void TstMobileNav::theConnectFormSavesTheServerItIsShowingOnATap()
     // it dies FIRST.
     shell.fixture.controller.setConnection(nullptr, nullptr, nullptr,
                                            &shell.fixture.layouts);
+}
+
+void TstMobileNav::retryingAConnectionFromTheSameFormDoesNotDuplicateItsProfile()
+{
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    const QString iniPath = storeRoot.filePath(QStringLiteral("servers.ini"));
+    ServerProfiles profiles(iniPath);
+    Shell shell;
+    // No bootstrap or SSH pool: a connection cannot start and the same form
+    // stays active, as it does after failed authentication.
+    shell.fixture.controller.setConnection(nullptr, nullptr, &profiles,
+                                           &shell.fixture.layouts);
+    QQuickWindow* window = shell.window();
+    QVERIFY(window);
+    QQuickItem* page = currentPage(window);
+    QVERIFY(page);
+    QCOMPARE(qmlTypeName(page), QStringLiteral("ConnectPage"));
+    page->setProperty("hostText", QStringLiteral("test.invalid"));
+    page->setProperty("userText", QStringLiteral("dev"));
+    page->setProperty("nodePathText", QStringLiteral("/usr/bin/node"));
+    QVERIFY(page->property("formValid").toBool());
+
+    QVERIFY(QMetaObject::invokeMethod(page, "connectNow"));
+    QCOMPARE(profiles.profiles().size(), 1);
+    const QString id = profiles.activeId();
+    QVERIFY(!id.isEmpty());
+    QCOMPARE(page->property("profileId").toString(), id);
+    QCOMPARE(currentPage(shell.window()), page);
+
+    page->setProperty("userText", QStringLiteral("ops"));
+    QVERIFY(QMetaObject::invokeMethod(page, "connectNow"));
+    QCOMPARE(profiles.profiles().size(), 1);
+    QCOMPARE(profiles.profile(id).value(QStringLiteral("user")).toString(),
+             QStringLiteral("ops"));
+    ServerProfiles reopened(iniPath);
+    QCOMPARE(reopened.profiles().size(), 1);
+    QCOMPARE(reopened.profile(id).value(QStringLiteral("user")).toString(),
+             QStringLiteral("ops"));
+}
+
+void TstMobileNav::aReentrantFormRetargetDoesNotAdoptThePreviousConnectionsProfile()
+{
+    QTemporaryDir storeRoot;
+    QVERIFY(storeRoot.isValid());
+    ServerProfiles profiles(storeRoot.filePath(QStringLiteral("servers.ini")));
+    Shell shell;
+    shell.fixture.controller.setConnection(nullptr, nullptr, &profiles,
+                                           &shell.fixture.layouts);
+    QQuickWindow* window = shell.window();
+    QVERIFY(window);
+    QQuickItem* page = currentPage(window);
+    QVERIFY(page);
+    page->setProperty("hostText", QStringLiteral("first.invalid"));
+    page->setProperty("userText", QStringLiteral("dev"));
+    page->setProperty("nodePathText", QStringLiteral("/usr/bin/node"));
+    connect(&profiles, &ServerProfiles::activeIdChanged, page, [page]() {
+        page->setProperty("profileId", QStringLiteral("another-form"));
+        page->setProperty("hostText", QStringLiteral("second.invalid"));
+    });
+
+    QVERIFY(QMetaObject::invokeMethod(page, "connectNow"));
+    QCOMPARE(profiles.profiles().size(), 1);
+    QCOMPARE(profiles.profile(profiles.activeId())
+                 .value(QStringLiteral("host")).toString(),
+             QStringLiteral("first.invalid"));
+    QCOMPARE(page->property("profileId").toString(), QStringLiteral("another-form"));
+    QCOMPARE(page->property("hostText").toString(), QStringLiteral("second.invalid"));
 }
 
 // The whole reported journey in one case: get back to the server form, change

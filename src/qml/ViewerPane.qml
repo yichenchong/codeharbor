@@ -30,9 +30,30 @@ Item {
     property string paneId: ""
     property string acceptedServerId: ""
     property string sessionId: ""
+    property string documentServerId: ""
     // The empty leaf left after closing the last pane has no persisted identity.
     // Its first navigation fills that leaf through the host's ordinary split path.
     property bool placeholder: false
+    property bool layoutBlocked: false
+    property bool layoutConflict: false
+    property bool contextRetired: false
+    property string retiredHandlerKind: ""
+
+    function retireServerContext() {
+        if (pane.contextRetired)
+            return;
+        const handler = contentLoader.item;
+        if (handler && typeof handler.detachFromServer === "function")
+            handler.detachFromServer();
+        pane.retiredHandlerKind = pane.kind;
+        pane.contextRetired = true;
+        pane.layoutBlocked = true;
+        pane.layoutConflict = true;
+        pane.retireLayoutRequests();
+        pane.repoCheckPath = "";
+        pane.repoCheckBase = "";
+        pane.repoRootState = "";
+    }
 
     // This is the pane the user is working in. Written by the region that owns
     // the pane cache (ViewerRegion.applyFocusFlags) rather than derived here:
@@ -105,12 +126,12 @@ Item {
     // sibling pane's WebEngine profile or its own handler state.
     property bool contentActive: true
 
-    readonly property bool canGoBack: pane.navigationIndex > 0
+    readonly property bool canGoBack: !pane.contextRetired && pane.navigationIndex > 0
     readonly property bool canGoForward:
-        pane.navigationIndex >= 0
+        !pane.contextRetired && pane.navigationIndex >= 0
         && pane.navigationIndex < pane.navigationHistory.length - 1
-    readonly property bool canGoHome: pane.sessionRoot.length > 0
-    readonly property bool canReload: pane.effectiveUrl.toString().length > 0
+    readonly property bool canGoHome: !pane.contextRetired && pane.sessionRoot.length > 0
+    readonly property bool canReload: !pane.contextRetired && pane.effectiveUrl.toString().length > 0
 
     function defaultAddressForRoot(rootPath) {
         const root = String(rootPath || "");
@@ -624,6 +645,10 @@ Item {
 
     readonly property bool contentDirty:
         contentLoader.item && contentLoader.item.dirty === true
+    readonly property var documentObject: contentLoader.item
+    readonly property var documentController:
+        contentLoader.item && contentLoader.item.controller !== undefined
+        ? contentLoader.item.controller : null
     property string dirtyHandlerKind: ""
     onContentDirtyChanged: {
         // A background change to viewer defaults/capabilities must not unload
@@ -647,6 +672,10 @@ Item {
     // navigation here: agent commands need an immediate, truthful outcome.
     // Closing keeps its separate discard confirmation (requestClose()).
     function allowContentReplacement() {
+        if (pane.layoutBlocked) {
+            pane.messageRequested(qsTr("The remote viewer layout changed. Save or close the retained unsaved editors before navigating."));
+            return false;
+        }
         if (pane.contentDirty) {
             pane.messageRequested(qsTr("This editor has unsaved changes. Save your changes or close this pane before navigating or reloading."));
             return false;
@@ -654,6 +683,10 @@ Item {
         // A newer navigation/reload supersedes an address probe, even when
         // its target equals the current URL and urlChanged will not fire.
         pane.probePath = "";
+        // A same-address "Open as" replaces the handler without urlChanged.
+        // Its new content must not inherit an older editor's discard question.
+        if (closeEditorDialog)
+            closeEditorDialog.close();
         return true;
     }
 
@@ -670,6 +703,8 @@ Item {
     // View kind for the current URL: "web" | "markdown" | "text" | "image" |
     // "pdf" | "directory" | "binary" (nothing to show -> a neutral placeholder).
     property string kind: {
+        if (pane.contextRetired)
+            return pane.retiredHandlerKind;
         if (pane.dirtyHandlerKind.length > 0)
             return pane.dirtyHandlerKind;
         if (pane.forcedKind.length > 0)
@@ -767,6 +802,8 @@ Item {
     // Component.onCompleted, since a pane can be born already showing a file)
     // without spending a round trip per handler.
     function checkRepoRoot() {
+        if (pane.contextRetired)
+            return;
         if (pane.repoCheckTarget === pane.repoCheckPath
                 && pane.sessionRoot === pane.repoCheckBase)
             return;
@@ -796,6 +833,7 @@ Item {
     // reports the real failure if there is one. This holds the path being asked
     // about; empty when no probe is outstanding.
     property string probePath: ""
+    property string probeRequestId: ""
 
     // The probe is BOUNDED. Nothing else un-wedges it: the header is drawn busy
     // for as long as `probePath` is set, and the two replies that clear it are
@@ -831,8 +869,10 @@ Item {
     onProbePathChanged: {
         if (pane.probePath.length > 0)
             probeWatchdog.restart();
-        else
+        else {
+            pane.probeRequestId = "";
             probeWatchdog.stop();
+        }
     }
 
     // Resolve whatever is in the address field and open it.
@@ -864,22 +904,23 @@ Item {
             pane.openRemotePath(path);
             return;
         }
+        pane.probeRequestId = pane.viewerModel.newDirectoryRequestId();
         pane.probePath = path;
-        pane.viewerModel.listDirectory(path);
+        pane.viewerModel.listDirectory(path, pane.probeRequestId);
     }
 
     Connections {
         target: pane.viewerModel
         // Only ever the pane's OWN outstanding probe: `viewers` is shared by
         // every pane, and the directory views listen on this same pair.
-        function onDirectoryListed(path, list) {
-            if (path !== pane.probePath)
+        function onDirectoryListed(path, list, requestId) {
+            if (requestId !== pane.probeRequestId || path !== pane.probePath)
                 return;
             pane.probePath = "";
             pane.openRemotePath(path + "/");
         }
-        function onDirectoryError(path, message) {
-            if (path !== pane.probePath)
+        function onDirectoryError(path, message, requestId) {
+            if (requestId !== pane.probeRequestId || path !== pane.probePath)
                 return;
             pane.probePath = "";
             pane.openRemotePath(path);
@@ -910,8 +951,12 @@ Item {
     }
 
     function requestClose() {
+        if (pane.layoutBlocked && !pane.layoutConflict) {
+            pane.messageRequested(qsTr("Save or close the retained unsaved editors before changing the viewer layout."));
+            return;
+        }
         const handler = contentLoader.item;
-        if (handler && handler.dirty === true) {
+        if (pane.contextRetired || (handler && handler.dirty === true)) {
             closeEditorDialog.open();
             return;
         }
@@ -1004,8 +1049,9 @@ Item {
         active: pane.paneActive
         subtitle: pane.showingDefault ? qsTr("session root")
                                      : pane.kindLabel
-                                       + (pane.contentDirty
-                                          ? qsTr(" \u00b7 unsaved changes") : "")
+                                       + (pane.contextRetired
+                                          ? qsTr(" \u00b7 previous workspace; local only")
+                                          : pane.contentDirty ? qsTr(" \u00b7 unsaved changes") : "")
         // fetching. Every handler that can wait on the network publishes
         // `loading` (the directory listing, and the four WebEngine-backed
         // views); the ones that cannot — the binary metadata card, the empty
@@ -1304,7 +1350,13 @@ Item {
         title: qsTr("Unsaved changes")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
+        preferredWidth: 420
         anchors.centerIn: Overlay.overlay
+        // Content measurement must not depend on popup geometry, which itself
+        // falls back to implicit size before the preferred-width Binding runs.
+        contentWidth: Math.max(0, closeEditorDialog._clampedPreferredWidth
+            - closeEditorDialog.leftPadding - closeEditorDialog.rightPadding)
+        contentHeight: closeEditorText.implicitHeight
         closePolicy: Popup.NoAutoClose
         // Enter cancels rather than closing: the affirmative answer throws away
         // unsaved work. See SessionRow.qml.
@@ -1316,14 +1368,19 @@ Item {
         }
         onAccepted: pane.closeRequested(pane.paneId)
 
-        Column {
-            width: 380
-            spacing: 8
+        // The popup sizes the wrapper; the text is measured independently from
+        // the clamped window width, never from the popup's assigned height.
+        contentItem: Item {
+            implicitWidth: closeEditorDialog.contentWidth
+            implicitHeight: closeEditorDialog.contentHeight
             Label {
-                width: parent.width
+                id: closeEditorText
+                width: closeEditorDialog.contentWidth
                 wrapMode: Text.WordWrap
                 textFormat: Text.PlainText
-                text: qsTr("This editor has unsaved changes. Close it without saving?")
+                text: pane.contextRetired
+                    ? qsTr("This editor belongs to a previous workspace and is kept only in local memory. Close it and discard its retained text?")
+                    : qsTr("This editor has unsaved changes. Close it without saving?")
                 color: Theme.text
             }
         }

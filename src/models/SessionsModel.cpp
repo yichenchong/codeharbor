@@ -1,5 +1,6 @@
 #include "SessionsModel.h"
 
+#include <QPointer>
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -88,10 +89,15 @@ void SessionsModel::setGroups(QVector<GroupRow> groups)
     const bool hadSessions = hasSessions();
     const bool hadUnarchivedSessions = hasUnarchivedSessions();
     ++resetSerial_;
+    const QPointer<SessionsModel> guard(this);
     beginResetModel();
+    if (!guard)
+        return;
     allGroups_ = std::move(groups);
     groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
     endResetModel();
+    if (!guard)
+        return;
     if (hadSessions != hasSessions() || hadUnarchivedSessions != hasUnarchivedSessions())
         emit sessionPresenceChanged();
 }
@@ -102,7 +108,10 @@ void SessionsModel::applyFilters()
     // out of the UNFILTERED tree, which this does not touch, so hasSessions()
     // and hasUnarchivedSessions() cannot move here.
     ++resetSerial_;
+    const QPointer<SessionsModel> guard(this);
     beginResetModel();
+    if (!guard)
+        return;
     groups_ = filteredGroups(allGroups_, pinnedOnly_, showArchived_);
     endResetModel();
 }
@@ -112,8 +121,10 @@ void SessionsModel::setPinnedOnly(bool pinnedOnly)
     if (pinnedOnly_ == pinnedOnly)
         return;
     pinnedOnly_ = pinnedOnly;
+    const QPointer<SessionsModel> guard(this);
     applyFilters();
-    emit pinnedOnlyChanged();
+    if (guard)
+        emit pinnedOnlyChanged();
 }
 
 void SessionsModel::setShowArchived(bool showArchived)
@@ -121,8 +132,10 @@ void SessionsModel::setShowArchived(bool showArchived)
     if (showArchived_ == showArchived)
         return;
     showArchived_ = showArchived;
+    const QPointer<SessionsModel> guard(this);
     applyFilters();
-    emit showArchivedChanged();
+    if (guard)
+        emit showArchivedChanged();
 }
 
 bool SessionsModel::hasSessions() const
@@ -230,8 +243,10 @@ void SessionsModel::updateTerminalStates(QVector<GroupRow> groups)
         }
     }
     const quint64 serial = resetSerial_;
+    const QPointer<SessionsModel> guard(this);
     for (const QModelIndex &row : std::as_const(changedRows)) {
-        if (serial != resetSerial_)
+        // A receiver may reset the model or tear down its owner altogether.
+        if (!guard || serial != resetSerial_)
             break;
         emit dataChanged(row, row, {RowStateRole});
     }

@@ -1,3 +1,4 @@
+#include <QPointer>
 #include <QSignalSpy>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -37,6 +38,7 @@ private slots:
     void genericPairsCannotEscapeTheirGroup();
     void valuesSurviveAReopen();
     void resetRestoresDefaultsAndAnnouncesWhatMoved();
+    void resetObserverMayDestroySettings();
 
 private:
     QTemporaryDir m_dir;
@@ -464,6 +466,40 @@ void TstAppSettings::resetRestoresDefaultsAndAnnouncesWhatMoved()
     QCOMPARE(noGeneric.count(), 0);
     QSettings raw(path, QSettings::IniFormat);
     QCOMPARE(raw.value(QStringLiteral("layout/sidebarWidth")).toInt(), 321);
+}
+
+void TstAppSettings::resetObserverMayDestroySettings()
+{
+    using Signal = void (AppSettings::*)();
+    const QList<Signal> changeSignals = {
+        &AppSettings::themeChanged, &AppSettings::groupPaletteChanged,
+        &AppSettings::groupPaletteSizeChanged, &AppSettings::toolbarOrderChanged,
+        &AppSettings::terminalFontSizeChanged, &AppSettings::terminalPixelRatioChanged,
+        &AppSettings::viewerDefaultsChanged};
+    for (qsizetype i = 0; i < changeSignals.size(); ++i) {
+        const QString path = scratchIni(m_dir, QStringLiteral("reset-delete-%1").arg(i));
+        QPointer<AppSettings> settings = new AppSettings(path);
+        settings->setTheme(QStringLiteral("light"));
+        settings->setGroupPalette(QStringLiteral("tokyonight"));
+        settings->setGroupPaletteSize(AppSettings::kMaxPaletteSize);
+        settings->setToolbarOrder({QStringLiteral("back")});
+        settings->setTerminalFontSize(AppSettings::kMaxTerminalFontSize);
+        settings->setTerminalPixelRatio(1.0);
+        QVERIFY(settings->setViewerDefault(QStringLiteral("md"), QStringLiteral("text")));
+        settings->setValue(QStringLiteral("tmux"), QStringLiteral("prefix"),
+                           QStringLiteral("C-a"));
+        connect(settings, changeSignals.at(i), this, [&settings] { delete settings.data(); });
+
+        settings->resetToDefaults();
+
+        QVERIFY(settings.isNull());
+        AppSettings reopened(path);
+        QCOMPARE(reopened.theme(), QStringLiteral("dark"));
+        QCOMPARE(reopened.groupPalette(), QStringLiteral("plain"));
+        QVERIFY(reopened.toolbarOrder().isEmpty());
+        QVERIFY(reopened.viewerDefaults().isEmpty());
+        QVERIFY(!reopened.value(QStringLiteral("tmux"), QStringLiteral("prefix")).isValid());
+    }
 }
 
 QTEST_GUILESS_MAIN(TstAppSettings)

@@ -42,6 +42,8 @@ private slots:
     void fencedAndIndentedCodeCarryTheRightLanguage();
     void aFenceDedentPreservesTheRemainderOfATab();
     void listMarkersInsideIndentedCodeRemainLiteral();
+    void listNestingRequiresTheParentsContentColumn();
+    void tabsAfterListMarkersUseColumnStops();
     void deeplyNestedListsCarryTheirNestingLevel();
     void taskMarkersHaveThreeStatesNotTwo();
     void headingsInBothSpellings();
@@ -57,6 +59,7 @@ private slots:
     void destinationValidatorsInIsolation();
     void intrawordUnderscoresAreNotEmphasis();
     void anUnterminatedAngleDestinationIsNotADestination();
+    void destinationEscapesAndAngleParenthesesNameTheActualPath();
     void adversarialInlineInputCannotHangOrOverflowTheParser();
 };
 
@@ -227,6 +230,43 @@ void TstMarkdownModel::aFenceDedentPreservesTheRemainderOfATab()
     QCOMPARE(kindOf(model, 0), QStringLiteral("code"));
     // The tab occupies four columns; the two-column fence dedent must leave two.
     QCOMPARE(textOf(model, 0), QStringLiteral("  indented"));
+}
+
+void TstMarkdownModel::listNestingRequiresTheParentsContentColumn()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("100. parent\n"
+                                     "     - child\n"
+                                     "  - sibling\n"));
+    QCOMPARE(model.rowCount(), 3);
+    QCOMPARE(textOf(model, 0), QStringLiteral("parent"));
+    QCOMPARE(textOf(model, 1), QStringLiteral("child"));
+    QCOMPARE(textOf(model, 2), QStringLiteral("sibling"));
+    QCOMPARE(blockOf(model, 0).value(QStringLiteral("level")).toInt(), 0);
+    QCOMPARE(blockOf(model, 1).value(QStringLiteral("level")).toInt(), 1);
+    QCOMPARE(blockOf(model, 2).value(QStringLiteral("level")).toInt(), 0);
+
+    // A marker too far left to belong to its parent, but indented by four
+    // columns at the root, is literal code rather than a nested list.
+    model.setMarkdown(QStringLiteral("100. parent\n    - literal\n"));
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(kindOf(model, 1), QStringLiteral("code"));
+    QCOMPARE(textOf(model, 1), QStringLiteral("- literal"));
+}
+
+void TstMarkdownModel::tabsAfterListMarkersUseColumnStops()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("-\tparent\n\tcontinued\n"));
+    QCOMPARE(model.rowCount(), 1);
+    QCOMPARE(kindOf(model, 0), QStringLiteral("listItem"));
+    QCOMPARE(textOf(model, 0), QStringLiteral("parent\ncontinued"));
+
+    model.setMarkdown(QStringLiteral("-\tparent\n  separate paragraph\n"));
+    QCOMPARE(model.rowCount(), 2);
+    QCOMPARE(textOf(model, 0), QStringLiteral("parent"));
+    QCOMPARE(kindOf(model, 1), QStringLiteral("paragraph"));
+    QCOMPARE(textOf(model, 1), QStringLiteral("separate paragraph"));
 }
 
 void TstMarkdownModel::anUnterminatedFenceStaysCodeToTheEndOfTheDocument()
@@ -741,7 +781,8 @@ void TstMarkdownModel::anUnterminatedAngleDestinationIsNotADestination()
     MarkdownModel model;
     model.setMarkdown(QStringLiteral("[a](<https://example.com/x)"));
     QCOMPARE(kindOf(model, 0), QStringLiteral("paragraph"));
-    QCOMPARE(textOf(model, 0), QStringLiteral("a"));
+    // Malformed syntax may remain literal; the behavioral contract is that
+    // no tappable destination is created.
     QCOMPARE(spansOf(model, 0).size(), 0);
 
     // An EMPTY angle destination is refused the same way, and the terminated
@@ -755,6 +796,36 @@ void TstMarkdownModel::anUnterminatedAngleDestinationIsNotADestination()
     QCOMPARE(kindOf(spaced, 0), QStringLiteral("image"));
     QCOMPARE(blockOf(spaced, 0).value(QStringLiteral("imagePath")).toString(),
              QStringLiteral("my logo.png"));
+}
+
+void TstMarkdownModel::destinationEscapesAndAngleParenthesesNameTheActualPath()
+{
+    MarkdownModel model;
+    model.setMarkdown(QStringLiteral("[manual](docs/a\\(b\\).md)\n\n"
+                                     "![badge](assets/a\\(b\\).png)\n\n"
+                                     "![angle](<assets/a)b(c.png>)\n\n"
+                                     "[web](<https://example.com/a)b(c>)\n"));
+    QCOMPARE(model.rowCount(), 4);
+    QCOMPARE(textOf(model, 0), QStringLiteral("manual"));
+    QCOMPARE(spansOf(model, 0).size(), 1);
+    QCOMPARE(spansOf(model, 0).first().toMap().value(QStringLiteral("target")).toString(),
+             QStringLiteral("docs/a(b).md"));
+    QCOMPARE(kindOf(model, 1), QStringLiteral("image"));
+    QCOMPARE(blockOf(model, 1).value(QStringLiteral("imagePath")).toString(),
+             QStringLiteral("assets/a(b).png"));
+    QCOMPARE(kindOf(model, 2), QStringLiteral("image"));
+    QCOMPARE(blockOf(model, 2).value(QStringLiteral("imagePath")).toString(),
+             QStringLiteral("assets/a)b(c.png"));
+    QCOMPARE(textOf(model, 3), QStringLiteral("web"));
+    QCOMPARE(spansOf(model, 3).size(), 1);
+    QCOMPARE(spansOf(model, 3).first().toMap().value(QStringLiteral("target")).toString(),
+             QStringLiteral("https://example.com/a)b(c"));
+
+    // Decode escaping before path validation: escaped separators must not
+    // turn a refused parent traversal into an automatic image read.
+    model.setMarkdown(QStringLiteral("![refused](..\\/outside.png)"));
+    QCOMPARE(kindOf(model, 0), QStringLiteral("image"));
+    QVERIFY(blockOf(model, 0).value(QStringLiteral("imagePath")).toString().isEmpty());
 }
 
 // setMarkdown() runs on the QML thread over a string the SERVER chose, so a

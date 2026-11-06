@@ -3,6 +3,7 @@
 #include "ViewerKinds.h"
 
 #include <QMetaType>
+#include <QPointer>
 #include <QSet>
 #include <QSettings>
 #include <cmath>
@@ -408,20 +409,45 @@ void AppSettings::resetToDefaults()
     }
     m_settings->remove(QStringLiteral("settings"));
 
-    if (theme != this->theme())
+    // Change receivers may close the settings owner synchronously. Never read
+    // another preference or announce another change after that teardown.
+    const QPointer<AppSettings> guard(this);
+
+    if (theme != this->theme()) {
         emit themeChanged();
-    if (palette != groupPalette())
+        if (!guard)
+            return;
+    }
+    if (palette != groupPalette()) {
         emit groupPaletteChanged();
-    if (paletteSize != groupPaletteSize())
+        if (!guard)
+            return;
+    }
+    if (paletteSize != groupPaletteSize()) {
         emit groupPaletteSizeChanged();
-    if (toolbar != toolbarOrder())
+        if (!guard)
+            return;
+    }
+    if (toolbar != toolbarOrder()) {
         emit toolbarOrderChanged();
-    if (fontSize != terminalFontSize())
+        if (!guard)
+            return;
+    }
+    if (fontSize != terminalFontSize()) {
         emit terminalFontSizeChanged();
-    if (!qFuzzyCompare(pixelRatio + 1.0, terminalPixelRatio() + 1.0))
+        if (!guard)
+            return;
+    }
+    if (!qFuzzyCompare(pixelRatio + 1.0, terminalPixelRatio() + 1.0)) {
         emit terminalPixelRatioChanged();
-    if (viewerDefaults != this->viewerDefaults())
+        if (!guard)
+            return;
+    }
+    if (viewerDefaults != this->viewerDefaults()) {
         emit viewerDefaultsChanged();
+        if (!guard)
+            return;
+    }
     if (hadGeneric) {
         // Generic pairs have no per-key record of what existed, so one blanket
         // notification with empty names says "re-read everything".

@@ -8,6 +8,18 @@ target_link_libraries(tst_appcontroller PRIVATE
 )
 add_test(NAME tst_appcontroller COMMAND tst_appcontroller)
 
+# Window registration and synchronous property-callback lifetime regressions.
+# The Windows cases need the native platform plugin to exercise real HWND
+# message handling; other hosts can run the portable lifetime cases headlessly.
+qt_add_executable(tst_windowchrome tst_windowchrome.cpp)
+target_link_libraries(tst_windowchrome PRIVATE ch_app Qt6::Quick Qt6::Test)
+add_test(NAME tst_windowchrome COMMAND tst_windowchrome)
+set_tests_properties(tst_windowchrome PROPERTIES TIMEOUT 120)
+if(NOT WIN32)
+    set_tests_properties(tst_windowchrome PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software")
+endif()
+
 # The client end of the viewer control channel (SPEC 4.3): a `viewer.command`
 # notification off the wire becomes a validated signal, and an answer becomes a
 # `viewer.commandResult` request. Driven through the real CodeharbordClient over
@@ -281,6 +293,7 @@ add_test(NAME tst_logbuffer COMMAND tst_logbuffer)
 if(WIN32)
     set_target_properties(
         tst_appcontroller
+        tst_windowchrome
         tst_appsettings
         tst_logbuffer
         tst_notifier

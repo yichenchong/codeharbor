@@ -46,12 +46,12 @@ import {
 } from "./validate.ts";
 
 // Opaque revision token (SPEC 8.4/8.6). Clients treat it as bytes and never
-// parse it. It must change whenever the file changes, so it folds in a
-// change-monotonic component (ctimeMs) and the inode alongside mtime + size:
-// a same-size external edit within a single mtime tick would otherwise mint an
-// identical token, bypassing the save guard and dropping watch modify events.
-export function revisionFrom(stats: Pick<Stats, "mtimeMs" | "ctimeMs" | "ino" | "size">): string {
-    return `${stats.mtimeMs}-${stats.ctimeMs}-${stats.ino}-${stats.size}`;
+// parse it. ctime catches same-size edits within one mtime tick, and the device
+// plus inode identify the file: inode numbers alone can alias across mounts.
+export function revisionFrom(
+    stats: Pick<Stats, "mtimeMs" | "ctimeMs" | "dev" | "ino" | "size">,
+): string {
+    return `${stats.mtimeMs}-${stats.ctimeMs}-${stats.dev}-${stats.ino}-${stats.size}`;
 }
 
 // Tagged error carrying the JSON-RPC revision-mismatch code (SPEC 8.6). The
@@ -435,13 +435,14 @@ export async function readFile(params: ReadFileParams): Promise<ReadFileResult> 
             const bytesRead = await readFully(handle, dest, size, 0);
             slice = bytesRead === size ? dest : dest.subarray(0, bytesRead);
         }
-        // Skipped for a stat-size-0 file: its revision token is minted from a
-        // size and an mtime that describe nothing (procfs restamps mtime on
-        // every stat, so the comparison would ALWAYS report a change), and the
-        // read above went to end of file, so the content is whole by
-        // construction.
+        // A zero-size pseudo-file has metadata that need not describe its
+        // content (procfs can restamp mtime on every stat), so metadata-only
+        // changes there do not invalidate the read. But an initially empty
+        // ordinary file can grow during the read too: a nonzero final size
+        // proves the old revision no longer describes the returned bytes.
+        const after = await handle.stat();
         const fileChangedDuringRead =
-            size > 0 && revisionFrom(await handle.stat()) !== revision;
+            size === 0 ? after.size !== 0 : revisionFrom(after) !== revision;
 
         // `truncated` answers exactly ONE question: is `content` the WHOLE file?
         // It is true whenever any byte of the file is absent from the returned
@@ -557,6 +558,7 @@ async function resolveLinkChain(p: string): Promise<string> {
     let current = path.isAbsolute(p) ? path.parse(p).root : process.cwd();
     let pending = p.split(path.sep);
     let depth = 0;
+    let missingComponent = false;
     const lastComponent = pending.at(-1);
     let directoryTarget =
         lastComponent === "" || lastComponent === "." || lastComponent === "..";
@@ -564,6 +566,14 @@ async function resolveLinkChain(p: string): Promise<string> {
         const component = pending.shift()!;
         if (component === "" || component === ".") continue;
         if (component === "..") {
+            // A missing directory cannot be traversed, even when a later ".."
+            // would cancel its spelling. Collapsing it would publish a sibling
+            // file while the original path still fails with ENOENT.
+            if (missingComponent) {
+                throw Object.assign(new Error(`ENOENT: no such file or directory, '${p}'`), {
+                    code: "ENOENT",
+                });
+            }
             current = path.dirname(current);
             continue;
         }
@@ -582,6 +592,7 @@ async function resolveLinkChain(p: string): Promise<string> {
             }
             // A regular component, or a directory/file the create will bring
             // into being. Real errors (EACCES, ENOTDIR, EIO) must not be hidden.
+            if (err.code === "ENOENT") missingComponent = true;
             current = candidate;
             continue;
         }
@@ -917,9 +928,9 @@ interface Subscription {
     id: string;
     path: string;
     watcher?: FSWatcher;
-    // The inode number fs.watch was armed on, or undefined when no watcher is
-    // installed. An OS watch handle names an INODE, not a path, so it goes deaf
-    // the moment the path is repointed at a different inode — see armWatcher.
+    // Device plus inode fs.watch was armed on, or undefined with no watcher.
+    // Inode numbers alone are not unique across mounted filesystems.
+    watchedDev?: number;
     watchedIno?: number;
     poll?: NodeJS.Timeout;
     lastRevision?: string;
@@ -972,6 +983,7 @@ export class FileWatchService {
     private readonly subscriptions = new Map<string, Subscription>();
     private counter = 0;
 
+    private closing = false;
     // Polling-fallback cadence, in milliseconds. Adjustable for tests.
     pollIntervalMs = 1000;
 
@@ -1008,6 +1020,7 @@ export class FileWatchService {
     }
 
     async watch(params: WatchParams): Promise<WatchResult> {
+        if (this.closing) throw new Error("File-watch service is closing");
         // Checked AND reserved before the first await. The table insertion used
         // to happen after two awaits, so a burst of concurrent watch calls could
         // all pass one size check and overshoot the cap together; reserving the
@@ -1038,7 +1051,7 @@ export class FileWatchService {
         if (sub.closed || !this.subscriptions.has(id)) return { subscriptionId: id };
         sub.lastRevision = existing ? revisionFrom(existing) : undefined;
 
-        this.armWatcher(sub, existing?.ino);
+        this.armWatcher(sub, existing);
 
         sub.poll = setInterval(() => {
             this.reconcile(sub);
@@ -1064,8 +1077,16 @@ export class FileWatchService {
     }
 
     closeAll(): void {
-        for (const id of [...this.subscriptions.keys()]) {
-            this.unwatch({ subscriptionId: id });
+        // A closed listener can re-enter closeAll or try to replace a watch.
+        // Do not let it install handles after the teardown snapshot was taken.
+        if (this.closing) return;
+        this.closing = true;
+        try {
+            for (const id of [...this.subscriptions.keys()]) {
+                this.unwatch({ subscriptionId: id });
+            }
+        } finally {
+            this.closing = false;
         }
     }
 
@@ -1082,12 +1103,12 @@ export class FileWatchService {
     // intended "fs.watch is the primary signal" design. Re-arming on the new
     // inode restores it.
     //
-    // `ino` is the inode the handle ends up watching; undefined means the path
-    // has nothing at it, in which case fs.watch throws (ENOENT) and polling is
-    // the only signal until the path appears and a check re-arms.
-    private armWatcher(sub: Subscription, ino: number | undefined): void {
+    // `stats` identifies the file the handle ends up watching; undefined means
+    // the path has no target, so polling is the only signal until it appears.
+    private armWatcher(sub: Subscription, stats: Pick<Stats, "dev" | "ino"> | undefined): void {
         sub.watcher?.close();
         sub.watcher = undefined;
+        sub.watchedDev = undefined;
         sub.watchedIno = undefined;
         if (sub.closed) return;
         try {
@@ -1100,11 +1121,13 @@ export class FileWatchService {
                 watcher.close();
                 if (sub.watcher === watcher) {
                     sub.watcher = undefined;
+                    sub.watchedDev = undefined;
                     sub.watchedIno = undefined;
                 }
             });
             sub.watcher = watcher;
-            sub.watchedIno = ino;
+            sub.watchedDev = stats?.dev;
+            sub.watchedIno = stats?.ino;
         } catch {
             // fs.watch unavailable for this path; polling covers it.
         }
@@ -1172,12 +1195,14 @@ export class FileWatchService {
             }
             return;
         }
-        // Re-arm whenever the path now names a DIFFERENT inode than the handle
-        // was bound to (an atomic save, a delete-and-recreate, a re-pointed
-        // symlink), or whenever there is no handle at all because arming failed
-        // or the handle errored. Same inode plus a live handle costs nothing.
-        if (sub.watcher === undefined || sub.watchedIno !== stats.ino) {
-            this.armWatcher(sub, stats.ino);
+        // Re-arm for a different device/inode (an atomic save, re-create or
+        // re-pointed symlink), or after a failed/errored handle.
+        if (
+            sub.watcher === undefined ||
+            sub.watchedDev !== stats.dev ||
+            sub.watchedIno !== stats.ino
+        ) {
+            this.armWatcher(sub, stats);
         }
         const revision = revisionFrom(stats);
         if (revision === sub.lastRevision) return;

@@ -59,9 +59,11 @@
 #include <QJsonValue>
 #include <QList>
 #include <QMetaObject>
+#include <QPair>
 #include <QModelIndex>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QPointer>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
@@ -336,9 +338,8 @@ constexpr auto kJsPasteTemplate = R"JS(
 // macro's argument list).
 using WidthPair = QPair<int, int>;
 
-// Organisation/application names of the shipped binary (main.cpp). The test
-// process adopts them so its production UiStateStore and the relaunched GUI
-// binary address the very same QSettings file.
+// Organisation/application names of the shipped binary (main.cpp). Settings
+// themselves use an explicit private INI shared with child processes.
 const char kOrganization[] = "CodeHarbor";
 const char kApplication[] = "CodeHarbor";
 
@@ -350,7 +351,9 @@ QString env(const char* key)
 // One JSON-RPC round trip driven to completion on the caller's event loop.
 // Used for out-of-band reads/writes that must NOT go through AppController, so
 // the controller's own behaviour is never assumed by the thing checking it.
-struct RawRpc {
+// A timeout leaves the client's request pending. Its eventual failure/reply
+// must not access this stack helper after the caller has moved on.
+struct RawRpc : QObject {
     QJsonValue result;
     std::optional<RpcError> error;
     bool done = false;
@@ -358,11 +361,14 @@ struct RawRpc {
     bool call(CodeharbordClient& client, const QString& method,
               const QJsonObject& params, int timeoutMs = kOpTimeoutMs)
     {
+        const QPointer<RawRpc> self(this);
         client.call(method, params,
-                    [this](QJsonValue value, std::optional<RpcError> err) {
-                        result = value;
-                        error = err;
-                        done = true;
+                    [self](QJsonValue value, std::optional<RpcError> err) {
+                        if (!self)
+                            return;
+                        self->result = value;
+                        self->error = err;
+                        self->done = true;
                     });
         if (!QTest::qWaitFor([this] { return done; }, timeoutMs))
             return false;
@@ -392,10 +398,10 @@ struct FreshView {
     AppController controller;
     QString stderrText;
 
-    explicit FreshView(SshConnectionPool* pool)
+    FreshView(SshConnectionPool* pool, const QString& settingsPath)
         : device(pool)
         , client()
-        , controller(&client)
+        , controller(&client, nullptr, settingsPath)
     {
         QObject::connect(&device, &SshChannelDevice::channelError, &device,
                          [this](const QString& text) { stderrText += text; });
@@ -481,7 +487,7 @@ QStringList sessionIds(const SessionsModel& model, int groupRow)
 
 // Child mode of this same binary: a second real OS process that writes region
 // widths through the production object graph (AppController -> UiStateStore ->
-// QSettings native scope) and exits. Selected by CH_LIVESHELL_WRITE_WIDTHS so
+// explicit INI) and exits. Selected by CH_LIVESHELL_WRITE_WIDTHS so
 // the parent can prove the values crossed a process boundary rather than being
 // served from this process's QSettings cache.
 int runWidthWriter(int argc, char* argv[], const QByteArray& spec)
@@ -496,9 +502,14 @@ int runWidthWriter(int argc, char* argv[], const QByteArray& spec)
         return 2;
     }
 
+    const QString settingsPath = qEnvironmentVariable("CH_SETTINGS_PATH");
+    if (settingsPath.isEmpty() || !QFileInfo(settingsPath).isAbsolute()) {
+        qCritical("Width writer requires an absolute private CH_SETTINGS_PATH");
+        return 2;
+    }
     // No transport is wired: this child touches client-local UI state only.
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, settingsPath);
     controller.uiState()->setRegionWidths(parts.at(0).toInt(), parts.at(1).toInt(),
                                           parts.at(2).toInt());
     // Returning destroys the controller, its UiStateStore and its QSettings,
@@ -544,6 +555,7 @@ private:
     // pane is live and a diagnosis when it is not.
     QString whyPaneIsNotLive(QObject* probe, QObject* pane, const QString& marker);
 
+    QTemporaryDir m_scratch;
     SshConnectionPool m_pool;
     CodeharbordClient m_client;
     AgentStatusMonitor m_monitor;
@@ -552,7 +564,6 @@ private:
     std::unique_ptr<ch::ServerProfiles> m_shellProfiles;
     std::unique_ptr<QSignalSpy> m_refreshedSpy;
     std::unique_ptr<FreshView> m_freshView;
-    QTemporaryDir m_scratch;
 
     // False when CH_LIVE_SSH is unset (or libssh is missing): the SSH-backed
     // cases QSKIP, the QML case still runs.
@@ -564,6 +575,7 @@ private:
     QString m_node;
     QString m_repo;
     QString m_configHome;
+    QString m_settingsPath;
     QString m_rpcCommand;
 
     // Unique per run: every row created below is recorded by its server id.
@@ -587,29 +599,17 @@ void TstLiveShell::initTestCase()
 {
     QVERIFY(m_scratch.isValid());
 
-    // Linux's native QSettings path follows XDG_CONFIG_HOME. macOS and
-    // Windows ignore that variable, so use the native path those child
-    // processes share. The CI hosts are disposable, and using the native
-    // path is required because QStandardPaths test mode is process-local.
-#if defined(Q_OS_LINUX)
+    // Explicit settings paths isolate native-store platforms too. Keep an XDG
+    // root for ancillary Linux configuration and child process caches.
     m_configHome = m_scratch.filePath(QStringLiteral("config"));
     QVERIFY(QDir().mkpath(m_configHome));
+    m_settingsPath = m_scratch.filePath(QStringLiteral("CodeHarbor.ini"));
+#if defined(Q_OS_LINUX)
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(m_configHome));
     QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation),
              m_configHome);
 #else
-    // ...but only the LIVE cases spawn child processes. With no fixture the
-    // one case that still runs, qmlRestoresAndPersistsRegionWidths(), lives
-    // entirely in this process AND WRITES region widths through the production
-    // native-scope store - which off Linux is the developer's own
-    // CodeHarbor settings. Test mode is process-local, so it is exactly right
-    // here and exactly wrong for the live cases; tst_coldstart draws the same
-    // line for the same reason.
-    if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH")
-        || !SshConnectionPool::libsshAvailable())
-        QStandardPaths::setTestModeEnabled(true);
-    m_configHome = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
-    QVERIFY(QDir().mkpath(m_configHome));
+    QStandardPaths::setTestModeEnabled(true);
 #endif
 
     if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH")) {
@@ -641,7 +641,8 @@ void TstLiveShell::initTestCase()
     // -> client transport; bridge over an AgentStatus channel -> monitor.
     m_bootstrap = std::make_unique<SessionBootstrap>(&m_pool, &m_client, &m_monitor);
     QString bootstrapError;
-    connect(m_bootstrap.get(), &SessionBootstrap::error, this,
+    QObject bootstrapDiagnostics;
+    connect(m_bootstrap.get(), &SessionBootstrap::error, &bootstrapDiagnostics,
             [&bootstrapError](const QString& text) {
                 bootstrapError += text + QLatin1Char('\n');
             });
@@ -670,7 +671,7 @@ void TstLiveShell::initTestCase()
              QStringLiteral("codeharbord"));
 
     // The shell as main.cpp builds it.
-    m_controller = std::make_unique<AppController>(&m_client);
+    m_controller = std::make_unique<AppController>(&m_client, nullptr, m_settingsPath);
     m_controller->setAgentMonitor(&m_monitor);
     connect(m_controller.get(), &AppController::error, this,
             [this](const QString& message) { m_lastError = message; });
@@ -687,13 +688,13 @@ void TstLiveShell::initTestCase()
 void TstLiveShell::cleanupTestCase()
 {
     QStringList cleanupFailures;
+    m_freshView.reset();
     if (!m_createdGroupIds.isEmpty()) {
         if (m_client.transport() == nullptr) {
             cleanupFailures
                 << QStringLiteral("SSH transport is down; groups not deleted: %1")
                        .arg(m_createdGroupIds.join(QStringLiteral(", ")));
         } else {
-            m_freshView.reset();
             for (const QString& groupId : m_createdGroupIds) {
                 RawRpc removed;
                 if (!removed.call(m_client, QStringLiteral("workspace.deleteGroup"),
@@ -736,16 +737,12 @@ bool TstLiveShell::waitForRefresh(int previousCount, int timeoutMs)
 
 QString TstLiveShell::configFilePath() const
 {
-    // Ask QSettings for the platform-native file rather than assuming the
-    // Linux INI layout. macOS stores NativeFormat differently, while the
-    // production UiStateStore uses this exact constructor.
-    return QSettings(QStringLiteral("CodeHarbor"), QStringLiteral("CodeHarbor"))
-        .fileName();
+    return m_settingsPath;
 }
 
 QString TstLiveShell::readConfigFile() const
 {
-    QSettings settings(QStringLiteral("CodeHarbor"), QStringLiteral("CodeHarbor"));
+    QSettings settings(m_settingsPath, QSettings::IniFormat);
     settings.sync();
     return QStringLiteral("layout/sidebarWidth=%1\nlayout/terminalWidth=%2")
         .arg(settings.value(QStringLiteral("layout/sidebarWidth")).toInt())
@@ -855,7 +852,8 @@ void TstLiveShell::liveCrudRoundTripPersistsServerSide()
 
     // A second codeharbord process reading the same database. Everything below
     // is confirmed here before it counts as persisted.
-    m_freshView = std::make_unique<FreshView>(&m_pool);
+    m_freshView = std::make_unique<FreshView>(
+        &m_pool, m_scratch.filePath(QStringLiteral("fresh-view.ini")));
     QVERIFY2(m_freshView->start(m_rpcCommand, m_serverId),
              qPrintable(QStringLiteral("second codeharbord failed to start: %1")
                             .arg(m_freshView->stderrText)));
@@ -1045,13 +1043,14 @@ void TstLiveShell::regionWidthsSurviveRealRelaunch()
     constexpr int kOversizedTerminal = 888;
 
     // Write the widths from a REAL second OS process, through the production
-    // graph (AppController -> UiStateStore -> QSettings native scope), so the
+    // graph (AppController -> UiStateStore -> private INI), so the
     // values genuinely cross a process boundary instead of being served from
     // this process's QSettings cache.
     const auto writeWidthsInChildProcess = [this](int sidebar, int terminal,
                                                   QString* diagnostic) {
         QProcessEnvironment writerEnv = QProcessEnvironment::systemEnvironment();
         writerEnv.insert(QStringLiteral("XDG_CONFIG_HOME"), m_configHome);
+        writerEnv.insert(QStringLiteral("CH_SETTINGS_PATH"), m_settingsPath);
         writerEnv.insert(QStringLiteral("CH_LIVESHELL_WRITE_WIDTHS"),
                          QStringLiteral("%1,0,%2").arg(sidebar).arg(terminal));
         QProcess writer;
@@ -1067,9 +1066,9 @@ void TstLiveShell::regionWidthsSurviveRealRelaunch()
     };
 
     // What the shipped app reads on startup: a brand new production store.
-    const auto storedWidths = [] {
+    const auto storedWidths = [this] {
         CodeharbordClient offline;
-        AppController reopened(&offline);
+        AppController reopened(&offline, nullptr, m_settingsPath);
         return WidthPair(reopened.uiState()->sidebarWidth(),
                                reopened.uiState()->terminalWidth());
     };
@@ -1138,6 +1137,7 @@ bool TstLiveShell::launchRealApp(const QString& knownHostsPath, QString* output)
 {
     QProcessEnvironment appEnv = QProcessEnvironment::systemEnvironment();
     appEnv.insert(QStringLiteral("XDG_CONFIG_HOME"), m_configHome);
+    appEnv.insert(QStringLiteral("CH_SETTINGS_PATH"), m_settingsPath);
     appEnv.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("offscreen"));
     appEnv.insert(QStringLiteral("QT_QUICK_BACKEND"), QStringLiteral("software"));
     // NB: no --single-process. It is fatal the moment a second
@@ -1258,7 +1258,7 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
     constexpr int kDragDelta = 60;
 
     {
-        UiStateStore seed; // native scope, redirected to m_configHome
+        UiStateStore seed(m_settingsPath);
         seed.setRegionWidths(kStoredSidebar, 0, kStoredTerminal);
     }
 
@@ -1266,9 +1266,9 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
     // are client-local, so no server takes part in restoring or persisting them.
     CodeharbordClient client;
     AgentStatusMonitor monitor;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, m_settingsPath);
     controller.setAgentMonitor(&monitor);
-    ch::ViewerProfiles profiles(&client);
+    ch::ViewerProfiles profiles(&client, m_settingsPath + QStringLiteral(".webengine"));
     ch::ViewerModel viewers(&client);
     viewers.setProfiles(&profiles);
     ch::EditorFactory editorFactory(&client);
@@ -1352,7 +1352,7 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
     const int persistedSidebar = qRound(evalReal("sidebarRegion.width"));
     const int persistedTerminal = qRound(evalReal("terminalRegion.width"));
     {
-        UiStateStore stored;
+        UiStateStore stored(m_settingsPath);
         QCOMPARE(stored.sidebarWidth(), persistedSidebar);
         QCOMPARE(stored.terminalWidth(), persistedTerminal);
     }
@@ -1379,7 +1379,7 @@ void TstLiveShell::qmlRestoresAndPersistsRegionWidths()
                              .arg(evalReal("terminalRegion.width"));
 
     {
-        UiStateStore stored;
+        UiStateStore stored(m_settingsPath);
         QVERIFY2(stored.sidebarWidth() == persistedSidebar
                      && stored.terminalWidth() == persistedTerminal,
                  qPrintable(QStringLiteral("a layout-driven resize overwrote the "
@@ -1431,7 +1431,7 @@ void TstLiveShell::liveTerminalsAfterTheFirstComeUp()
     // never saw these rows: this one is the shell the other cases already
     // proved reads the authoritative workspace.
     AppController& controller = *m_controller;
-    ch::ViewerProfiles profiles(&m_client);
+    ch::ViewerProfiles profiles(&m_client, m_settingsPath + QStringLiteral(".webengine"));
     ch::ViewerModel viewers(&m_client);
     viewers.setProfiles(&profiles);
     // Borrowed by the long-lived controller: keep it alive through row cleanup.
@@ -2051,6 +2051,24 @@ int main(int argc, char* argv[])
     const QByteArray widths = qgetenv("CH_LIVESHELL_WRITE_WIDTHS");
     if (!widths.isEmpty())
         return runWidthWriter(argc, argv, widths);
+
+    QTemporaryDir applicationState;
+    if (!applicationState.isValid()) {
+        qCritical("Could not create private WebEngine test state");
+        return 2;
+    }
+#if defined(Q_OS_LINUX)
+    for (const auto& entry : {
+             qMakePair("XDG_DATA_HOME", QStringLiteral("data")),
+             qMakePair("XDG_CACHE_HOME", QStringLiteral("cache"))}) {
+        const QString path = applicationState.filePath(entry.second);
+        if (!QDir().mkpath(path))
+            return 2;
+        qputenv(entry.first, QFile::encodeName(path));
+    }
+#else
+    QStandardPaths::setTestModeEnabled(true);
+#endif
 
     // Mirrors src/app/main.cpp's setup order: the custom URL scheme and
     // WebEngine must both be initialised before the GUI application, because

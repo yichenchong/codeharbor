@@ -67,6 +67,28 @@ function listingRunner(records: string[]): { run: CommandRunner; calls: string[]
     };
 }
 
+// A session inventory, including names that tmux would interpret as targets.
+// Destruction succeeds only for the inventory's IDs, never for a name.
+function sessionRunner(initial: readonly string[], killReply = OK("")) {
+    const sessions = new Map(initial.map((name, index) => [`$${index}`, name]));
+    const calls: string[][] = [];
+    const run: CommandRunner = async (argv) => {
+        calls.push(argv);
+        if (argv[0] === "list-sessions") {
+            const format = argv[argv.indexOf("-F") + 1];
+            const anchor = format.slice(0, format.indexOf("#{"));
+            const suffix = format.slice(format.indexOf("#{session_name}") + "#{session_name}".length);
+            return OK([...sessions].map(([id, name]) => `${anchor}${id} ${name}${suffix}`).join("\n"));
+        }
+        assert.equal(argv[0], "kill-session");
+        if (killReply.code === 0) {
+            assert.ok(sessions.delete(argv[2]), `not a listed session ID: ${argv[2]}`);
+        }
+        return killReply;
+    };
+    return { sessions, calls, run };
+}
+
 // Every fixture line below is assembled from the SHIPPED separator rather than
 // spelling one. A fixture that hard-codes bytes real tmux never emits is exactly
 // what hid the tab bug for a release: the parsers agreed with the fixtures and
@@ -268,44 +290,69 @@ test("sessionExists is false when the server has no sessions at all", async () =
     assert.deepEqual(await sessionExists({ name: "codeharbor" }, tmux.run), { exists: false });
 });
 
-test("killSession targets the exact name through argv, never a shell string", async () => {
-    const tmux = stubRunner(OK(""));
-    assert.deepEqual(await killSession({ name: "my session staging" }, tmux.run), {});
-    assert.deepEqual(tmux.calls, [["kill-session", "-t", "=my session staging"]]);
-});
-
-test("killSession passes hostile names verbatim as one argv element", async () => {
-    const tmux = stubRunner(OK(""));
-    const hostile = "; rm -rf $HOME #";
-    await killSession({ name: hostile }, tmux.run);
-    assert.deepEqual(tmux.calls[0], ["kill-session", "-t", `=${hostile}`]);
-});
-
-// SECURITY: two distinct ways a hostile name could hit the wrong session.
-// (a) An option-looking name: `-a`, `-C`, `--`. Without the `=` sigil the name
-//     is the first character of the argv element and tmux's getopt would read
-//     it as a FLAG (`kill-session -a` kills every OTHER session).
-// (b) A glob: tmux's target grammar falls back to prefix then fnmatch matching,
-//     so a bare `-t 'ch_*'` destroys whatever it happens to hit. `=` pins the
-//     lookup to an exact name.
-test("an option-shaped or glob name cannot be read as a flag or match another session", async () => {
-    for (const name of ["-a", "-C", "--", "-t", "*", "ch_*_term", "?", "[abc]"]) {
-        const tmux = stubRunner(OK(""));
-        await killSession({ name }, tmux.run);
-        assert.deepEqual(
-            tmux.calls[0],
-            ["kill-session", "-t", `=${name}`],
-            `"${name}" must reach tmux as one exact-match target, not as an option or pattern`,
-        );
-        // The `=` sigil is what makes it neither: it is the first character, so
-        // getopt sees no leading `-`, and it disables prefix/fnmatch matching.
-        assert.ok(tmux.calls[0][2].startsWith("="));
+test("killSession destroys only the session with the literal requested name", async () => {
+    for (const name of [
+        "my session staging", "; rm -rf $HOME #", "-a", "-C", "--", "-t",
+        "*", "ch_*_term", "?", "[abc]", "$0", "=victim", "pts/42",
+        "trailing;", "backslash\\;", "日本語", "old-marker $99 literal",
+    ]) {
+        const tmux = sessionRunner(["victim", name]);
+        assert.deepEqual(await killSession({ name }, tmux.run), {});
+        assert.deepEqual([...tmux.sessions.values()], ["victim"], name);
+        // Names never enter the destructive target grammar at all.
+        assert.deepEqual(tmux.calls.at(-1), ["kill-session", "-t", "$1"]);
     }
 });
 
-test("killing an absent session is a successful no-op", async () => {
-    const tmux = stubRunner({ code: 1, stdout: "", stderr: "can't find session: ghost" });
+test("an absent session name never reaches tmux's client-name fallback", async () => {
+    const tmux = sessionRunner(["victim"]);
+    for (const name of ["ghost", "pts/42", "/dev/pts/42", "$0", "victim;", "vic*"]) {
+        assert.deepEqual(await killSession({ name }, tmux.run), {});
+    }
+    assert.deepEqual([...tmux.sessions.values()], ["victim"]);
+    assert.ok(tmux.calls.every((argv) => argv[0] === "list-sessions"));
+});
+
+test("killSession ignores forged and malformed ID records", async () => {
+    const calls: string[][] = [];
+    const run: CommandRunner = async (argv) => {
+        calls.push(argv);
+        assert.equal(argv[0], "list-sessions", "an untrusted record authorized a kill");
+        const format = argv[argv.indexOf("-F") + 1];
+        const anchor = format.slice(0, format.indexOf("#{"));
+        const suffix = format.slice(format.indexOf("#{session_name}") + "#{session_name}".length);
+        return OK([
+            `${anchor}$0 victim\n$1 forged${suffix}`,
+            `${anchor}victim forged${suffix}`,
+            `${anchor}$2; forged${suffix}`,
+            `${anchor}$3suffix forged${suffix}`,
+        ].join("\n"));
+    };
+    assert.deepEqual(await killSession({ name: "forged" }, run), {});
+    assert.equal(calls.length, 1);
+});
+
+test("control characters and name fragments cannot authorize another literal name", async () => {
+    for (const name of [
+        "victim\n$99 forged", "victim\r", "victim\t", "victim\\n", "victim前",
+    ]) {
+        const tmux = sessionRunner([name]);
+        assert.deepEqual(await killSession({ name: "victim" }, tmux.run), {});
+        assert.deepEqual([...tmux.sessions.values()], [name]);
+        assert.ok(tmux.calls.every((argv) => argv[0] === "list-sessions"), name);
+    }
+    const multiline = "victim\n$99 forged";
+    const tmux = sessionRunner([multiline]);
+    assert.deepEqual(await killSession({ name: multiline }, tmux.run), {});
+    assert.deepEqual([...tmux.sessions.values()], [multiline]);
+});
+
+test("a session disappearing between lookup and kill remains an idempotent no-op", async () => {
+    const tmux = sessionRunner(["ghost"], {
+        code: 1, stdout: "", stderr: "can't find session: $0",
+    });
     assert.deepEqual(await killSession({ name: "ghost" }, tmux.run), {});
+    assert.deepEqual(tmux.calls.at(-1), ["kill-session", "-t", "$0"]);
 });
 
 // The other absence on the kill path: tmux is installed but no server is
@@ -327,53 +374,16 @@ test("killing a session with no tmux server running is a successful no-op", asyn
     assert.deepEqual(await killSession({ name: "ghost" }, noSocket.run), {});
 });
 
-// SECURITY: tmux's `=` exact-match prefix is not a general quoting mechanism.
-// A LEADING `$` is tmux's session-ID form and is resolved BEFORE the
-// exact-name lookup, so `=` does not shield it. Verified against tmux 3.6:
-// with sessions `victim` ($0) and a second session literally named `$0`,
-// `tmux kill-session -t '=$0'` killed `victim` and left `$0` alive. A target of
-// `$0` therefore destroys an unrelated session and everything running in it,
-// while tmux.sessionExists — which compares against the listing — reports that
-// no such session exists. The name must be refused before the target is built.
-test("killSession refuses a name tmux would read as a session ID", async () => {
-    const tmux = stubRunner(OK(""));
-    for (const name of ["$0", "$1", "$", "$victim"]) {
-        await assert.rejects(
-            () => killSession({ name }, tmux.run),
-            /tmux-safe session name/,
-            name,
-        );
-    }
-    assert.deepEqual(tmux.calls, [], "an ID-shaped target must not reach tmux");
-
-    // Only the FIRST character carries the ID meaning: tmux matches `a$0`
-    // literally, so refusing it would make a legitimately named session
-    // un-killable.
-    const literal = stubRunner(OK(""));
-    assert.deepEqual(await killSession({ name: "a$0" }, literal.run), {});
-    assert.deepEqual(literal.calls, [["kill-session", "-t", "=a$0"]]);
-});
-
-test("killSession rejects tmux target separators instead of killing another session", async () => {
-    const tmux = stubRunner(OK(""));
-    // A raw control character is refused for the same reason: tmux vis-escapes
-    // it in its own output, so the stored name never matches the session tmux
-    // actually made, and an unanchored match can land on a different one.
-    for (const name of ["other:0", "other.0", "   ", "bell\u0007", "\u007f", "nl\nx"]) {
-        await assert.rejects(
-            () => killSession({ name }, tmux.run),
-            /tmux-safe session name|non-empty string name/,
-            name,
-        );
-    }
-    assert.deepEqual(tmux.calls, [], "unsafe targets must not reach tmux");
-});
 
 test("unexpected tmux failures are surfaced", async () => {
     const failed = stubRunner({ code: 1, stdout: "", stderr: "permission denied" });
     await assert.rejects(() => listSessions(failed.run), /tmux list-sessions failed/);
 
-    const killFailed = stubRunner({ code: 1, stdout: "", stderr: "permission denied" });
+    const lookupFailed = stubRunner({ code: 1, stdout: "", stderr: "permission denied" });
+    await assert.rejects(() => killSession({ name: "codeharbor" }, lookupFailed.run), /tmux list-sessions failed/);
+    const killFailed = sessionRunner(["codeharbor"], {
+        code: 1, stdout: "", stderr: "permission denied",
+    });
     await assert.rejects(() => killSession({ name: "codeharbor" }, killFailed.run), /tmux kill-session failed/);
 });
 

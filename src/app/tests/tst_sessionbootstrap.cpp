@@ -352,6 +352,7 @@ private slots:
     void unknownHostKeyIsNeverTrustedWithoutADecisionPolicy();
     void unattendedTrustDoesNotOutliveTheAttempt();
     void environmentTrustDoesNotLeakIntoAttendedConnect();
+    void reentrantEnvironmentConnectCannotChangeTheActiveContext();
     void channelLossReconnectsAndRewires();
     void agentChannelLossAlsoReconnects();
     void pendingCallsFailWhenTheSessionDies();
@@ -410,6 +411,7 @@ private slots:
     void provisioningStaysInsideTheChosenDirectory();
     void provisioningRejectsRelativeAndRootEquivalentTargets_data();
     void provisioningRejectsRelativeAndRootEquivalentTargets();
+    void provisioningRejectsASymlinkToTheFilesystemRoot();
     void theReportIsReadBackFieldForField();
     void aRequestedUpgradeReplacesAnInstallWeDidNotMake();
     void aRequestedUpgradeRefusesASourceCheckoutAndKeepsUsingIt();
@@ -421,6 +423,7 @@ private slots:
     // session has to come up on it.
     void anUpdateBlockedByAPrerequisiteKeepsTheOldServiceUsable();
     void anInstallThatFailedFallsBackToWhatSurvivedOnTheServer();
+    void failedInstallCannotBorrowItsVerdictFromAProgressLine();
     // The provisioning script itself, executed by a real POSIX sh against real
     // files: staging, the swap, and the rollback that keeps a failed update from
     // costing the user the service they had.
@@ -952,6 +955,60 @@ void TstSessionBootstrap::environmentTrustDoesNotLeakIntoAttendedConnect()
     // before it reaches the test seam (or a real SSH handshake).
     QVERIFY(!h.wire());
     QCOMPARE(h.boot.connectCalls, 1);
+}
+
+void TstSessionBootstrap::reentrantEnvironmentConnectCannotChangeTheActiveContext()
+{
+    const QList<std::pair<QByteArray, QByteArray>> values{
+        {"CH_LIVE_SSH", "1"}, {"CH_LIVE_HOST", "other.invalid"},
+        {"CH_LIVE_PORT", "2223"}, {"CH_LIVE_USER", "other"},
+        {"CH_LIVE_NODE", "/other/node"}, {"CH_LIVE_REPO", "/other/root"}};
+    QList<std::pair<QByteArray, std::optional<QByteArray>>> previous;
+    const auto saveAndSet = [&previous](const QByteArray& name,
+                                        const QByteArray& value) {
+        previous.append({name, qEnvironmentVariableIsSet(name.constData())
+                                   ? std::optional<QByteArray>(qgetenv(name.constData()))
+                                   : std::nullopt});
+        qputenv(name.constData(), value);
+    };
+    const auto restore = qScopeGuard([&previous] {
+        for (const auto& [name, value] : previous) {
+            if (value)
+                qputenv(name.constData(), *value);
+            else
+                qunsetenv(name.constData());
+        }
+    });
+    for (const auto& [name, value] : values)
+        saveAndSet(name, value);
+
+    Harness h;
+    const QString originalStore = h.boot.knownHostsPath();
+    const QString otherStore = h.dir.filePath(QStringLiteral("other-known-hosts"));
+    saveAndSet("CH_LIVE_KNOWN_HOSTS", otherStore.toUtf8());
+    h.boot.setTrustUnknownHostKeys(false);
+    // An attended policy must survive a refused unattended connection.
+    h.pool.setHostKeyCallback([](const QString&, const QString&,
+                                 const QByteArray&, ch::KnownHosts::Verdict) {
+        return SshConnectionPool::HostKeyDecision::Reject;
+    });
+    bool attempted = false;
+    bool nestedConnected = true;
+    connect(&h.boot, &SessionBootstrap::stateChanged, &h.boot,
+            [&h, &attempted, &nestedConnected](State state) {
+                if (state == State::Connecting && !attempted) {
+                    attempted = true;
+                    nestedConnected = h.wireFromEnvironment();
+                }
+            });
+    QVERIFY(h.wire());
+    QVERIFY(attempted);
+    QVERIFY(!nestedConnected);
+    QCOMPARE(h.boot.knownHostsPath(), originalStore);
+    QVERIFY(!h.boot.trustUnknownHostKeys());
+    QCOMPARE(h.boot.connectCalls, 1);
+    QCOMPARE(h.boot.state(), State::Wired);
+    QVERIFY(!QFileInfo::exists(otherStore));
 }
 
 // The load-bearing case: the RPC channel dies, both devices are dropped, a
@@ -2880,6 +2937,32 @@ void TstSessionBootstrap::anUpdateBlockedByAPrerequisiteKeepsTheOldServiceUsable
 // The client does not TRUST that rollback, because a script that was killed
 // outright never runs it: it re-reads the directory and connects only to an
 // entry point that is really still there.
+void TstSessionBootstrap::failedInstallCannotBorrowItsVerdictFromAProgressLine()
+{
+    Harness h;
+    const QString url = QStringLiteral("/srv/codeharbor: installed/archive.tar.gz");
+    const QString oldRelease = QStringLiteral("previous-release");
+    h.boot.setRemoteArtifactUrl(url);
+    h.boot.requestRemoteUpgrade();
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), oldRelease));
+    // EOF means the shell ran, not that cp succeeded. The URL in this ordinary
+    // progress line used to be mistaken for the install's success verdict.
+    h.boot.fakeScript(true, QStringLiteral("codeharbor: fetching %1\n").arg(url),
+                     QStringLiteral("cp: source does not exist"));
+    h.boot.fakeScript(true, inspectionReport(QStringLiteral("v24.16.0"),
+                                             installedEntry(), oldRelease));
+    QSignalSpy upgrades(&h.boot, &SessionBootstrap::upgradeFailed);
+    QSignalSpy progress(&h.boot, &SessionBootstrap::provisioning);
+    QVERIFY(h.wire());
+    QCOMPARE(h.boot.state(), State::Wired);
+    QCOMPARE(upgrades.size(), 1);
+    QVERIFY(upgrades.first().first().toString().contains(
+        QStringLiteral("cp: source does not exist")));
+    for (const auto& call : progress)
+        QVERIFY(!call.first().toString().startsWith(QStringLiteral("Installed")));
+}
+
 void TstSessionBootstrap::anInstallThatFailedFallsBackToWhatSurvivedOnTheServer()
 {
     const QString oldRelease =
@@ -3531,6 +3614,88 @@ void TstSessionBootstrap::theProvisionScriptStagesTheArchiveAndRollsBackUnderARe
             unsafeRoot + QStringLiteral("/.codeharbor-provision")));
         QVERIFY(QFile::remove(unsafeLock));
     }
+
+    // (17) Recovery and marker writes must not traverse pre-existing links.
+    // The outside journal is deliberately a complete interrupted swap: before
+    // the guard it authorises deletion of the live dist/ tree through a link.
+    const QString outside = dir.filePath(QStringLiteral("outside-install"));
+    const QString outsideMarker = outside + QStringLiteral("/marker");
+    put(outsideMarker, QStringLiteral("not the installation marker"));
+    put(outside + QStringLiteral("/plan"), QStringLiteral("dist\n"));
+    put(outside + QStringLiteral("/ready"), QString());
+    put(outside + QStringLiteral("/release.prev"), QStringLiteral("other release\n"));
+    for (const bool markerPath : {false, true}) {
+        for (const bool fifo : {false, true}) {
+            const QString unsafePath =
+                unsafeRoot + (markerPath ? QStringLiteral("/.codeharbor-release")
+                                         : QStringLiteral("/.codeharbor-provision"));
+            if (fifo) {
+                QCOMPARE(QProcess::execute(QStringLiteral("mkfifo"), {unsafePath}), 0);
+            } else {
+                QCOMPARE(QProcess::execute(
+                             QStringLiteral("ln"),
+                             {QStringLiteral("-s"), markerPath ? outsideMarker : outside,
+                              unsafePath}),
+                         0);
+            }
+            QProcess unsafe;
+            unsafe.start(shell,
+                         {QStringLiteral("-c"),
+                          SessionBootstrap::remoteProvisionScript(
+                              unsafeRoot, release, QStringLiteral("curl"))});
+            const bool finished = unsafe.waitForFinished(5000);
+            if (!finished) {
+                unsafe.kill();
+                unsafe.waitForFinished(5000);
+            }
+            QVERIFY2(finished, "a special provisioning path blocked the installer");
+            QVERIFY(unsafe.exitCode() != 0);
+            QCOMPARE(slurp(unsafeRoot + QStringLiteral("/dist/codeharbord.js")),
+                     QStringLiteral("untouched daemon"));
+            QCOMPARE(slurp(outsideMarker),
+                     QStringLiteral("not the installation marker"));
+            QCOMPARE(slurp(outside + QStringLiteral("/plan")), QStringLiteral("dist\n"));
+            QCOMPARE(slurp(outside + QStringLiteral("/release.prev")),
+                     QStringLiteral("other release\n"));
+            QVERIFY(QFileInfo::exists(outside + QStringLiteral("/ready")));
+            QVERIFY(QFile::remove(unsafePath));
+        }
+    }
+#endif
+}
+
+void TstSessionBootstrap::provisioningRejectsASymlinkToTheFilesystemRoot()
+{
+#ifdef Q_OS_WIN
+    QSKIP("the provisioning script targets a POSIX server");
+#else
+    const QString bash = QStandardPaths::findExecutable(QStringLiteral("bash"));
+    if (bash.isEmpty() || QStandardPaths::findExecutable(QStringLiteral("flock")).isEmpty())
+        QSKIP("bash and flock are required for the read-only root-alias fixture");
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString alias = dir.filePath(QStringLiteral("root-alias"));
+    QVERIFY(QFile::link(QStringLiteral("/"), alias));
+
+    // Exercise real physical path resolution, but never permit the old script
+    // to create its lock under /. Bash's DEBUG trap stops BEFORE any exec
+    // redirection; 42 is the old unsafe branch, not an installation failure.
+    const QString guard = QStringLiteral(
+        "trap 'case \"$BASH_COMMAND\" in exec*) exit 42;; esac' DEBUG; ");
+    QProcess process;
+    process.start(bash,
+                  {QStringLiteral("--posix"), QStringLiteral("-c"),
+                   guard + SessionBootstrap::remoteProvisionScript(
+                               alias, dir.filePath(QStringLiteral("unused.tar.gz")),
+                               QStringLiteral("curl"))});
+    QVERIFY(process.waitForFinished(5000));
+    QCOMPARE(process.exitStatus(), QProcess::NormalExit);
+    QCOMPARE(process.exitCode(), 1);
+    const QString error = QString::fromUtf8(process.readAllStandardError());
+    QVERIFY2(error.contains(QStringLiteral("filesystem root")), qPrintable(error));
+    QCOMPARE(QFileInfo(alias).canonicalFilePath(), QStringLiteral("/"));
+    QCOMPARE(QDir(dir.path()).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot),
+             QStringList{QStringLiteral("root-alias")});
 #endif
 }
 

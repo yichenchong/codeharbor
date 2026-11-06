@@ -137,7 +137,10 @@ public:
     // A profile that could never connect (no host, no user, an impossible port)
     // is refused by ServerProfiles' own write-boundary validation; this reports
     // that through statusText rather than dialling nothing.
-    Q_INVOKABLE void connectToServer(QVariantMap profile);
+    // Returns the stored id even if the subsequent connection fails, so the
+    // form retries an edit of this profile rather than creating duplicates.
+    // Empty means profile validation refused the write.
+    Q_INVOKABLE QString connectToServer(QVariantMap profile);
 
     // Write `profile` (the same map connectToServer takes, `id` included for an
     // edit) into ch::ServerProfiles WITHOUT dialling it, and return the id it is

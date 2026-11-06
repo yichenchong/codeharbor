@@ -927,10 +927,29 @@ export function connectTerminal(element: HTMLElement): void {
         showFatal(element, "This page requires the CodeHarbor host: no WebChannel transport.");
         return;
     }
+    const pageWindow = element.ownerDocument.defaultView ?? window;
+    let retired = false;
+    let disposeHost: (() => void) | undefined;
+    const releaseConnection = (): void => {
+        pageWindow.removeEventListener("pagehide", onPageHide);
+        connectingElements.delete(element);
+    };
+    const onPageHide = (): void => {
+        retired = true;
+        releaseConnection();
+        disposeHost?.();
+    };
+    // Subscribe before the asynchronous channel handshake. A page can disappear
+    // before its callback arrives; that callback must not mount a fresh renderer
+    // or overwrite a later connection's DOM/guard after teardown.
+    pageWindow.addEventListener("pagehide", onPageHide, { once: true });
     const onChannel = (channel: QWebChannelInstance): void => {
+        if (retired) {
+            return;
+        }
         const bridge = channel.objects.terminal as TerminalChannelObject | undefined;
         if (!bridge) {
-            connectingElements.delete(element);
+            releaseConnection();
             showFatal(element, "The terminal bridge is missing from this window.");
             return;
         }
@@ -942,7 +961,7 @@ export function connectTerminal(element: HTMLElement): void {
         try {
             host = mountTerminal(element, bridge);
         } catch (error) {
-            connectingElements.delete(element);
+            releaseConnection();
             showFatal(element, `The terminal could not start: ${String(error)}`);
             return;
         }
@@ -973,14 +992,13 @@ export function connectTerminal(element: HTMLElement): void {
         // The element's OWN window, not the ambient global: a page that mounts
         // the terminal inside a frame must tear it down when THAT document
         // goes away.
-        (element.ownerDocument.defaultView ?? window).addEventListener("pagehide", () => {
+        disposeHost = () => {
             bridge.write.disconnect(onWrite);
             bridge.connectionStateChanged.disconnect(onConnectionStateChanged);
             bridge.inputTransportChanged.disconnect(onInputTransportChanged);
             bridge.clearRequested.disconnect(onClearRequested);
-            connectingElements.delete(element);
             host.dispose();
-        }, { once: true });
+        };
         // Handshake LAST, once every host callback is connected. The first
         // intersection is still unknown during this synchronous mount, so the
         // page stays hidden until its observer reports the real visibility.
@@ -991,7 +1009,7 @@ export function connectTerminal(element: HTMLElement): void {
         // WebChannel transport has already closed.
         new QWebChannel(qt.webChannelTransport, onChannel);
     } catch {
-        connectingElements.delete(element);
+        onPageHide();
         showFatal(element, "This page could not reach the CodeHarbor host.");
     }
 }

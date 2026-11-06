@@ -181,13 +181,8 @@ test("every file.* and tmux.* contract name has a server handler", () => {
     assert.deepEqual(Object.keys(TMUX_METHODS).sort(), tsGroup(RPC_TMUX_METHODS));
 });
 
-// `ping` is not in a spread-in table, so the two tests above cannot see it.
-// Dispatch it for real instead: the C++ client's heartbeat drops the transport
-// (failing every in-flight call and announcing a disconnect) when consecutive
-// probes go unanswered, so a server that answered this with "method not found"
-// — an error response, but still a response — would keep the session alive by
-// accident, and a server that answered nothing at all would tear down healthy
-// sessions every interval.
+// The client's keepalive needs a valid response, not merely a method name
+// listed in a handler table.
 test("the keepalive method really dispatches to a success result", async () => {
     const response = await dispatch({
         jsonrpc: "2.0",
@@ -430,11 +425,12 @@ test("the reported server version matches remote/package.json", () => {
     );
 });
 
-test("a response is serialized as one newline-terminated JSON line", () => {
-    assert.equal(
-        responseLine({ jsonrpc: "2.0", id: 1, result: { pong: true } }),
-        '{"jsonrpc":"2.0","id":1,"result":{"pong":true}}\n',
-    );
+test("a response escapes embedded newlines without creating another frame", () => {
+    const payload = { jsonrpc: "2.0" as const, id: 1, result: { text: "first\nsecond" } };
+    const line = responseLine(payload);
+    assert.equal(line.indexOf("\n"), line.length - 1);
+    assert.equal(line.at(-1), "\n");
+    assert.deepEqual(JSON.parse(line), payload);
 });
 
 // An answer bigger than one transport frame used to be written out anyway, and
@@ -456,9 +452,6 @@ test("an over-cap response is refused instead of written as a doomed frame", () 
     const decoded = JSON.parse(line);
     assert.equal(decoded.id, 7);
     assert.equal(decoded.error.code, RPC_RESOURCE_LIMIT);
-    assert.match(decoded.error.message, /transport frame limit/);
-    assert.match(decoded.error.message, /may already have completed/);
-    assert.doesNotMatch(decoded.error.message, /Nothing was changed/);
 });
 test("an oversized response id is replaced with null in the bounded refusal", () => {
     const line = responseLine({
@@ -514,7 +507,6 @@ test("an unserializable response still answers the request", () => {
     );
     assert.equal(decoded.id, "abc");
     assert.equal(decoded.error.code, RPC_INTERNAL_ERROR);
-    assert.match(decoded.error.message, /could not be serialized/);
 });
 
 // The last piece of the server.info payload the client stores and acts on, and

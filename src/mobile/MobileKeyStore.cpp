@@ -347,13 +347,9 @@ QString tidyLine(QStringView line)
     return line.trimmed().toString();
 }
 
-// Overwrite a secret's characters before the buffer is released, so a passphrase
-// does not linger in freed heap memory for the rest of the run (SPEC 12.3).
-//
-// Same limitation SshConnectionPool::wipeSecret() documents, and worth spelling
-// out rather than implying: only the copy this object owns can be scrubbed.
-// data() detaches it first, so the fill cannot corrupt a QString the caller
-// still holds — and by the same token cannot scrub that one either.
+// Best-effort overwrite of this value's writable buffer before release.
+// Qt may detach shared storage, leaving other copies untouched; parser, QML,
+// allocator and platform copies are not covered. This is not secure erasure.
 void wipeSecret(QString& secret)
 {
     if (!secret.isEmpty()) {
@@ -826,9 +822,7 @@ MobileKeyStore::MobileKeyStore(QString rootDirectory, QObject* parent)
 
 MobileKeyStore::~MobileKeyStore()
 {
-    // None of these emits, so all are safe from a destructor, and all are the
-    // point of the class: no secret and no key material may outlive this object
-    // inside freed heap memory.
+    // Release held credentials with a best-effort overwrite of owned buffers.
     forgetPassphrase();
     for (auto it = m_memoryKeys.begin(); it != m_memoryKeys.end(); ++it)
         wipeKeyMaterial(it.value());
@@ -937,12 +931,8 @@ bool MobileKeyStore::importKeyFromFile(QUrl fileUrl, QString name)
     // exists for a user who wants to pick a key once per launch and leave nothing
     // behind at all.
     const bool imported = importKeyFromText(settledName, text);
-    // `text` is the only copy of the key bytes left standing — importKeyFromText()
-    // took a value parameter, but that copy died with the call, and what it
-    // retained is the re-serialised `normalized` block, a different buffer. So
-    // this wipe is not the no-op a wipe of a still-shared string would be: with
-    // no other reference, data() does not detach and the fill really does erase
-    // the characters instead of erasing a fresh copy of them.
+    // Best-effort overwrite of the file-to-text conversion; the retained
+    // normalized key and any parser/runtime copies have separate lifetimes.
     wipeSecret(text);
     return imported;
 }
@@ -1024,6 +1014,15 @@ QString MobileKeyStore::registerReference(QString reference, QString name)
                         "profile refers to. Choose the key file again."));
         return QString();
     }
+    // App-private saved keys already have a stable name and deletion policy.
+    // Re-adopting their path must not create a second, user-managed alias that
+    // survives forgetting the saved copy.
+    for (const QString& savedName : m_savedNames) {
+        if (reference == savedKeyPath(savedName)) {
+            setLastError(QString());
+            return savedName;
+        }
+    }
 
     name = name.trimmed();
     // A caller-supplied name is NOT trusted here. This entry point is reached
@@ -1072,7 +1071,8 @@ QString MobileKeyStore::registerReference(QString reference, QString name)
 
 QString MobileKeyStore::referenceFor(QString name) const
 {
-    return m_references.value(name.trimmed());
+    name = name.trimmed();
+    return m_savedNames.contains(name) ? savedKeyPath(name) : m_references.value(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,15 +1185,11 @@ bool MobileKeyStore::saveKeyOnDevice(QString name)
         return false;
     }
 
-    // `material` shares the buffer this object keeps under `name`, so
-    // wipeKeyMaterial() detaches before filling: the copy in m_memoryKeys is the
-    // key the session is still using and must survive. What is scrubbed is this
-    // function's own reference, and the detach makes that a real erase of a real
-    // buffer rather than a no-op on a shared one.
-    QByteArray material = m_memoryKeys.value(name);
+    // Borrow the retained bytes. Copying and then wiping would only detach and
+    // zero a newly allocated buffer while the session's original stays live.
+    const QByteArray& material = m_memoryKeys.constFind(name).value();
     const qint64 written = out.write(material);
     const bool complete = (written == qint64(material.size()));
-    wipeKeyMaterial(material);
     if (!complete || !out.commit()) {
         // commit() failed -> nothing was renamed into place. A partial write that
         // was never committed leaves the temporary file removed by QSaveFile
@@ -1437,12 +1433,8 @@ QByteArray MobileKeyStore::keyMaterial(const QString& name)
     // source whose file has been replaced with something that is not a key is
     // caught here rather than inside libssh.
     //
-    // The UTF-16 conversion is a SECOND copy of the whole key, in a buffer this
-    // function owns alone, so it is wiped explicitly: letting `QString::fromUtf8`
-    // produce a temporary would leave the key's characters in freed heap memory
-    // for the rest of the run, which is precisely what this class promises not to
-    // do. describeKeyText() takes a const reference and keeps nothing, so the
-    // wipe below cannot pull the ground out from under it.
+    // Keep the UTF-16 conversion addressable for a best-effort overwrite after
+    // parsing; this does not cover the parser's temporary copies.
     QString text = QString::fromUtf8(raw);
     wipeKeyMaterial(raw);
     const KeyDescription described = describeKeyText(text);
@@ -1481,13 +1473,9 @@ bool MobileKeyStore::applyIdentityForConnect(QString name)
     if (material.isEmpty())
         return false;  // keyMaterial() already said why
     m_pool->setInMemoryIdentity(material);
-    // For a REFERENCED or SAVED key this is the only copy outside the pool (the
-    // pool detaches its own), so the wipe erases the real characters — which is
-    // what keeps a key that lives on the device from also living in memory
-    // between connects. For an in-memory key `material` still shares the buffer
-    // this object keeps under that name, and wipeKeyMaterial() detaches before
-    // filling — deliberately: scrubbing here would destroy the very key the
-    // session is meant to keep, and forgetSession() is what erases that one.
+    // Release this temporary with a best-effort overwrite. The pool retains
+    // its own identity for authentication/reconnect, and a pasted key remains
+    // in m_memoryKeys until explicitly forgotten.
     wipeKeyMaterial(material);
     // Remembered so removeKey() knows whether dropping a key also has to disarm
     // the pool. It is a NAME, not key material.
@@ -1545,7 +1533,7 @@ QVariantMap MobileKeyStore::keyInfo(QString name)
         {QStringLiteral("name"), name},
         {QStringLiteral("referenced"), referenced},
         {QStringLiteral("saved"), saved},
-        {QStringLiteral("reference"), m_references.value(name)},
+        {QStringLiteral("reference"), referenceFor(name)},
         {QStringLiteral("format"), described.format},
         {QStringLiteral("keyType"), described.keyType},
         {QStringLiteral("encrypted"), described.encrypted},
@@ -1735,11 +1723,8 @@ QString MobileKeyStore::takePassphrase(QString name)
 {
     if (!hasArmedPassphrase(name))
         return QString();
-    // A DEEP copy, not an assignment: QString is reference-counted, so a plain
-    // copy would share the buffer and forgetPassphrase()'s fill would then detach
-    // and zero a fresh block while the real characters lived on in the one being
-    // returned. This way the wipe below erases the only remaining copy besides
-    // the caller's.
+    // Return an independent buffer so forgetting the parked value can overwrite
+    // its storage without touching the result. Copies elsewhere are not covered.
     const QString secret(m_armedPassphrase.constData(), m_armedPassphrase.size());
     forgetPassphrase();
     return secret;

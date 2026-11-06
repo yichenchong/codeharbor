@@ -255,6 +255,19 @@ node "$BUMPCTL" check --root "$verify_tree" \
 # consume another public version number. The preflight is deliberately required
 # only for --push: local dry runs and tests can still check version and tag
 # safety without a full toolchain installed.
+# Preflight builds the working tree, not the archived version files above.
+# Unrelated local repairs (including new source files) must not make a broken
+# committed release look healthy. --allow-dirty only permits version edits that
+# the release commit consumes; it cannot waive this publication boundary.
+require_clean_release_tree() {
+    local changes
+    changes="$(git status --porcelain --untracked-files=normal)"
+    [ -z "$changes" ] || die "release preflight requires a clean working tree; commit or stash these changes before --push:
+$changes"
+}
+if [ "$DO_PUSH" -eq 1 ]; then
+    require_clean_release_tree
+fi
 if [ "$DO_PUSH" -eq 1 ] && [ "${#PREFLIGHT[@]}" -gt 0 ]; then
     echo "Running release preflight before creating $tag..."
     for step in "${PREFLIGHT[@]}"; do
@@ -262,6 +275,9 @@ if [ "$DO_PUSH" -eq 1 ] && [ "${#PREFLIGHT[@]}" -gt 0 ]; then
         bash -c "$step" || die "release preflight failed at: $step"
     done
     echo "Release preflight passed"
+fi
+if [ "$DO_PUSH" -eq 1 ]; then
+    require_clean_release_tree
 fi
 
 # Preflight commands are arbitrary project commands. They must not move HEAD

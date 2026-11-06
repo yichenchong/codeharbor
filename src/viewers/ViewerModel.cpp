@@ -14,6 +14,7 @@
 #include <QList>
 #include <QPointer>
 #include <QVariantMap>
+#include <QUuid>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 #include <algorithm>
 #include <utility>
@@ -107,6 +108,8 @@ void ViewerModel::setProfiles(ViewerProfiles *profiles)
     if (m_ownsProfiles)
         delete m_profiles;
     m_profiles = profiles;
+    if (profiles)
+        m_externalStorageRoot = profiles->externalStorageRoot();
     m_ownsProfiles = false;
     wireProfileSignals();
 }
@@ -131,7 +134,7 @@ void ViewerModel::setDefaultKinds(const QHash<QString, QString>& defaults)
 ViewerProfiles *ViewerModel::profiles()
 {
     if (!m_profiles) {
-        m_profiles = new ViewerProfiles(m_client, this);
+        m_profiles = new ViewerProfiles(m_client, m_externalStorageRoot, this);
         m_ownsProfiles = true;
         wireProfileSignals();
     }
@@ -236,10 +239,16 @@ QQuickWebEngineProfile *ViewerModel::internalProfile()
     return profiles()->internalProfile();
 }
 
-void ViewerModel::listDirectory(const QString &path)
+QString ViewerModel::newDirectoryRequestId() const
+{
+    return QUuid::createUuid().toString(QUuid::Id128);
+}
+
+void ViewerModel::listDirectory(const QString &path, const QString &requestId)
 {
     if (!m_client) {
-        emit directoryError(path, QStringLiteral("no remote client is connected"));
+        emit directoryError(path, QStringLiteral("no remote client is connected"),
+                            requestId);
         return;
     }
 
@@ -247,11 +256,11 @@ void ViewerModel::listDirectory(const QString &path)
     QPointer<ViewerModel> guard(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodListDirectory), params,
-        [guard, path](QJsonValue result, std::optional<RpcError> error) {
+        [guard, path, requestId](QJsonValue result, std::optional<RpcError> error) {
             if (!guard)
                 return;
             if (error) {
-                emit guard->directoryError(path, error->message);
+                emit guard->directoryError(path, error->message, requestId);
                 return;
             }
             const QJsonValue entriesValue =
@@ -259,7 +268,8 @@ void ViewerModel::listDirectory(const QString &path)
             if (!entriesValue.isArray()) {
                 emit guard->directoryError(
                     path,
-                    QStringLiteral("reply carried no directory entries"));
+                    QStringLiteral("reply carried no directory entries"),
+                    requestId);
                 return;
             }
             const QJsonArray array = entriesValue.toArray();
@@ -272,7 +282,8 @@ void ViewerModel::listDirectory(const QString &path)
                 if (!value.isObject() || !name.isString() || !kind.isString()) {
                     emit guard->directoryError(
                         path,
-                        QStringLiteral("reply carried a malformed directory entry"));
+                        QStringLiteral("reply carried a malformed directory entry"),
+                        requestId);
                     return;
                 }
                 parsed.append(DirectoryEntry{name.toString(), kind.toString()});
@@ -287,7 +298,7 @@ void ViewerModel::listDirectory(const QString &path)
                     {QStringLiteral("kind"), entry.kind},
                 });
             }
-            emit guard->directoryListed(path, entries);
+            emit guard->directoryListed(path, entries, requestId);
         });
 }
 

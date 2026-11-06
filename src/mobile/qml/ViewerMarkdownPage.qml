@@ -74,13 +74,35 @@ Item {
     // should not keep holding twenty buffers once it is no longer on screen —
     // the same discipline ViewerImagePage applies to its single image.
     function forgetImages() {
-        if (!root.service)
-            return;
-        for (const key in root.imageResolved)
-            root.service.forgetImage(root.imageResolved[key]);
+        if (root.service) {
+            for (const key in root.imageResolved)
+                root.service.forgetImage(root.imageResolved[key]);
+        }
+        // Loader unparents before deferred deletion. Releasing at detach must
+        // leave destruction inert, or it can cancel a replacement page's read.
+        root.imageResolved = Object.create(null);
+        root.imagePending = Object.create(null);
+    }
+
+    // Pane hosts call this before replacing a Loader child, before a new page
+    // can request the same paths. Deferred destruction is too late to release.
+    function deactivate() {
+        root.started = false;
+        root.requestedPath = "";
+        root.loading = false;
+        root.pendingLink = "";
+        linkSheet.close();
+        webLoader.active = false;
+        webLoader.target = "";
+        root.imageSources = Object.create(null);
+        root.forgetImages();
     }
 
     function reload() {
+        root.pendingLink = "";
+        linkSheet.close();
+        webLoader.active = false;
+        webLoader.target = "";
         root.forgetImages();
         root.requestedPath = "";
         root.errorText = "";
@@ -108,6 +130,7 @@ Item {
     property bool started: false
     onRemotePathChanged: if (root.started) root.reload()
     onRepoRootChanged: if (root.started) root.reload()
+    onParentChanged: if (root.started && !parent) root.deactivate()
     Component.onCompleted: {
         root.started = true;
         root.reload();
@@ -352,11 +375,20 @@ Item {
         property color textColor: MobileTheme.text
         property bool bold: false
         spacing: 0
+        // A single block can occupy the entire 8 MiB read cap. One QQuickItem
+        // per word would bypass ListView virtualization and exhaust a phone's
+        // memory. Large or token-heavy blocks retain all their readable text,
+        // but degrade to one plain Text rather than unbounded styled children.
+        readonly property bool useStyledRuns: spanFlow.spans.length > 0
+                                             && spanFlow.body.length <= 16384
+                                             && spanFlow.lines !== null
 
         // [{ text, strong, emphasis, code, target }], covering `body` exactly
         // once and in order. Gaps between spans are plain runs.
         readonly property var runs: {
             const out = [];
+            if (spanFlow.spans.length === 0 || spanFlow.body.length > 16384)
+                return [];
             let at = 0;
             for (let i = 0; i < spanFlow.spans.length; ++i) {
                 const span = spanFlow.spans[i];
@@ -381,9 +413,12 @@ Item {
         // Keeping lines separate preserves the file's line structure.
         readonly property var lines: {
             const out = [[]];
+            let piecesSeen = 0;
             for (const run of spanFlow.runs) {
                 const pieces = run.text.match(/[^\s]+|[^\S\n]+|\n/g) || [];
                 for (const piece of pieces) {
+                    if (++piecesSeen > 256)
+                        return null;
                     if (piece === "\n") {
                         out.push([]);
                         continue;
@@ -412,8 +447,20 @@ Item {
             font.pixelSize: spanFlow.size
             text: "M"
         }
+        Text {
+            objectName: "markdownPlainText"
+            width: spanFlow.width
+            visible: !spanFlow.useStyledRuns
+            height: visible ? implicitHeight : 0
+            textFormat: Text.PlainText
+            wrapMode: Text.WrapAnywhere
+            text: visible ? spanFlow.body : ""
+            color: spanFlow.textColor
+            font.pixelSize: spanFlow.size
+            font.bold: spanFlow.bold
+        }
         Repeater {
-            model: spanFlow.lines
+            model: spanFlow.useStyledRuns ? spanFlow.lines : []
             delegate: Flow {
                 id: lineFlow
                 required property var modelData

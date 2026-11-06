@@ -92,6 +92,8 @@ Item {
     property var pageChannel: null
     property string pageBridgeId: ""
     property int reloadSerial: 0
+    property bool serverContextRetired: false
+    property var retainedController: null
 
     // Entry page of the trusted editor bundle. Embedded into this QML module's
     // resources by src/qml/CMakeLists.txt; overridable by a host or test that
@@ -155,11 +157,27 @@ Item {
         root.reloadSerial += 1
     }
 
+    // Authoritative context retirement keeps this document for viewing/copy.
+    // Revoke server authority synchronously before changing any host state.
+    function detachFromServer() {
+        if (root.serverContextRetired)
+            return
+        const owner = root.controller
+        if (owner)
+            owner.detachFromServer()
+        root.retainedController = owner
+        root.serverContextRetired = true
+        root.reloadSerial += 1
+        root.clearRecoveryOffer()
+    }
+
     // ViewerPane keeps handler objects alive when they provide reload(). The
     // editor is a live WebEngine document with unsaved text, so falling back to
     // Loader churn would destroy Monaco and could discard that buffer.
     readonly property bool reloadPreservesDirtyContent: true
     function reload() {
+        if (root.serverContextRetired)
+            return
         const bridge = root.pageBridge
         const controller = root.controller
         const path = root.currentRemotePath()
@@ -368,13 +386,15 @@ Item {
             elide: Text.ElideRight
             // Whole sentences: the state word alone ("conflict") names the
             // condition without telling anyone what it means for their file.
-            text: root.conflicted
-                  ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
-                  : root.failed
-                    ? qsTr("The editor could not load this file.")
-                    : root.dropped
-                      ? qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
-                      : qsTr("Crash recovery is unavailable. Keep this editor open until you can save.")
+            text: root.serverContextRetired
+                  ? qsTr("This workspace is no longer active. Unsaved text is kept here; copy it before discarding this editor. Saving and reloading are unavailable.")
+                  : root.conflicted
+                    ? qsTr("This file changed on the server since it was opened, so the last save was refused. Reload to take the server's copy, or save again to overwrite it.")
+                    : root.failed
+                      ? qsTr("The editor could not load this file.")
+                      : root.dropped
+                        ? qsTr("The connection to the server is down. This file cannot be saved or reloaded until it comes back.")
+                        : qsTr("Crash recovery is unavailable. Keep this editor open until you can save.")
             color: root.conflicted || root.failed ? Theme.danger : Theme.warning
             font.pixelSize: Theme.fontSizeSmall
         }
@@ -393,8 +413,8 @@ Item {
     // floor, one round trip per file open, and the user was never told their
     // work had survived.
 
-    // The revision the page's buffer is guarded at (SPEC 8.4/8.6), read off the
-    // same `contentLoaded` the editor page takes its content from.
+    // The revision of the page's on-disk baseline (SPEC 8.4/8.6), taken from
+    // contentLoaded or the exact baseline carried by bufferRestored.
     //
     property string loadedRevision: ""
     // A recovered buffer may legitimately be empty (the user deleted every
@@ -404,10 +424,26 @@ Item {
     property bool contentReadyForRecovery: false
     property string recoveredContent: ""
     property bool recoveryPending: false
+    property var recoveryOfferController: null
+    property var recoveryOfferContext: 0
+    property string recoveryOfferRevision: ""
+
+    function clearRecoveryOffer() {
+        root.recoveredContent = ""
+        root.recoveryPending = false
+        root.recoveryOfferController = null
+        root.recoveryOfferContext = 0
+        root.recoveryOfferRevision = ""
+        if (recoveryDialog)
+            recoveryDialog.close()
+    }
 
     Connections {
         target: root.controller
         function onContentLoaded(content, revision) {
+            if (root.contentReadyForRecovery && root.recoveryPending
+                    && root.loadedRevision !== revision)
+                root.clearRecoveryOffer()
             root.loadedRevision = revision
             root.contentReadyForRecovery = true
             root.showRecoveryOffer()
@@ -416,8 +452,13 @@ Item {
         // the property it is assigned to reads as a self-assignment.
         function onRecoveryAvailable(recovered) {
             root.recoveredContent = recovered
+            root.recoveryOfferController = root.controller
+            root.recoveryOfferContext = root.controller.recoveryContextRevision
             root.recoveryPending = true
             root.showRecoveryOffer()
+        }
+        function onRecoveryContextRevisionChanged() {
+            root.clearRecoveryOffer()
         }
     }
 
@@ -436,36 +477,42 @@ Item {
     // so the content-loaded flag means the page has taken the file even when
     // the revision itself is empty.
     function showRecoveryOffer() {
-        if (root.recoveryPending && root.contentReadyForRecovery
-                && !recoveryDialog.visible)
+        if (!root.recoveryPending)
+            return
+        if (root.recoveryOfferController !== root.controller
+                || !root.controller
+                || root.recoveryOfferContext !== root.controller.recoveryContextRevision) {
+            root.clearRecoveryOffer()
+            return
+        }
+        if (root.contentReadyForRecovery && !recoveryDialog.visible) {
+            root.recoveryOfferRevision = root.loadedRevision
             recoveryDialog.open()
+        }
     }
 
-    // Put the recovered text back into the pane, and keep it recoverable.
-    //
-    // TWO steps, both required. `contentLoaded` is the ONE way content reaches
-    // the Monaco page (the frozen C3 bridge has no other), re-emitted here with
-    // the revision the page already holds so the save guard is untouched. The
-    // page treats a host-driven load as not-an-edit and therefore does NOT mark
-    // the buffer dirty — so reportContent() states what is now true: the bytes
-    // on screen are not the bytes on the server. That is what stops an external
-    // change from silently reloading over the restored work (SPEC 8.7), and
-    // what makes the restored work recoverable while it is unsaved.
+    // Restoration retains the real disk baseline through bufferRestored. It is
+    // not a contentLoaded event: the recovered text is still unsaved, including
+    // when a subsequent edit is undone back to that recovered text.
     function restoreRecovered() {
         if (!root.controller || !root.recoveryPending || !root.contentReadyForRecovery)
             return
+        const owner = root.recoveryOfferController
+        const context = root.recoveryOfferContext
+        const revision = root.recoveryOfferRevision
         const recovered = root.recoveredContent
-        root.recoveredContent = ""
-        root.recoveryPending = false
-        root.controller.contentLoaded(recovered, root.loadedRevision)
-        root.controller.reportContent(recovered)
+        const current = owner === root.controller
+            && context === root.controller.recoveryContextRevision
+            && revision === root.loadedRevision
+        root.clearRecoveryOffer()
+        if (current)
+            owner.restoreRecovery(recovered, context, revision)
     }
 
     // Keep the saved file on screen without deleting the recovery copy.
     // Later edits can replace the copy; saving or clean reconciliation can clear it.
     function discardRecovered() {
-        root.recoveredContent = ""
-        root.recoveryPending = false
+        root.clearRecoveryOffer()
     }
 
     AppDialog {
@@ -534,6 +581,8 @@ Item {
     // Revoke first, then replace the channel registration. Already queued old
     // document calls see an inert adapter until its deferred deletion.
     function replacePageBridge() {
+        if (root.serverContextRetired)
+            return
         const oldBridge = root.pageBridge
         const oldOwner = root.pageBridgeOwner
         const oldChannel = root.pageChannel
@@ -559,6 +608,8 @@ Item {
     // bundle; file CONTENT never reaches this view as a document, it arrives
     // over the bridge (SPEC 7.2/8.1).
     function navigate() {
+        if (root.serverContextRetired)
+            return
         const base = root.editorBundleUrl.toString()
         if (base.length === 0) {
             view.url = ""
@@ -574,15 +625,15 @@ Item {
     }
 
     function start() {
+        if (root.serverContextRetired)
+            return
         // A pane reused for another file carries nothing over: the revision
         // belongs to the file being left, and so does any recovery offer that
         // was still standing. Offering the previous file's unsaved work against
         // the new one would restore it into the wrong buffer.
         root.loadedRevision = ""
         root.contentReadyForRecovery = false
-        root.recoveredContent = ""
-        root.recoveryPending = false
-        recoveryDialog.close()
+        root.clearRecoveryOffer()
         root.pageReady = false
         // Revoke the old page before a fast new-file response can reach it.
         root.replacePageBridge()
@@ -596,8 +647,20 @@ Item {
     // page so the language hint follows the new path.
     onFileUrlChanged: if (root.started) root.start()
     onEditorBundleUrlChanged: if (root.started) root.reload()
+    onControllerChanged: {
+        if (root.serverContextRetired) {
+            if (root.controller !== root.retainedController)
+                root.controller = root.retainedController
+        } else {
+            root.loadedRevision = ""
+            root.contentReadyForRecovery = false
+            root.clearRecoveryOffer()
+        }
+    }
 
     function updateRecoveryScope() {
+        if (root.serverContextRetired)
+            return
         root.reloadSerial += 1
         if (root.controller)
             root.controller.setRecoveryScope(root.recoveryServerId,
@@ -612,6 +675,8 @@ Item {
     // Mint the native controller once. start() registers a fresh document
     // adapter before opening the file or navigating the first page.
     Component.onCompleted: {
+        if (root.serverContextRetired)
+            return
         // Mint the controller once, here, so create() is not in a reactive
         // binding (see `controller` above). A pre-assigned stub is kept.
         if (!root.controller && root.factory)

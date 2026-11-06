@@ -207,9 +207,11 @@ Markdown renderer — all gitignored build artifacts that CMake embeds as
 `qrc:/codeharbor/web/terminal/index.html` and
 `qrc:/codeharbor/web/markdown/index.html` (see `src/qml/CMakeLists.txt`). CMake
 builds them for you at **configure** time when any is missing or older than its
-sources — so `npm install` above is the only real prerequisite, and editing
-`src/web/editor/**`, `src/web/terminal/**` or `src/web/markdown/**` re-triggers
-the rebuild on the next configure.
+sources, build script, workspace manifest or `tsconfig.json`. Editing those inputs
+re-triggers the rebuild on the next configure. Configure also refreshes dependencies
+with `npm ci` when npm's installed hidden lock is absent or older than the root
+lockfile, root manifest or current bundle's workspace manifest; a pre-existing
+`node_modules/` alone does not establish that the installed dependencies are current.
 
 If a bundle is missing and cannot be built (no `npm` on `PATH`), configure
 **fails** with the command to run: a client whose editor, terminal or Markdown
@@ -367,29 +369,58 @@ npm run typecheck  # tsc --noEmit
 npm run build      # tsc -> dist/ (codeharbord, codeharbor-bridge)
 ```
 
-Smoke-test the services without a build:
+Smoke-test the services without a build, from `remote/`, using private state:
 
 ```bash
-# JSON-RPC over stdio
-echo '{"jsonrpc":"2.0","id":1,"method":"server.info"}' | node src/codeharbord.ts rpc --stdio
+(
+  umask 077
+  D=$(mktemp -d /tmp/ch-smoke.XXXXXX) || exit 1
+  trap 'rm -rf -- "$D"' EXIT
+  mkdir "$D/runtime" "$D/data" "$D/tmux" || exit 1
+  export CODEHARBOR_DB="$D/workspace.sqlite" XDG_RUNTIME_DIR="$D/runtime"
+  export XDG_DATA_HOME="$D/data" HISTFILE=/dev/null TMUX_TMPDIR="$D/tmux"
+  export CODEHARBOR_AGENT_SOCKET="$D/runtime/agent.sock"
 
-# Agent-status bridge (explicit CODEHARBOR_AGENT_SOCKET, otherwise XDG/HOME defaults)
-node src/bridge.ts
+  # JSON-RPC over stdio; server.info opens/migrates the selected database.
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"server.info"}' \
+    | node src/codeharbord.ts rpc --stdio
+
+  # Foreground status relay on this scratch endpoint; Ctrl+C stops it.
+  node src/bridge.ts --relay
+)
 ```
+
+Do not omit the overrides: even `server.info` can create or migrate the ordinary
+workspace database, and a bridge started with the default endpoint can interact
+with an existing GUI's shared relay. This scratch relay does not connect a client
+or prove hook delivery. Use the isolated SSH fixture under **Live gates** for that.
 
 **Schema changes.** Two different version numbers exist and they mean different
 things.
 
-The WORKSPACE DATABASE is at version 5 (the session `pinned` flag). It is stated in
-three places that must move together: `remote/sql/schema.sql`,
+The WORKSPACE DATABASE is at version **6** (repairing terminal identity constraints
+left in already-upgraded files). It is stated in three places that must move together:
+`remote/sql/schema.sql`,
 `WORKSPACE_SCHEMA_VERSION` in `remote/src/workspace.ts`, and
 `WorkspaceDb::kSchemaVersion` in `src/persistence/WorkspaceDb.h`. Only the daemon
-migrates; the client's copy is a record of what the schema is expected to be, and
-tests on both sides pin it. A new column also needs a migration step for databases
-already in the field: version 5 adds `pinned` with a default of 0, so an existing
-database keeps every row and simply starts unpinned. Indexes are the exception and
-belong in `remote/sql/indexes.sql`, which is applied on every open rather than only
-on migration.
+migrates; the client's copy is an informational record of the expected level,
+pinned by tests on both sides, not a runtime compatibility gate. A new column also
+needs an ordered migration for databases already in the field: version 5 adds
+`pinned` with a default of 0, so an existing
+database keeps every row and simply starts unpinned. Ordinary lookup indexes are
+the exception and belong in `remote/sql/indexes.sql`, applied on every open.
+Constraint repairs still need an ordered migration: version 6 reaches files an
+older build already stamped as version 5, removing leftover display-name uniqueness
+and repairing target uniqueness when only a partial rule existed. Fixing the old
+v3/v4 functions alone would leave those files on the already-current fast path.
+The repair drops obsolete named label rules before temporary target vacating,
+preserves valid duplicate labels rather than replaying v3's label deduplication,
+and defers a required table rebuild until target uniqueness is established.
+Historical/current rebuilds preserve unrelated same-table named indexes and
+triggers, replayed after row copy so that the copy does not generate audit events.
+Actual repair updates may still fire existing update triggers. Repairs, DDL replay
+and the version record commit or roll back together; subsequent current-version
+opens do not rerun them. See SPEC11.1 for compatibility limits.
 
 The RPC schema is separate and IS the compatibility gate: `RPC_SCHEMA_VERSION` in
 `remote/src/codeharbord.ts` is currently **10**. Schema 7 added agent viewer
@@ -397,7 +428,7 @@ control, 8 added `tmux.paneActivity`, 9 added atomic `workspace.ensureInitialLay
 and 10 requires `server.info.agentSocket` so tmux-created shells receive the
 service's actual event endpoint. `AppController::kMinimumServerSchemaVersion` is
 10; an older service is incompatible rather than a reason to guess that endpoint.
-The workspace database remains at schema 5. Separate initial-terminal creation
+The workspace database is at schema 6, independently of that RPC gate. Separate initial-terminal creation
 and default-tree saving is still not a safe fallback for atomic initialization.
 
 **Native JSON-depth constraint.** Server layout storage is opaque byte-bounded
@@ -700,6 +731,17 @@ server-authoritative layout tree the desktop reads: the mobile client flattens
 identity (`terminalPaneId` for terminals) and both clients can be attached to
 the same Dev Session at once without either one rewriting the other's layout.
 
+Leaving the native editor through its header Back, hardware Back/`Alt+Left`, or
+the mobile window's close/back route asks **Discard** or **Cancel** when dirty.
+The pending decision belongs to that exact controller, opened file and
+server/session/pane context; a stale acceptance cannot close a replacement page.
+This covers those user-driven navigation paths, not forced transport/controller
+retirement or a general guarantee that a removed context remains in memory.
+
+Native Material controls inherit the same live dark/light preference as the
+custom mobile panels. The window binds Material's theme to `MobileTheme.themeName`
+so flat buttons and text inputs remain readable when the preference changes.
+
 Two rules constrain every mobile QML file, and both are security rules
 (SPEC 7.5, 2.4, 7.4):
 
@@ -713,6 +755,12 @@ Two rules constrain every mobile QML file, and both are security rules
   daemon's `file.readFile`, not through the phone's local filesystem. The optional
   in-app web viewer loads HTTP(S) pages over the phone's network connection; it
   is separate from remote file rendering.
+
+Native Markdown inline styling/link delegates are bounded per block: at most
+16,384 UTF-16 code units and 256 lexical pieces (word, whitespace or newline).
+A larger or more fragmented block is one plain-text item with its complete parsed
+body retained; inline styling and link actions are omitted rather than creating an
+unbounded number of QML objects. Blocks without inline spans also use one text item.
 
 Automatic Markdown images require a known repository root. Their path-resolution
 replies must match both the requested image path and that original root; an old
@@ -734,9 +782,22 @@ The PDF page uses native page images and selection/link models rather than a
 component that opens URI annotations through the operating system. External URI
 annotations are inactive; internal page links, multipage scrolling, text
 selection, and zoom stay inside the viewer.
+
+Each decoded page is composited over white paper, independently of the app theme.
+The paper follows the raster's actual painted bounds; unused space in a short
+page's minimum-height list slot retains the themed viewport background.
+
 Remote PDF files are limited to **8 MiB**. Each rasterized PDF page is bounded to
 **16 Mi pixels** and **8192 pixels per axis**, independently of zoom, device-pixel
 ratio or page aspect ratio.
+Each page also reserves at least **48 device-independent pixels** of list height,
+limiting the page/text/link delegate fanout for extremely wide, subpixel-height
+pages in the viewport and cache. This is separate from the per-page raster bounds.
+Page rasters, text selection and links are attached only after the viewport and
+page dimensions are positive. A page closes its native `QPdfDocument` before
+releasing the rendering file. Clearing QtQuick PDF's `source` alone is not a close:
+the service uses Qt's public QML extension API to close the underlying document,
+and explicitly reloads it when the same owned file URL is opened again.
 
 The native PDF backend needs the complete document in a per-service rendering
 spool: a `QTemporaryDir` matching
@@ -750,6 +811,11 @@ destruction removes only that service's directory. No constructor sweeps another
 service's cache and no orphan reclamation is promised. Crash/forced kill or failed
 removal can leave the document until OS eviction; this is not secure erase or a
 guaranteed crash cleanup. The narrow no-local-project-files exception is in SPEC 11.2.
+
+Before removing a PDF file or directory, the service also closes every native
+document associated with those files, including documents whose old QML page has
+not yet been destroyed. The source-setting bridge accepts only this service's
+current rendering files; it is not an arbitrary local-file loading interface.
 
 The optional HTTP(S) viewer waits for native navigation protection before loading
 an untrusted address. `MobileWebViewPolicy` identifies this view by a unique
@@ -900,9 +966,15 @@ the whole chain was green while the harness itself invoked nothing. Two tests no
 run the REAL binaries: `remote/test/oh-my-pi-live.test.ts` runs an actual `omp`
 with the extension loaded and asserts the bridge receives
 `starting → running → idle_unseen → stopped`, and `remote/test/tmux-live.test.ts`
-does the same job for tmux. Both skip cleanly when the binary is absent. Prefer
-one of these over another fixture-fed unit test whenever the thing that could be
-wrong is an assumption about an external program's interface.
+does the same job for tmux. Both skip when the binary is absent. The real `omp`
+test additionally requires **`CH_LIVE_OMP=1`**: it makes a real model call, so it
+must not run merely because `omp` is installed. To opt in, supply model credentials
+through environment variables and, from `remote/`, run
+`CH_LIVE_OMP=1 node --test test/oh-my-pi-live.test.ts`. It uses private agent/home/
+runtime/data/cache/config/database/history/tmux/temp state and disables tools and
+discovered extensions; it does not borrow the installed user's profile or auth
+store. This is separate from `CH_LIVE_SSH`. Prefer real-program gates over another
+fixture-fed unit test when the uncertain contract is an external program's interface.
 
 `-L desktop` currently holds one target, `tst_notifierlive`. It waits for the
 freedesktop notification daemon's replies and verifies a nonzero notification id
@@ -931,10 +1003,11 @@ Environment contract:
 | `CH_LIVE_USER` | SSH login user |
 | `CH_LIVE_NODE` | **Absolute** path to `node` on the remote side (a non-interactive SSH session usually has no version-manager `PATH`) |
 | `CH_LIVE_REPO` | Absolute path to this repo on the remote side |
-| `CH_LIVE_IDENTITY` | Optional private key used by `tst_livessh` to encrypt a temporary copy and prove the passphrase callback; never committed |
+| `CH_LIVE_IDENTITY` | Optional private key for environment-driven SSH connections, including the editor reconnect gate's independent shell; `tst_livessh` also encrypts a temporary copy to prove the passphrase callback; never committed |
 | `CH_LIVE_KNOWN_HOSTS` | Optional scratch known-hosts file; when unset, each gate uses a temporary path |
 | `CH_LIVE_PASSWORD` | Optional password for the multi-step SSH authentication live gate |
 | `CH_LIVE_KBDINT_PASSWORD` | Optional password for the keyboard-interactive SSH live gate |
+| `CH_SETTINGS_PATH` | For the desktop GUI/live launcher: absolute private local INI for profiles/preferences/UI state; external browser data/cache use its `.webengine/` sibling root; use e.g. `<fixture>/client.ini`, never the real user store |
 
 Standing up a throwaway `sshd` fixture (no root, no changes to your `~/.ssh`):
 
@@ -1023,13 +1096,28 @@ Two guards now stand in front of it:
   they could not remove. Cleanup errors used to be ignored, which is how
   leftovers accumulated unnoticed.
 
+Live tests may share a private SSH listener while running in parallel. A network
+failure test must disconnect only its own authenticated connection, not every
+child process of that listener. `tst_liveterminalfactory` checks that a separate
+connection can run fresh commands before the drop, after it, and after the
+intended connection reconnects; that separate connection never reconnects.
+
+In native test fixtures, declare callback result state before the client or
+device that uses it, or use a shorter-lived QObject receiver to disconnect the
+callback first. `CodeharbordClient` completes pending requests from its destructor,
+so a timeout or an early assertion return must not destroy captured stack state
+before the client.
+
 If rows have already been left behind, remove them by the id the failing test
 reported. Do NOT sweep by name: "delete every group whose name looks like a test"
 is how somebody eventually deletes a real session.
 
-If the schema migration has already happened, the workspace itself is fine — the
-migration only adds columns. Upgrade the installed server (`Update server` in the
-client, or unpack a newer `codeharbor-remote.tar.gz` over it) and it opens again.
+If a live run accidentally migrated the real workspace, stop using it as a fixture,
+preserve the database, and upgrade the installed service to a build supporting that
+workspace schema (`Update server`, or a matching manually installed release).
+Do not lower `schema_version` to make an older daemon open it: migrations may repair
+constraints and legacy identity data, not merely add columns. Keep subsequent live
+runs on the disposable fixture instead.
 
 Then run them. `CH_LIVE_SSH` and `CH_LIVE_HOST` / `CH_LIVE_PORT` / `CH_LIVE_USER` /
 `CH_LIVE_NODE` / `CH_LIVE_REPO` are required for the SSH-backed gates. Without
@@ -1039,11 +1127,22 @@ required variables and the SSH-backed gates fail their own precondition check
 instead. `CH_LIVE_IDENTITY` and `CH_LIVE_KNOWN_HOSTS` are optional; the gates use
 their documented fallback paths when they are unset.
 
+The remote fixture alone does not isolate client-local preferences or connection
+profiles. Set `CH_SETTINGS_PATH` to a fresh absolute private INI path before
+launching the desktop GUI; all three client stores use that file, and external
+browser data/cache use `<CH_SETTINGS_PATH>.webengine/{data,cache}` before page use.
+Unset retains the normal native settings/browser storage. Explicitly empty or
+relative settings paths fail startup before stores are constructed.
+This is not an SSH `SetEnv` variable or a general sandbox: choose a fresh private
+root rather than existing user data or an untrusted/symlinked path. Trust and key
+files are not redirected; keep `CH_LIVE_KNOWN_HOSTS` private as well.
+
 ```bash
 export CH_LIVE_SSH=1
 export CH_LIVE_HOST=127.0.0.1 CH_LIVE_PORT=2222 CH_LIVE_USER=$(whoami)
 export CH_LIVE_NODE=$(command -v node) CH_LIVE_REPO=$PWD CH_LIVE_IDENTITY="$D/id"
 export SSH_AUTH_SOCK="$D/agent.sock"
+export CH_SETTINGS_PATH="$D/client.ini"
 export CH_LIVE_KNOWN_HOSTS="$D/known_hosts"
 ctest --preset dev -L live --output-on-failure
 ```

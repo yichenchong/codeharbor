@@ -1425,7 +1425,11 @@ void AppController::adoptServerIdentity()
                            return;
                        if (self->m_layouts) {
                            self->m_layouts->setWorkspaceReady(true);
-                           if (sameServer && !self->m_activeSessionId.isEmpty())
+                           // A new-server list can complete reentrantly during
+                           // identity publication and restore a remembered
+                           // selection while layout I/O is still suspended.
+                           // Resume that selection too, not just reconnects.
+                           if (!self->m_activeSessionId.isEmpty())
                                self->m_layouts->refresh();
                        }
                        if (!self || generation != self->m_identityGeneration

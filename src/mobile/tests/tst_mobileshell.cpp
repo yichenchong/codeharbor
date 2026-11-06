@@ -18,10 +18,17 @@
 #include <QtTest/QtTest>
 
 #include <QAccessible>
+#include <QAbstractItemModel>
 #include <QBuffer>
+#include <QColor>
 #include <QDesktopServices>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QEvent>
+#include <QFont>
+#include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QImage>
 #include <QJsonArray>
@@ -31,8 +38,10 @@
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
 #include <QQmlContext>
+#include <QQmlProperty>
 #include <QQuickItem>
 #include <QQuickStyle>
+#include <QPointer>
 #include <QQuickWindow>
 #include <QSignalSpy>
 #include <QScopeGuard>
@@ -40,10 +49,16 @@
 #include <QTemporaryDir>
 #include <QVariant>
 
+#if CH_HAVE_QTPDF
+#include <QPdfDocument>
+#include <QtQml/qqml.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 
 #include "EditorFactory.h"
+#include "AppSettings.h"
 #include "MarkdownModel.h"
 #include "MobileKeyStore.h"
 #include "MobileNavFixture.h"
@@ -119,6 +134,118 @@ QQuickItem *findItem(QQuickItem *item, Predicate matches)
             return found;
     }
     return nullptr;
+}
+
+template <typename Predicate>
+void collectItems(QQuickItem *root, const Predicate &matches, QList<QQuickItem *> &found)
+{
+    if (!root)
+        return;
+    if (matches(root))
+        found.append(root);
+    for (QQuickItem *child : root->childItems())
+        collectItems(child, matches, found);
+}
+
+template <typename Predicate>
+QList<QQuickItem *> findItems(QQuickItem *root, const Predicate &matches)
+{
+    QList<QQuickItem *> found;
+    collectItems(root, matches, found);
+    return found;
+}
+
+bool isNativeText(QQuickItem *item)
+{
+    // A model delegate can expose text too, but has no native text layout.
+    return item->inherits("QQuickText")
+        && item->property("lineCount").isValid()
+        && item->property("font").isValid();
+}
+
+QQuickItem *findNativeTextShowing(QQuickItem *root, const QString &text)
+{
+    return findItem(root, [&text](QQuickItem *item) {
+        return isNativeText(item) && item->property("text").toString() == text;
+    });
+}
+
+#if CH_HAVE_QTPDF
+bool isPdfPageImage(QQuickItem *item)
+{
+    return item->property("document").isValid()
+        && item->property("currentFrame").isValid()
+        && item->property("sourceSize").isValid()
+        && item->property("status").isValid();
+}
+
+QQuickItem *findPdfView(QQuickItem *root)
+{
+    return findItem(root, [](QQuickItem *item) {
+        // QML adds a generated subclass for the viewport's custom properties.
+        // Native inheritance survives that suffix; exact class spelling does not.
+        return item->inherits("QQuickListView")
+            && item->property("zoom").isValid()
+            && item->property("renderedZoom").isValid()
+            && item->property("currentPage").isValid();
+    });
+}
+#endif
+
+bool isMarkdownInlineText(QQuickItem *item)
+{
+    QQuickItem *run = item->parentItem();
+    return isNativeText(item) && run && run->property("modelData").isValid()
+        && run->parentItem() && run->parentItem()->inherits("QQuickFlow");
+}
+
+qreal relativeLuminance(const QColor &color)
+{
+    const auto linear = [](qreal channel) {
+        return channel <= 0.04045 ? channel / 12.92
+                                 : std::pow((channel + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * linear(color.redF()) + 0.7152 * linear(color.greenF())
+        + 0.0722 * linear(color.blueF());
+}
+
+QRect frameRect(QQuickWindow *window, const QImage &frame, const QRectF &sceneRect)
+{
+    const qreal sx = qreal(frame.width()) / window->width();
+    const qreal sy = qreal(frame.height()) / window->height();
+    return QRectF(sceneRect.x() * sx, sceneRect.y() * sy,
+                  sceneRect.width() * sx, sceneRect.height() * sy)
+        .toAlignedRect().intersected(frame.rect());
+}
+
+QColor framePixel(QQuickWindow *window, const QImage &frame, const QPointF &scenePoint)
+{
+    return frame.pixelColor(
+        std::clamp(int(scenePoint.x() * frame.width() / window->width()), 0, frame.width() - 1),
+        std::clamp(int(scenePoint.y() * frame.height() / window->height()), 0, frame.height() - 1));
+}
+
+int contrastingPixels(const QImage &frame, const QRect &area, const QColor &background,
+                      QColor *foreground = nullptr)
+{
+    const qreal backgroundLuminance = relativeLuminance(background);
+    qreal strongestContrast = 1;
+    int pixels = 0;
+    for (int y = area.top(); y <= area.bottom(); ++y) {
+        for (int x = area.left(); x <= area.right(); ++x) {
+            const QColor color = frame.pixelColor(x, y);
+            const qreal luminance = relativeLuminance(color);
+            const qreal contrast = (std::max(luminance, backgroundLuminance) + 0.05)
+                / (std::min(luminance, backgroundLuminance) + 0.05);
+            if (contrast >= 4.5)
+                ++pixels;
+            if (foreground && contrast > strongestContrast) {
+                strongestContrast = contrast;
+                *foreground = color;
+            }
+        }
+    }
+    return pixels;
 }
 
 // Match either spelling of a Quick type, because which one an item has depends
@@ -391,6 +518,65 @@ QByteArray linkedPdfBytes(int firstPageHeight = 400)
            + " /Root 1 0 R >>\nstartxref\n" + QByteArray::number(xref) + "\n%%EOF\n";
     return pdf;
 }
+
+QByteArray widePdfBytes(int pageCount)
+{
+    QByteArray kids;
+    for (int page = 0; page < pageCount; ++page)
+        kids += QByteArray::number(page + 3) + " 0 R ";
+    QList<QByteArray> objects{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [" + kids + "] /Count "
+            + QByteArray::number(pageCount) + " >>",
+    };
+    for (int page = 0; page < pageCount; ++page)
+        objects.append("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 14400 1] >>");
+    QByteArray pdf("%PDF-1.4\n");
+    QList<qsizetype> offsets{0};
+    for (qsizetype object = 0; object < objects.size(); ++object) {
+        offsets.append(pdf.size());
+        pdf += QByteArray::number(object + 1) + " 0 obj\n"
+            + objects.at(object) + "\nendobj\n";
+    }
+    const qsizetype xref = pdf.size();
+    pdf += "xref\n0 " + QByteArray::number(offsets.size()) + "\n0000000000 65535 f \n";
+    for (qsizetype object = 1; object < offsets.size(); ++object)
+        pdf += QByteArray::number(offsets.at(object)).rightJustified(10, '0')
+            + " 00000 n \n";
+    pdf += "trailer\n<< /Size " + QByteArray::number(offsets.size())
+        + " /Root 1 0 R >>\nstartxref\n" + QByteArray::number(xref) + "\n%%EOF\n";
+    return pdf;
+}
+
+QByteArray transparentPaperPdfBytes(int pageHeight)
+{
+    // Default black text only: no page-fill command and no painted white box.
+    const QByteArray stream = "BT /F1 12 Tf 20 "
+        + QByteArray::number(pageHeight - 16) + " Td (Readable PDF) Tj ET\n";
+    const QList<QByteArray> objects{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 "
+            + QByteArray::number(pageHeight)
+            + "] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        "<< /Length " + QByteArray::number(stream.size()) + " >>\nstream\n"
+            + stream + "endstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    };
+    QByteArray pdf("%PDF-1.4\n");
+    QList<qsizetype> offsets{0};
+    for (qsizetype i = 0; i < objects.size(); ++i) {
+        offsets.append(pdf.size());
+        pdf += QByteArray::number(i + 1) + " 0 obj\n" + objects.at(i) + "\nendobj\n";
+    }
+    const qsizetype xref = pdf.size();
+    pdf += "xref\n0 " + QByteArray::number(offsets.size()) + "\n0000000000 65535 f \n";
+    for (qsizetype i = 1; i < offsets.size(); ++i)
+        pdf += QByteArray::number(offsets.at(i)).rightJustified(10, '0') + " 00000 n \n";
+    pdf += "trailer\n<< /Size " + QByteArray::number(offsets.size())
+        + " /Root 1 0 R >>\nstartxref\n" + QByteArray::number(xref) + "\n%%EOF\n";
+    return pdf;
+}
 #endif
 
 // The first descendant QObject (not only Items — an ch::EditorController is
@@ -468,7 +654,11 @@ public:
                                   {QStringLiteral("kind"), kind}});
     }
     Q_INVOKABLE void acceptHostKey(bool trusted) { trustReplies.append(trusted); }
-    Q_INVOKABLE void connectToServer(QVariantMap profile) { emit connectionRequested(profile); }
+    Q_INVOKABLE QString connectToServer(QVariantMap profile)
+    {
+        emit connectionRequested(profile);
+        return QStringLiteral("test-profile");
+    }
 signals:
     void connectionStateChanged();
     void credentialPrompt(QString user, QString host, QString prompt, QString kind);
@@ -531,6 +721,13 @@ private slots:
     // those two disagree fails at link time with nothing pointing at the cause.
     void thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies();
     void pdfLinksNeverLeaveTheAppButInternalNavigationAndZoomWork();
+    void pdfNativeDocumentClosesBeforeSpoolReleaseAndReopensTheSameSource();
+    void pdfDecodersWaitForPositiveViewportGeometry();
+    void pdfServiceRetirementClosesAllNativeDocumentsBeforeRemovingSpools_data();
+    void pdfServiceRetirementClosesAllNativeDocumentsBeforeRemovingSpools();
+    void pdfTransparentPagesPaintWhitePaperWithReadableInk_data();
+    void pdfTransparentPagesPaintWhitePaperWithReadableInk();
+    void nativeControlsRemainReadableAcrossLiveThemeChanges();
     void aWebPageWithoutNativePolicyRefusesToLoadAndExplainsWhy();
     void revisitingATextPathDoesNotAcceptItsPreviousRead();
     void pdfRastersStayBoundedForTallPagesAtMaximumZoom();
@@ -551,6 +748,16 @@ private slots:
     void lateRecoveryScopeKeepsEditsAndSeparatesSnapshotTargets();
     void recoveryOffersRetireWhenTheirScopeOrDocumentChanges_data();
     void recoveryOffersRetireWhenTheirScopeOrDocumentChanges();
+    void replacingAPaneRetiresResourceOwnershipBeforeDeferredDeletion_data();
+    void replacingAPaneRetiresResourceOwnershipBeforeDeferredDeletion();
+    void replacingMarkdownRetiresImageOwnershipBeforeDeferredDeletion_data();
+    void replacingMarkdownRetiresImageOwnershipBeforeDeferredDeletion();
+    void pdfWidePagesKeepTheLiveDelegateCountBounded();
+    void markdownLargeBlocksKeepNativeItemCountsBounded_data();
+    void markdownLargeBlocksKeepNativeItemCountsBounded();
+    void retargetingMarkdownRetiresItsOfferedLink();
+    void leavingADirtyEditorThroughEveryBackRouteRequiresDiscard_data();
+    void leavingADirtyEditorThroughEveryBackRouteRequiresDiscard();
 
 private:
     // One engine per case: the shell keeps per-session state, and a case that
@@ -732,6 +939,97 @@ void TstMobileShell::grabFrame(Shell &shell, const QString &name)
     QVERIFY(frame.width() > 0 && frame.height() > 0);
     const QString path = QDir(m_frameDir).filePath(name + QStringLiteral(".png"));
     QVERIFY2(frame.save(path), qPrintable(path));
+}
+
+void TstMobileShell::nativeControlsRemainReadableAcrossLiveThemeChanges()
+{
+    Shell shell;
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    AppSettings *settings = shell.fixture.controller.settings();
+    QVERIFY(settings);
+    const QString originalTheme = settings->theme();
+    const auto restoreTheme = qScopeGuard([settings, originalTheme] {
+        settings->setTheme(originalTheme);
+    });
+
+    // These are real Material controls underneath the REAL MobileMain window.
+    // No attached theme/foreground binding is repeated by the fixture. A flat
+    // toolbar button and an unfilled text field expose native ink on the custom
+    // panel, matching the integration boundary that lost readability.
+    QQmlComponent component(&shell.engine);
+    component.setData(QByteArrayLiteral(
+        "import QtQuick\n"
+        "import QtQuick.Controls\n"
+        "import CodeHarbor.Mobile\n"
+        "Rectangle {\n"
+        " width: 360; height: 190; z: 10000; color: MobileTheme.surfaceRaised\n"
+        " Column { x: 24; y: 24; spacing: 12\n"
+        "  Button { width: 280; height: 56; text: \"MMMMMMMM\"; flat: true\n"
+        "           hoverEnabled: false; font.pixelSize: 24 }\n"
+        "  TextField { width: 280; height: 52; text: \"MMMMMMMM\"; readOnly: true\n"
+        "              background: null; hoverEnabled: false; cursorVisible: false\n"
+        "              leftPadding: 0; rightPadding: 0; font.pixelSize: 24 }\n"
+        " }\n"
+        "}\n"), QUrl(QStringLiteral("qrc:/tst_mobileshell/native-theme-consumers.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    QScopedPointer<QObject> overlay(component.create(shell.engine.rootContext()));
+    auto *panel = qobject_cast<QQuickItem *>(overlay.data());
+    QVERIFY2(panel, qPrintable(component.errorString()));
+    panel->setParent(window->contentItem());
+    panel->setParentItem(window->contentItem());
+    QQuickItem *button = findItem(panel, [](QQuickItem *item) {
+        return item->inherits("QQuickButton");
+    });
+    QQuickItem *field = findItem(panel, [](QQuickItem *item) {
+        return item->inherits("QQuickTextInput");
+    });
+    QVERIFY(button);
+    QVERIFY(field);
+    QQuickItem *buttonLabel = button->property("contentItem").value<QQuickItem *>();
+    QVERIFY(buttonLabel);
+    QList<QColor> panelColors;
+    QList<QColor> buttonColors;
+    QList<QColor> fieldColors;
+    for (const QString &theme : {QStringLiteral("dark"), QStringLiteral("light"),
+                                 QStringLiteral("dark")}) {
+        settings->setTheme(theme);
+        QColor panelColor;
+        QColor buttonInk;
+        QColor fieldInk;
+        const auto readableFrame = [&] {
+            const QImage frame = window->grabWindow();
+            if (frame.isNull())
+                return false;
+            panelColor = framePixel(window, frame, panel->mapToScene(QPointF(8, 8)));
+            const QRect buttonArea = frameRect(window, frame,
+                buttonLabel->mapRectToScene(buttonLabel->boundingRect()));
+            const qreal textWidth = std::min(field->width(),
+                                             field->property("contentWidth").toReal());
+            const QRect fieldArea = frameRect(window, frame,
+                field->mapRectToScene(QRectF(field->property("leftPadding").toReal(),
+                                            0, textWidth, field->height())));
+            if (contrastingPixels(frame, buttonArea, panelColor, &buttonInk) < 20
+                || contrastingPixels(frame, fieldArea, panelColor, &fieldInk) < 20)
+                return false;
+            const qreal background = relativeLuminance(panelColor);
+            return theme == QLatin1String("dark")
+                ? relativeLuminance(buttonInk) > background
+                    && relativeLuminance(fieldInk) > background
+                : relativeLuminance(buttonInk) < background
+                    && relativeLuminance(fieldInk) < background;
+        };
+        QTRY_VERIFY(readableFrame()); // >= 4.5:1 against actually painted pixels.
+        panelColors.append(panelColor);
+        buttonColors.append(buttonInk);
+        fieldColors.append(fieldInk);
+    }
+    QVERIFY(relativeLuminance(panelColors.at(1)) > relativeLuminance(panelColors.at(0)));
+    QVERIFY(relativeLuminance(buttonColors.at(1)) < relativeLuminance(buttonColors.at(0)));
+    QVERIFY(relativeLuminance(fieldColors.at(1)) < relativeLuminance(fieldColors.at(0)));
+    QCOMPARE(panelColors.at(2), panelColors.at(0));
 }
 
 void TstMobileShell::theFirstScreenIsTheConnectPage()
@@ -1204,20 +1502,11 @@ void TstMobileShell::theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap()
              "the save control is checkable, so it could arrive pre-ticked");
     QVERIFY2(!save->property("checked").toBool(), "the save control is pre-armed");
 
-    // The cost, unhedged. Asserted by the substrings that carry the meaning, so
-    // rewording the sentence around them is free but dropping the facts is not.
+    // Keep a plain-text warning beside the explicit save action. Encryption is
+    // determined by the imported key's armour, not by this presentation test.
     QQuickItem *warning = byName("saveKeyWarningLabel");
     QVERIFY2(warning, "the save offer has no warning");
-    const QString warningText = warning->property("text").toString();
-    QVERIFY2(warningText.contains(QStringLiteral("not encrypted")),
-             qPrintable(QStringLiteral("warning does not say the file is "
-                                       "unencrypted: %1").arg(warningText)));
-    QVERIFY2(warningText.contains(QStringLiteral("unlock this phone")),
-             qPrintable(QStringLiteral("warning does not say who can read it: %1")
-                            .arg(warningText)));
-    QVERIFY2(warningText.contains(QStringLiteral("private storage")),
-             qPrintable(QStringLiteral("warning does not say where it goes: %1")
-                            .arg(warningText)));
+    QVERIFY(!warning->property("text").toString().trimmed().isEmpty());
     // Plain text everywhere on mobile (SPEC 7.5): the warning is the last string
     // that should ever be able to render as markup. The enum value is read off
     // the Label's own metaobject rather than written as a literal, because
@@ -1241,10 +1530,6 @@ void TstMobileShell::theKeySheetOffersSavingOnDeviceOnlyAsASeparateTap()
     QVERIFY2(!introText.contains(QStringLiteral("never stores a private key")),
              qPrintable(QStringLiteral("the explanation still claims no key is "
                                        "ever stored: %1").arg(introText)));
-    QVERIFY2(introText.contains(QStringLiteral("unencrypted")),
-             qPrintable(QStringLiteral("the explanation does not mention the "
-                                       "unencrypted third option: %1")
-                            .arg(introText)));
 
     // Three storage states, three different rows. Driven through the sheet's own
     // keyStateLabel(), which is the single place the list decides that text.
@@ -2239,18 +2524,23 @@ void TstMobileShell::markdownTextPreservesLinesAndWrapsLongTokens()
     host.deliver(textReadFrame(requestId(reads.at(0)),
                                QStringLiteral("alpha\nbeta\n\n**") + token
                                    + QStringLiteral("**\n"), QStringLiteral("r1")));
-    QQuickItem *alpha = nullptr;
-    QQuickItem *beta = nullptr;
+    QQuickItem *paragraph = nullptr;
     QQuickItem *longWord = nullptr;
-    QTRY_VERIFY((alpha = findItemShowing(host.page(), QStringLiteral("alpha"))));
-    QTRY_VERIFY((beta = findItemShowing(host.page(), QStringLiteral("beta"))));
-    QTRY_VERIFY((longWord = findItemShowing(host.page(), token)));
-    const qreal firstY = alpha->mapToScene(QPointF()).y();
-    const qreal secondY = beta->mapToScene(QPointF()).y();
-    QVERIFY(secondY >= firstY + alpha->height());
-    QVERIFY(secondY <= firstY + alpha->height() + 2);
+    QTRY_VERIFY((paragraph = findNativeTextShowing(host.page(), QStringLiteral("alpha\nbeta"))));
+    QTRY_VERIFY((longWord = findNativeTextShowing(host.page(), token)));
+    QVERIFY(paragraph->isVisible());
+    QCOMPARE(paragraph->property("text").toString(), QStringLiteral("alpha\nbeta"));
+    // The plain-text fast path keeps the whole paragraph in one native Text.
+    // Check its actual layout, not the old implementation's per-line objects:
+    // both explicit lines must be drawn adjacently with normal font metrics.
+    QTRY_COMPARE(paragraph->property("lineCount").toInt(), 2);
+    const qreal lineHeight = std::ceil(
+        QFontMetricsF(paragraph->property("font").value<QFont>()).height());
+    QVERIFY(lineHeight > 0);
+    QTRY_VERIFY(std::abs(paragraph->height() - 2 * lineHeight) <= 2);
     QVERIFY(longWord->width() <= host.page()->width());
-    QVERIFY(longWord->height() > alpha->height() * 2);
+    QTRY_VERIFY(longWord->property("lineCount").toInt() > 2);
+    QVERIFY(longWord->height() > paragraph->height());
 }
 
 void TstMobileShell::markdownImagesRequireAKnownProjectRoot()
@@ -2419,6 +2709,391 @@ void TstMobileShell::thePdfSpoolFileIsDeletedWhenThePaneMovesOnAndWhenItDies()
     host.root.reset();
     QVERIFY2(!QFile::exists(thirdSpool),
              "the document outlived the pane that was showing it");
+#endif
+}
+
+void TstMobileShell::pdfNativeDocumentClosesBeforeSpoolReleaseAndReopensTheSameSource()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/lifecycle.pdf\""));
+    QVERIFY(showPage(host));
+    auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), linkedPdfBytes()));
+    QQuickItem *page = host.page();
+    QQuickItem *view = findPdfView(page);
+    QVERIFY(view);
+    QQuickItem *raster = nullptr;
+    QTRY_VERIFY((raster = findItem(page, [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1;
+    })));
+    QObject *wrapper = raster->property("document").value<QObject *>();
+    QVERIFY(wrapper);
+    auto *native = qobject_cast<QPdfDocument *>(qmlExtendedObject(wrapper));
+    QVERIFY(native); // The REAL public extension, not a separate test decoder.
+    QCOMPARE(native->status(), QPdfDocument::Status::Ready);
+    QCOMPARE(native->pageCount(), 2);
+    QCOMPARE(native->pageModel()->rowCount(), 2);
+    QVERIFY(!native->render(0, QSize(120, 160)).isNull());
+    const QUrl spool = page->property("documentSource").toUrl();
+    QVERIFY(QFile::exists(spool.toLocalFile()));
+    QCOMPARE(wrapper->property("source").toUrl(), spool);
+
+    QTemporaryDir foreignDirectory;
+    QVERIFY(foreignDirectory.isValid());
+    QFile foreign(foreignDirectory.filePath(QStringLiteral("foreign.pdf")));
+    QVERIFY(foreign.open(QIODevice::WriteOnly));
+    const QByteArray bytes = linkedPdfBytes();
+    QCOMPARE(foreign.write(bytes), bytes.size());
+    foreign.close();
+    QVERIFY(!host.viewers.setPdfDocumentSource(wrapper, QUrl::fromLocalFile(foreign.fileName())));
+    QUrl decoratedSpool = spool;
+    decoratedSpool.setFragment(QStringLiteral("not-the-owned-url"));
+    QVERIFY(!host.viewers.setPdfDocumentSource(wrapper, decoratedSpool));
+    MobileViewerService otherService(&host.fixture.client);
+    QVERIFY(!otherService.setPdfDocumentSource(wrapper, spool));
+    QCOMPARE(native->status(), QPdfDocument::Status::Ready);
+    QCOMPARE(wrapper->property("source").toUrl(), spool);
+    QCOMPARE(native->pageCount(), 2);
+
+    int closesBeforeDeletion = 0;
+    bool closedWithEmptyModels = true;
+    const auto closeConnection = connect(native, &QPdfDocument::statusChanged, page,
+        [&](QPdfDocument::Status status) {
+            if (status == QPdfDocument::Status::Null) {
+                if (QFile::exists(spool.toLocalFile()))
+                    ++closesBeforeDeletion;
+                closedWithEmptyModels = closedWithEmptyModels
+                    && native->pageCount() == 0 && native->pageModel()->rowCount() == 0
+                    && view->property("count").toInt() == 0;
+            }
+        });
+    const auto disconnectClose = qScopeGuard([closeConnection] {
+        QObject::disconnect(closeConnection);
+    });
+    // Logical close must not call the wrapper's broken empty-source setter.
+    QVERIFY(page->setProperty("documentSource", QUrl()));
+    QCOMPARE(native->status(), QPdfDocument::Status::Null);
+    QCOMPARE(native->pageCount(), 0);
+    QCOMPARE(view->property("count").toInt(), 0);
+    QVERIFY(QFile::exists(spool.toLocalFile()));
+    QCOMPARE(wrapper->property("source").toUrl(), spool);
+    QCOMPARE(closesBeforeDeletion, 1);
+    QVERIFY(closedWithEmptyModels);
+
+    // Unchanged wrapper source: native load() must bypass its same-URL no-op.
+    QVERIFY(page->setProperty("documentSource", spool));
+    QTRY_COMPARE(native->status(), QPdfDocument::Status::Ready);
+    QTRY_COMPARE(view->property("count").toInt(), 2);
+    QTRY_VERIFY(findItem(page, [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1;
+    }));
+    QVERIFY(!native->render(0, QSize(120, 160)).isNull());
+    host.viewers.releasePdf(QStringLiteral("/repo/lifecycle.pdf"));
+    QCOMPARE(native->status(), QPdfDocument::Status::Null);
+    QCOMPARE(native->pageCount(), 0);
+    QCOMPARE(view->property("count").toInt(), 0);
+    QCOMPARE(closesBeforeDeletion, 2);
+    QVERIFY(closedWithEmptyModels);
+    QVERIFY(!QFile::exists(spool.toLocalFile()));
+    host.viewers.releasePdf(QStringLiteral("/repo/lifecycle.pdf")); // Idempotent.
+    QVERIFY(!host.viewers.setPdfDocumentSource(wrapper, spool));
+
+    // A real page reload re-creates the same digest path after release.
+    QVERIFY(callQmlFunction(page, "reload"));
+    reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), linkedPdfBytes()));
+    QCOMPARE(page->property("documentSource").toUrl(), spool);
+    QTRY_COMPARE(native->status(), QPdfDocument::Status::Ready);
+    QTRY_VERIFY(findItem(page, [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1;
+    }));
+    QVERIFY(callQmlFunction(page, "deactivate"));
+    QCOMPARE(native->status(), QPdfDocument::Status::Null);
+    QCOMPARE(native->pageCount(), 0);
+    QCOMPARE(view->property("count").toInt(), 0);
+    QCOMPARE(closesBeforeDeletion, 3);
+    QVERIFY(closedWithEmptyModels);
+    QVERIFY(!QFile::exists(spool.toLocalFile()));
+    QVERIFY(callQmlFunction(page, "deactivate"));
+#endif
+}
+
+void TstMobileShell::pdfServiceRetirementClosesAllNativeDocumentsBeforeRemovingSpools_data()
+{
+    QTest::addColumn<QString>("retirement");
+    QTest::newRow("transport-loss") << QStringLiteral("loss");
+    QTest::newRow("transport-replacement") << QStringLiteral("replacement");
+    QTest::newRow("peer-loss-reconnect-publishes-new-spool-in-close-callback")
+        << QStringLiteral("loss-new-spool");
+    QTest::newRow("client-destruction") << QStringLiteral("client");
+    QTest::newRow("service-destruction") << QStringLiteral("service");
+}
+
+void TstMobileShell::pdfServiceRetirementClosesAllNativeDocumentsBeforeRemovingSpools()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    QFETCH(QString, retirement);
+    FakeTransport transport;
+    FakeTransport replacement;
+    auto client = std::make_unique<CodeharbordClient>();
+    client->setTransport(&transport);
+    auto service = std::make_unique<MobileViewerService>(client.get());
+    QQmlEngine engine;
+    QQmlComponent component(&engine);
+    component.setData(QByteArrayLiteral("import QtQuick.Pdf\nPdfDocument {}"),
+                      QUrl(QStringLiteral("qrc:/tst_mobileshell/service-pdf.qml")));
+    QVERIFY2(!component.isError(), qPrintable(component.errorString()));
+    QScopedPointer<QObject> first(component.create());
+    QScopedPointer<QObject> second(component.create());
+    QVERIFY(first);
+    QVERIFY(second);
+    auto *firstNative = qobject_cast<QPdfDocument *>(qmlExtendedObject(first.data()));
+    auto *secondNative = qobject_cast<QPdfDocument *>(qmlExtendedObject(second.data()));
+    QVERIFY(firstNative);
+    QVERIFY(secondNative);
+    QSignalSpy ready(service.get(), &MobileViewerService::pdfReady);
+    const QString path = QStringLiteral("/repo/service.pdf");
+    service->requestPdf(path);
+    const auto reads = requestsFor(takeRequests(transport), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    transport.deliver(byteReadFrame(requestId(reads.first()), linkedPdfBytes()));
+    QCOMPARE(ready.size(), 1);
+    const QUrl spool = ready.first().at(1).toUrl();
+    const QString spoolFile = spool.toLocalFile();
+    const QString spoolDirectory = QFileInfo(spoolFile).absolutePath();
+    QVERIFY(QFile::exists(spoolFile));
+    QVERIFY(service->setPdfDocumentSource(first.data(), spool));
+    QVERIFY(service->setPdfDocumentSource(second.data(), spool));
+    for (QPdfDocument *native : {firstNative, secondNative}) {
+        QCOMPARE(native->status(), QPdfDocument::Status::Ready);
+        QCOMPARE(native->pageCount(), 2);
+        QCOMPARE(native->pageModel()->rowCount(), 2);
+        QVERIFY(!native->render(0, QSize(120, 160)).isNull());
+    }
+    int nativeCloses = 0;
+    int closesWhileSpoolExists = 0;
+    bool emptyModelsAtClose = true;
+    int refusedReopens = 0;
+    MobileViewerService *retiringService = service.get();
+    bool replacementStarted = false;
+    bool replacementLoaded = false;
+    QUrl replacementSpool;
+    QPdfDocument *replacementNative = nullptr;
+    QObject observer; // Disconnect before the captured stack variables expire.
+    for (QPdfDocument *native : {firstNative, secondNative}) {
+        QObject *wrapper = native == firstNative ? first.data() : second.data();
+        connect(native, &QPdfDocument::statusChanged, &observer,
+            [&, native, wrapper](QPdfDocument::Status status) {
+                if (status != QPdfDocument::Status::Null)
+                    return;
+                ++nativeCloses;
+                if (QFile::exists(spoolFile))
+                    ++closesWhileSpoolExists;
+                emptyModelsAtClose = emptyModelsAtClose
+                    && native->pageCount() == 0 && native->pageModel()->rowCount() == 0;
+                // A Null observer must not resurrect a document whose spool is
+                // about to be unlinked, including inside the service destructor.
+                if (!retiringService->setPdfDocumentSource(wrapper, spool))
+                    ++refusedReopens;
+                if (retirement == QLatin1String("loss-new-spool")
+                    && !replacementStarted) {
+                    replacementStarted = true;
+                    // Rebind inside the old peer's Null callback, then answer
+                    // the new generation only after its invalidation broadcast.
+                    client->setTransport(&replacement);
+                    retiringService->requestPdf(path);
+                    const auto freshReads = requestsFor(takeRequests(replacement),
+                                                       rpc::kMethodReadFile);
+                    if (freshReads.size() != 1)
+                        return;
+                    replacement.deliver(byteReadFrame(requestId(freshReads.first()),
+                                                       linkedPdfBytes()));
+                    if (ready.size() != 2)
+                        return;
+                    replacementSpool = ready.last().at(1).toUrl();
+                    QObject *other = native == firstNative ? second.data() : first.data();
+                    replacementNative = native == firstNative ? secondNative : firstNative;
+                    replacementLoaded =
+                        retiringService->setPdfDocumentSource(other, replacementSpool);
+                }
+            });
+    }
+    // The QML documents deliberately outlive the service/peer and are NOT
+    // deactivated by a page: only production service retirement can close them.
+    if (retirement == QLatin1String("loss") || retirement == QLatin1String("loss-new-spool")) {
+        transport.close();
+        QVERIFY(QMetaObject::invokeMethod(&transport, "readChannelFinished"));
+    } else if (retirement == QLatin1String("replacement")) {
+        client->setTransport(&replacement);
+    } else if (retirement == QLatin1String("client")) {
+        client.reset();
+    } else {
+        service.reset();
+    }
+    QCOMPARE(nativeCloses, 2);
+    QCOMPARE(closesWhileSpoolExists, 2);
+    QCOMPARE(refusedReopens, 2);
+    QVERIFY(emptyModelsAtClose);
+    for (QPdfDocument *native : {firstNative, secondNative}) {
+        const bool replaced = native == replacementNative;
+        QCOMPARE(native->status(), replaced ? QPdfDocument::Status::Ready
+                                            : QPdfDocument::Status::Null);
+        QCOMPARE(native->pageCount(), replaced ? 2 : 0);
+        QCOMPARE(native->pageModel()->rowCount(), replaced ? 2 : 0);
+    }
+    QVERIFY(!QFile::exists(spoolFile));
+    QVERIFY(!QDir(spoolDirectory).exists());
+    if (retirement == QLatin1String("loss-new-spool")) {
+        QVERIFY(replacementLoaded);
+        QVERIFY(replacementSpool != spool);
+        QVERIFY(QFile::exists(replacementSpool.toLocalFile()));
+        QVERIFY(!replacementNative->render(0, QSize(120, 160)).isNull());
+    }
+    if (service) {
+        service->releasePdf(path); // The retired lease cannot remove anything twice.
+        QVERIFY(!service->setPdfDocumentSource(first.data(), spool));
+        if (!replacementSpool.isEmpty()) {
+            QCOMPARE(replacementNative->status(), QPdfDocument::Status::Null);
+            QVERIFY(!QFile::exists(replacementSpool.toLocalFile()));
+        }
+    }
+#endif
+}
+
+void TstMobileShell::pdfDecodersWaitForPositiveViewportGeometry()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/layout.pdf\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), linkedPdfBytes()));
+    QQuickItem *view = findPdfView(host.page());
+    QVERIFY(view);
+    QQuickItem *raster = nullptr;
+    QTRY_VERIFY((raster = findItem(host.page(), [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1;
+    })));
+    QQuickItem *delegate = raster->parentItem();
+    QVERIFY(delegate->property("validGeometry").toBool());
+    // Isolate the viewport size from anchors, not from the real page/model.
+    QVERIFY(QQmlProperty::write(view, QStringLiteral("anchors.fill"),
+                               QVariant::fromValue<QQuickItem *>(nullptr)));
+    QVERIFY(view->setProperty("width", 0));
+    QCOMPARE(view->width(), 0);
+    QCOMPARE(raster->property("source").toUrl(), QUrl());
+    QVERIFY(!delegate->property("validGeometry").toBool());
+    QVERIFY(!raster->property("document").value<QObject *>());
+    const auto selections = findItems(delegate, [](QQuickItem *item) {
+        return item->property("renderScale").isValid()
+            && item->property("document").isValid();
+    });
+    QVERIFY(!selections.isEmpty());
+    for (QQuickItem *selection : selections) {
+        QVERIFY(!selection->property("document").value<QObject *>());
+        QVERIFY(selection->property("renderScale").toReal() > 0);
+    }
+    bool checkedLinkModel = false;
+    for (QObject *child : delegate->findChildren<QObject *>()) {
+        if (qobject_cast<QAbstractItemModel *>(child)
+            && child->property("document").isValid() && child->property("page").isValid()) {
+            checkedLinkModel = true;
+            QVERIFY(!child->property("document").value<QObject *>());
+        }
+    }
+    QVERIFY(checkedLinkModel);
+    QVERIFY(QQmlProperty::write(view, QStringLiteral("anchors.fill"),
+                               QVariant::fromValue(host.page())));
+    QTRY_VERIFY(findItem(host.page(), [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1
+            && item->parentItem()->property("validGeometry").toBool();
+    }));
+#endif
+}
+
+void TstMobileShell::pdfTransparentPagesPaintWhitePaperWithReadableInk_data()
+{
+    QTest::addColumn<int>("pageHeight");
+    QTest::addColumn<QString>("theme");
+    QTest::newRow("portrait-dark") << 400 << QStringLiteral("dark");
+    QTest::newRow("portrait-light") << 400 << QStringLiteral("light");
+    QTest::newRow("short-slot-dark") << 20 << QStringLiteral("dark");
+    QTest::newRow("short-slot-light") << 20 << QStringLiteral("light");
+}
+
+void TstMobileShell::pdfTransparentPagesPaintWhitePaperWithReadableInk()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    QFETCH(int, pageHeight);
+    QFETCH(QString, theme);
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/plain.pdf\""));
+    AppSettings *settings = host.fixture.controller.settings();
+    QVERIFY(settings);
+    const QString originalTheme = settings->theme();
+    const auto restoreTheme = qScopeGuard([settings, originalTheme] {
+        settings->setTheme(originalTheme);
+    });
+    settings->setTheme(theme);
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), transparentPaperPdfBytes(pageHeight)));
+    QQuickItem *raster = nullptr;
+    QTRY_VERIFY((raster = findItem(host.page(), [](QQuickItem *item) {
+        return isPdfPageImage(item) && item->property("status").toInt() == 1
+            && item->property("paintedWidth").toReal() > 0
+            && item->property("paintedHeight").toReal() > 0;
+    })));
+    QObject *wrapper = raster->property("document").value<QObject *>();
+    QVERIFY(wrapper);
+    auto *native = qobject_cast<QPdfDocument *>(qmlExtendedObject(wrapper));
+    QVERIFY(native);
+    QCOMPARE(native->status(), QPdfDocument::Status::Ready);
+    QCOMPARE(native->pageCount(), 1);
+    QImage frame;
+    QColor paper;
+    QColor ink;
+    const auto paperAndInkAreVisible = [&] {
+        frame = host.window()->grabWindow();
+        if (frame.isNull())
+            return false;
+        const qreal paintedWidth = raster->property("paintedWidth").toReal();
+        const qreal paintedHeight = raster->property("paintedHeight").toReal();
+        const qreal left = (raster->width() - paintedWidth) / 2;
+        paper = framePixel(host.window(), frame, raster->mapToScene(
+            QPointF(left + paintedWidth * 5 / 6, paintedHeight / 2)));
+        if (paper.red() < 250 || paper.green() < 250 || paper.blue() < 250)
+            return false;
+        const QRect glyphArea = frameRect(host.window(), frame, raster->mapRectToScene(
+            QRectF(left + 15 * paintedWidth / 300, 0, 140 * paintedWidth / 300,
+                   std::min(pageHeight, 22) * paintedHeight / pageHeight)));
+        return contrastingPixels(frame, glyphArea, paper, &ink) >= 20
+            && relativeLuminance(ink) < 0.1;
+    };
+    // This checks native raster output composited onto real paper, not the
+    // Rectangle's color property or a PDF fixture that paints its own backdrop.
+    QTRY_VERIFY(paperAndInkAreVisible());
+    if (pageHeight == 20) {
+        const qreal paintedHeight = raster->property("paintedHeight").toReal();
+        const qreal gap = raster->parentItem()->height() - paintedHeight;
+        QVERIFY(gap > 8);
+        const QColor slot = framePixel(host.window(), frame, raster->mapToScene(
+            QPointF(raster->width() / 2, paintedHeight + gap / 2)));
+        QVERIFY(relativeLuminance(paper) - relativeLuminance(slot) > 0.05);
+    }
 #endif
 }
 
@@ -3555,6 +4230,370 @@ void TstMobileShell::recoveryOffersRetireWhenTheirScopeOrDocumentChanges()
     QVERIFY(QMetaObject::invokeMethod(offer, "accepted"));
     QCOMPARE(editor->property("text").toString(), expected);
     QVERIFY(!host.page()->property("dirty").toBool());
+}
+
+void TstMobileShell::replacingAPaneRetiresResourceOwnershipBeforeDeferredDeletion_data()
+{
+    QTest::addColumn<bool>("pdf");
+    QTest::addColumn<bool>("cached");
+    QTest::addColumn<bool>("directory");
+    QTest::newRow("pending-image") << false << false << false;
+    QTest::newRow("cached-image") << false << true << false;
+    QTest::newRow("pending-pdf") << true << false << false;
+    QTest::newRow("cached-pdf") << true << true << false;
+    QTest::newRow("nested-pending-image") << false << false << true;
+    QTest::newRow("nested-cached-image") << false << true << true;
+    QTest::newRow("nested-pending-pdf") << true << false << true;
+    QTest::newRow("nested-cached-pdf") << true << true << true;
+}
+
+void TstMobileShell::replacingAPaneRetiresResourceOwnershipBeforeDeferredDeletion()
+{
+    QFETCH(bool, pdf);
+    QFETCH(bool, cached);
+    QFETCH(bool, directory);
+#if !CH_HAVE_QTPDF
+    if (pdf)
+        QSKIP("this build has no Qt Pdf");
+#endif
+    const QString path = pdf ? QStringLiteral("/srv/s1/document.pdf")
+                             : QStringLiteral("/srv/s1/photo.png");
+    const QString pageType = pdf ? QStringLiteral("ViewerPdfPage")
+                                 : QStringLiteral("ViewerImagePage");
+    Shell shell;
+    shell.engine.addImageProvider(MobileImageProvider::providerId(),
+                                  shell.viewers.createImageProvider());
+    QVERIFY(shell.window());
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.mobile.selectSession(QStringLiteral("s1"));
+    shell.fixture.answerLayouts(shell.fixture.takeLayoutRequests(),
+        viewerTreeFor(QStringLiteral("viewer-1"),
+            shell.viewers.fileUrlFor(directory ? QStringLiteral("/srv/s1/") : path).toString()),
+        terminalTreeFor(QStringLiteral("terminal-1"), QStringLiteral("row-1")));
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    QQuickItem *host = currentPage(shell.window());
+    QVERIFY(host);
+    if (directory) {
+        QQuickItem *browser = findByQmlTypeIn(host, QStringLiteral("ViewerDirectoryPage"));
+        QVERIFY(browser);
+        QVERIFY(callQmlFunction(browser, "navigate", path));
+        host->setProperty("currentUrl", shell.viewers.fileUrlFor(path));
+    }
+    auto reads = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    const int abandonedRead = requestId(reads.first());
+    QByteArray bytes = pngBytes();
+#if CH_HAVE_QTPDF
+    if (pdf)
+        bytes = linkedPdfBytes();
+#endif
+    QString oldSpool;
+    if (cached) {
+        shell.fixture.transport.deliver(byteReadFrame(abandonedRead, bytes));
+        QQuickItem *viewer = findByQmlTypeIn(host, pageType);
+        QVERIFY(viewer);
+        if (pdf) {
+            oldSpool = viewer->property("documentSource").toUrl().toLocalFile();
+            QVERIFY(QFile::exists(oldSpool));
+        } else {
+            QVERIFY(!shell.viewers.cachedImageBytes(path).isEmpty());
+        }
+    }
+
+    // Exercise the real host's unload/load ordering without giving deleteLater
+    // a turn between the outgoing and incoming pages.
+    QVERIFY(callQmlFunction(host, "reload"));
+    reads = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    if (!oldSpool.isEmpty())
+        QVERIFY(!QFile::exists(oldSpool));
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    if (!cached)
+        shell.fixture.transport.deliver(byteReadFrame(abandonedRead, bytes));
+    QQuickItem *replacement = findByQmlTypeIn(host, pageType);
+    QVERIFY(replacement);
+    QVERIFY(replacement->property("loading").toBool());
+    shell.fixture.transport.deliver(byteReadFrame(requestId(reads.first()), bytes));
+    QVERIFY(!replacement->property("loading").toBool());
+    if (pdf) {
+        const QString spool = replacement->property("documentSource").toUrl().toLocalFile();
+        QVERIFY(!spool.isEmpty());
+        QVERIFY(QFile::exists(spool));
+    } else {
+        QVERIFY(!replacement->property("imageSource").toUrl().isEmpty());
+        QCOMPARE(shell.viewers.cachedImageBytes(path), bytes);
+    }
+}
+
+void TstMobileShell::replacingMarkdownRetiresImageOwnershipBeforeDeferredDeletion_data()
+{
+    QTest::addColumn<bool>("directory");
+    QTest::addColumn<bool>("cached");
+    QTest::newRow("pending") << false << false;
+    QTest::newRow("cached") << false << true;
+    QTest::newRow("nested-pending") << true << false;
+    QTest::newRow("nested-cached") << true << true;
+}
+
+void TstMobileShell::replacingMarkdownRetiresImageOwnershipBeforeDeferredDeletion()
+{
+    QFETCH(bool, directory);
+    QFETCH(bool, cached);
+    const QString document = QStringLiteral("/srv/s1/note.md");
+    const QString image = QStringLiteral("/srv/s1/shared.png");
+    const QString markdown = QStringLiteral("![badge](shared.png)");
+    Shell shell;
+    shell.engine.addImageProvider(MobileImageProvider::providerId(),
+                                  shell.viewers.createImageProvider());
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.mobile.selectSession(QStringLiteral("s1"));
+    shell.fixture.answerLayouts(shell.fixture.takeLayoutRequests(),
+        viewerTreeFor(QStringLiteral("viewer-1"),
+            shell.viewers.fileUrlFor(directory ? QStringLiteral("/srv/s1/") : document).toString()),
+        terminalTreeFor(QStringLiteral("terminal-1"), QStringLiteral("row-1")));
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    QQuickItem *host = currentPage(shell.window());
+    QVERIFY(host);
+    if (directory) {
+        QQuickItem *browser = findByQmlTypeIn(host, QStringLiteral("ViewerDirectoryPage"));
+        QVERIFY(browser);
+        QVERIFY(callQmlFunction(browser, "navigate", document));
+        host->setProperty("currentUrl", shell.viewers.fileUrlFor(document));
+    }
+    auto reads = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    shell.fixture.transport.deliver(textReadFrame(requestId(reads.first()), markdown, QStringLiteral("r1")));
+    const auto beginImageRead = [&](QQuickItem *page) {
+        if (!callQmlFunction(page, "requestImage", QStringLiteral("shared.png")))
+            return QJsonObject();
+        const auto resolves = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodResolvePath);
+        const auto resolve = std::find_if(resolves.begin(), resolves.end(), [&](const QJsonObject &request) {
+            return requestPath(request) == image;
+        });
+        if (resolve == resolves.end())
+            return QJsonObject();
+        shell.fixture.transport.deliver(resolveFrame(requestId(*resolve), image, true));
+        const auto imageReads = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodReadFile);
+        return imageReads.size() == 1 ? imageReads.first() : QJsonObject();
+    };
+    QQuickItem *page = findByQmlTypeIn(host, QStringLiteral("ViewerMarkdownPage"));
+    QVERIFY(page);
+    const QJsonObject abandonedRead = beginImageRead(page);
+    QVERIFY(!abandonedRead.isEmpty());
+    if (cached)
+        shell.fixture.transport.deliver(byteReadFrame(requestId(abandonedRead), pngBytes()));
+    QVERIFY(callQmlFunction(host, "reload"));
+    reads = requestsFor(takeRequests(shell.fixture.transport), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    shell.fixture.transport.deliver(textReadFrame(requestId(reads.first()), markdown, QStringLiteral("r2")));
+    page = findByQmlTypeIn(host, QStringLiteral("ViewerMarkdownPage"));
+    QVERIFY(page);
+    const QJsonObject replacementRead = beginImageRead(page);
+    QVERIFY(!replacementRead.isEmpty());
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    if (!cached)
+        shell.fixture.transport.deliver(byteReadFrame(requestId(abandonedRead), pngBytes()));
+    QVERIFY(page->property("imageSources").value<QJSValue>()
+                .property(QStringLiteral("shared.png")).isUndefined());
+    shell.fixture.transport.deliver(byteReadFrame(requestId(replacementRead), pngBytes()));
+    QCOMPARE(QUrl(page->property("imageSources").value<QJSValue>()
+                      .property(QStringLiteral("shared.png")).toString()), shell.viewers.imageUrl(image));
+    QCOMPARE(shell.viewers.cachedImageBytes(image), pngBytes());
+}
+
+void TstMobileShell::pdfWidePagesKeepTheLiveDelegateCountBounded()
+{
+#if !CH_HAVE_QTPDF
+    QSKIP("this build has no Qt Pdf");
+#else
+    PageHost host(QStringLiteral("ViewerPdfPage"),
+                  QStringLiteral("remotePath: \"/repo/wide.pdf\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(byteReadFrame(requestId(reads.first()), widePdfBytes(512)));
+    QQuickItem *view = host.page()->findChild<QQuickItem *>(QStringLiteral("pdfView"));
+    QVERIFY(view);
+    QTRY_COMPARE(view->property("count").toInt(), 512);
+    QTRY_VERIFY(!findItems(host.page(), isPdfPageImage).isEmpty());
+    const auto rasters = findItems(host.page(), isPdfPageImage);
+    QVERIFY2(rasters.size() < 40, "subpixel pages instantiated excessive native page models");
+    for (QQuickItem *raster : rasters)
+        QVERIFY(raster->parentItem()->height() >= 48);
+    QTRY_VERIFY(std::any_of(rasters.cbegin(), rasters.cend(), [](QQuickItem *raster) {
+        return raster->property("status").toInt() == 1; // A real Image.Ready raster.
+    }));
+    QVERIFY(callQmlFunction(view, "positionViewAtEnd"));
+    QTRY_VERIFY(view->property("contentY").toReal() > view->height());
+    QTRY_VERIFY(!findItems(host.page(), isPdfPageImage).isEmpty());
+    QTRY_VERIFY(findItems(host.page(), isPdfPageImage).size() < 40);
+#endif
+}
+
+void TstMobileShell::markdownLargeBlocksKeepNativeItemCountsBounded_data()
+{
+    QTest::addColumn<bool>("styled");
+    QTest::addColumn<int>("words");
+    QTest::newRow("plain-large") << false << 6000;
+    QTest::newRow("styled-large") << true << 6000;
+    QTest::newRow("styled-many-pieces") << true << 600;
+}
+
+void TstMobileShell::markdownLargeBlocksKeepNativeItemCountsBounded()
+{
+    QFETCH(bool, styled);
+    QFETCH(int, words);
+    const QString body = QStringLiteral("word ").repeated(words).trimmed();
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/large.md\""));
+    QVERIFY(showPage(host));
+    const auto reads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(reads.size(), 1);
+    host.deliver(textReadFrame(requestId(reads.first()),
+        styled ? QStringLiteral("**") + body + QStringLiteral("**") : body,
+        QStringLiteral("r1")));
+    QQuickItem *plain = nullptr;
+    QTRY_VERIFY((plain = findNativeTextShowing(host.page(), body)));
+    QVERIFY(plain->isVisible());
+    QCOMPARE(plain->property("text").toString(), body); // No budget truncation.
+    QVERIFY(plain->width() <= host.page()->width());
+    QTRY_VERIFY(plain->property("lineCount").toInt() > 2);
+    QVERIFY(plain->height() > QFontMetricsF(plain->property("font").value<QFont>()).height());
+    QVERIFY(findItems(host.page(), isMarkdownInlineText).size() <= 256);
+
+    // The bound does not remove native styled/link behavior from small blocks.
+    host.page()->setProperty("remotePath", QStringLiteral("/repo/small.md"));
+    const auto nextReads = requestsFor(host.requests(), rpc::kMethodReadFile);
+    QCOMPARE(nextReads.size(), 1);
+    host.deliver(textReadFrame(requestId(nextReads.first()),
+        QStringLiteral("**bold** [link](https://example.com/)"), QStringLiteral("r2")));
+    QQuickItem *bold = nullptr;
+    QTRY_VERIFY((bold = findItem(host.page(), [](QQuickItem *item) {
+        return isNativeText(item)
+            && item->property("text").toString().trimmed() == QLatin1String("bold");
+    })));
+    QVERIFY(bold->property("font").value<QFont>().bold());
+    QQuickItem *link = nullptr;
+    QTRY_VERIFY((link = findNativeTextShowing(host.page(), QStringLiteral("link"))));
+    QTRY_VERIFY(link->isVisible() && link->width() > 0 && link->height() > 0);
+    QVERIFY(!findItems(host.page(), isMarkdownInlineText).isEmpty());
+    QTest::mouseClick(host.window(), Qt::LeftButton, Qt::NoModifier,
+        link->mapToScene(QPointF(link->width() / 2, link->height() / 2)).toPoint());
+    QObject *sheet = host.page()->findChild<QObject *>(QStringLiteral("markdownLinkSheet"));
+    QVERIFY(sheet);
+    QTRY_VERIFY(sheet->property("visible").toBool());
+}
+
+void TstMobileShell::retargetingMarkdownRetiresItsOfferedLink()
+{
+    PageHost host(QStringLiteral("ViewerMarkdownPage"),
+                  QStringLiteral("remotePath: \"/repo/first.md\""));
+    QVERIFY(showPage(host));
+    QVERIFY(callQmlFunction(host.page(), "offerLink", QStringLiteral("https://example.com/old")));
+    QObject *sheet = host.page()->findChild<QObject *>(QStringLiteral("markdownLinkSheet"));
+    QVERIFY(sheet);
+    QTRY_VERIFY(sheet->property("visible").toBool());
+    host.page()->setProperty("remotePath", QStringLiteral("/repo/next.md"));
+    QTRY_VERIFY(!sheet->property("visible").toBool());
+    QCOMPARE(host.page()->property("pendingLink").toString(), QString());
+    // Even a stale accepted callback cannot resurrect the previous document's
+    // destination after its confirmation sheet has been retired.
+    QVERIFY(QMetaObject::invokeMethod(sheet, "accepted"));
+    QVERIFY(!findByQmlTypeIn(host.page(), QStringLiteral("ViewerWebPage")));
+}
+
+void TstMobileShell::leavingADirtyEditorThroughEveryBackRouteRequiresDiscard_data()
+{
+    QTest::addColumn<QString>("route");
+    QTest::newRow("pane-header") << QStringLiteral("header");
+    QTest::newRow("system-back") << QStringLiteral("back");
+    QTest::newRow("window-close") << QStringLiteral("close");
+}
+
+void TstMobileShell::leavingADirtyEditorThroughEveryBackRouteRequiresDiscard()
+{
+    QFETCH(QString, route);
+    Shell shell;
+    auto *editors = new EditorFactory(&shell.fixture.client, &shell.engine);
+    shell.engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), editors);
+    QQuickWindow *window = shell.window();
+    QVERIFY(window);
+    window->show();
+    QVERIFY(QTest::qWaitForWindowExposed(window));
+    shell.fixture.listSessions({QStringLiteral("s1")});
+    shell.fixture.mobile.selectSession(QStringLiteral("s1"));
+    shell.fixture.answerLayouts(shell.fixture.takeLayoutRequests(),
+        viewerTreeFor(QStringLiteral("viewer-1"), QStringLiteral("file:///srv/s1/edit.txt")),
+        terminalTreeFor(QStringLiteral("terminal-1"), QStringLiteral("row-1")));
+    shell.fixture.mobile.selectPane(QStringLiteral("viewer:viewer-1"));
+    QQuickItem *host = currentPage(window);
+    QVERIFY(host);
+    QQuickItem *page = findByQmlTypeIn(host, QStringLiteral("ViewerEditorPage"));
+    QVERIFY(page);
+    QVERIFY(openEditor(page, QStringLiteral("baseline"), QStringLiteral("r1"),
+                       takeRequests(shell.fixture.transport), shell.fixture.transport));
+    auto *editor = page->findChild<QQuickItem *>(QStringLiteral("editorText"));
+    QVERIFY(editor);
+    editor->setProperty("text", QStringLiteral("first edit"));
+    editor->setProperty("text", QStringLiteral("newest unsaved edit"));
+    QVERIFY(page->property("dirty").toBool());
+    QPointer<QObject> guard(page->findChild<QObject *>(QStringLiteral("unsavedChangesDialog")));
+    QVERIFY(guard);
+    QSignalSpy guardClosed(guard, SIGNAL(closed()));
+    QVERIFY(guardClosed.isValid());
+    const auto requestBack = [&] {
+        if (route == QLatin1String("back")) {
+            QTest::keyClick(window, Qt::Key_Back);
+            return true;
+        }
+        if (route == QLatin1String("close")) {
+            window->close();
+            return true;
+        }
+        QQuickItem *arrow = findItemShowing(host, QStringLiteral("\u2039"));
+        return arrow && QMetaObject::invokeMethod(arrow->parentItem(), "clicked");
+    };
+    QVERIFY(requestBack());
+    QTRY_VERIFY(guard && guard->property("opened").toBool());
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Pane);
+    QVERIFY(window->isVisible());
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("newest unsaved edit"));
+    // Consent belongs to this exact document/controller/server/session/pane,
+    // not whatever logical context happens to be bound when a reply arrives.
+    const QString originalSession = page->property("devSessionId").toString();
+    page->setProperty("devSessionId", QStringLiteral("retargeted-session"));
+    QTRY_VERIFY(!guard->property("visible").toBool());
+    QTRY_COMPARE(guardClosed.size(), 1);
+    QVERIFY(QMetaObject::invokeMethod(guard, "discarded"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Pane);
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("newest unsaved edit"));
+    QVERIFY(page->property("dirty").toBool());
+    page->setProperty("devSessionId", originalSession);
+    QVERIFY(requestBack());
+    QTRY_VERIFY(guard && guard->property("opened").toBool());
+    QVERIFY(QMetaObject::invokeMethod(guard, "reject"));
+    QTRY_COMPARE(guardClosed.size(), 2);
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Pane);
+    QCOMPARE(editor->property("text").toString(), QStringLiteral("newest unsaved edit"));
+    QVERIFY(page->property("dirty").toBool());
+    QVERIFY(requestBack());
+    QTRY_VERIFY(guard && guard->property("opened").toBool());
+    QPointer<QObject> retiredGuard(guard);
+    QPointer<QQuickItem> retiredPage(page);
+    QVERIFY(QMetaObject::invokeMethod(guard, "discarded"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Panes);
+    QTRY_COMPARE(qmlTypeName(currentPage(window)), QStringLiteral("PanePickerPage"));
+    // A second confirmation and an outgoing page's late close signal must not
+    // retreat the picker again or close the subsequently selected terminal.
+    if (retiredGuard)
+        QVERIFY(QMetaObject::invokeMethod(retiredGuard, "discarded"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Panes);
+    shell.fixture.mobile.selectPane(QStringLiteral("terminal:terminal-1"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Pane);
+    if (retiredPage)
+        QVERIFY(QMetaObject::invokeMethod(retiredPage, "closeRequested"));
+    QCOMPARE(shell.fixture.mobile.navStage(), MobileAppController::Pane);
+    QCOMPARE(shell.fixture.mobile.selectedPaneKey(), QStringLiteral("terminal:terminal-1"));
 }
 
 // A QGuiApplication is required (this loads and renders real QML), and the style

@@ -16,10 +16,14 @@
 #include "AppController.h"
 #include "CodeharbordClient.h"
 #include "EditorFactory.h"
+#include "EditorController.h"
 #include "ViewerModel.h"
 #include "ViewerProfiles.h"
 #include "ViewerCommandService.h"
 #include "RpcTypes.h"
+#include "SessionLayouts.h"
+#include "SessionBootstrap.h"
+#include "UiStateStore.h"
 
 #include <QtTest>
 
@@ -36,16 +40,21 @@
 #include <QQmlComponent>
 #include <QQmlContext>
 #include <QJsonDocument>
+#include <QJsonArray>
+#include <QJSValue>
 #include <QJsonObject>
 #include <QQmlError>
 #include <QQmlExpression>
+#include <QPointer>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QSet>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QUrl>
+#include <QVariant>
 #include <QVariantList>
 #include <QVariantMap>
 #include <QtQuickControls2/QQuickStyle>
@@ -59,6 +68,20 @@ namespace {
 // Resource prefix produced by qt_add_qml_module(URI CodeHarbor) — the very URL
 // the shipped binary resolves loadFromModule("CodeHarbor", "Main") to.
 constexpr auto kModuleRoot = "qrc:/qt/qml/CodeHarbor/";
+
+QString checkedTemporaryRoot(const QTemporaryDir &directory)
+{
+    if (!directory.isValid() || directory.path().isEmpty())
+        qFatal("Cannot allocate private QML settings/profile root: %s", qPrintable(directory.errorString()));
+    return directory.path();
+}
+
+QObject *qmlObject(const QVariant &value)
+{
+    if (QObject *object = value.value<QObject *>())
+        return object;
+    return value.value<QJSValue>().toQObject();
+}
 
 QUrl moduleUrl(const QString &file)
 {
@@ -382,6 +405,31 @@ private:
     QSet<QString> m_observedIds;
 };
 
+// Controls only publication of accepted peer identity. Main's consumers,
+// AppController's remaining state and the actual editor graph stay real.
+class AcceptedIdentityController : public ch::AppController
+{
+    Q_OBJECT
+    Q_PROPERTY(QString acceptedServerId READ acceptedIdentity NOTIFY acceptedIdentityChanged)
+
+public:
+    using ch::AppController::AppController;
+    QString acceptedIdentity() const { return m_acceptedIdentity; }
+    void setAcceptedIdentity(const QString &identity)
+    {
+        if (m_acceptedIdentity == identity)
+            return;
+        m_acceptedIdentity = identity;
+        emit acceptedIdentityChanged();
+    }
+
+signals:
+    void acceptedIdentityChanged();
+
+private:
+    QString m_acceptedIdentity;
+};
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -394,8 +442,11 @@ private:
     // Declared FIRST so they are destroyed LAST: the engine (declared below)
     // must go down first, otherwise the QML tree unbinds against dangling
     // context objects and floods the log with "property of null" TypeErrors.
+    QTemporaryDir m_stateDir;
+    const QString m_stateRoot = checkedTemporaryRoot(m_stateDir);
     ch::CodeharbordClient m_client;
     ch::AgentStatusMonitor m_monitor;
+    ch::SessionBootstrap m_bootstrap;
     ch::AppController m_controller;
     ch::ViewerProfiles m_profiles;
     ch::ViewerModel m_viewers;
@@ -415,15 +466,18 @@ public:
     ch::ViewerCommandService &viewerCommands() { return m_viewerCommands; }
     ch::CodeharbordClient &client() { return m_client; }
     ch::AppController &controller() { return m_controller; }
+    ch::SessionBootstrap &bootstrap() { return m_bootstrap; }
 
     ShellFixture()
-        : m_controller(&m_client)
-        , m_profiles(&m_client)
+        : m_bootstrap(nullptr, &m_client, &m_monitor)
+        , m_controller(&m_client, nullptr, m_stateRoot + QStringLiteral("/ui.ini"))
+        , m_profiles(&m_client, m_stateRoot + QStringLiteral("/webengine"))
         , m_viewers(&m_client)
         , m_editorFactory(&m_client)
         , m_viewerCommands(&m_client)
     {
         m_controller.setAgentMonitor(&m_monitor);
+        m_controller.setEditorFactory(&m_editorFactory);
         m_viewers.setProfiles(&m_profiles);
 
         m_controller.setViewerCommands(&m_viewerCommands);
@@ -572,8 +626,14 @@ private slots:
     void anAgentCommandForAnotherSessionIsRefused();
     void agentPathsBecomeAbsoluteRemoteFileUrls();
     void theAgentPaneInventoryReadsTheLayoutTree();
+    void agentCommandsFillAnEmptiedViewerRegion_data();
+    void agentCommandsFillAnEmptiedViewerRegion();
     void workspaceExitRequiresExplicitDiscard();
     void windowCloseKeepsDirtyEditorsAlive();
+    void authoritativeArchiveRetainsEditorsBeforeSessionNotification_data();
+    void authoritativeArchiveRetainsEditorsBeforeSessionNotification();
+    void workspaceDiscardRejectsAcceptedPeerAndRetirementChanges_data();
+    void workspaceDiscardRejectsAcceptedPeerAndRetirementChanges();
     void connectionPromptsReplaceCoveringSheetsAndRetireOnStateChange();
 };
 
@@ -1040,6 +1100,63 @@ private:
     QByteArray m_sent;
 };
 
+// Cross the same accepted-identity/readiness boundary as production. Neither
+// selected IDs nor a manually forced layout-ready flag prove a peer's identity.
+bool acceptServer(ch::AppController &app, ch::CodeharbordClient &client,
+                  ch::SessionBootstrap &bootstrap, AgentTransport &transport,
+                  ch::SessionLayouts *layouts, const QString &serverId)
+{
+    app.setConnection(nullptr, &bootstrap, nullptr, layouts);
+    client.setTransport(&transport);
+    bootstrap.stateChanged(ch::SessionBootstrap::State::Wired);
+    bootstrap.wired();
+    int answered = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) != QStringLiteral("server.info"))
+            continue;
+        const QJsonObject info{
+            {QStringLiteral("name"), QStringLiteral("codeharbord")},
+            {QStringLiteral("version"), QStringLiteral(CODEHARBOR_VERSION)},
+            {QStringLiteral("schemaVersion"), ch::AppController::kMinimumServerSchemaVersion},
+            {QStringLiteral("serverId"), serverId},
+            {QStringLiteral("controlSocket"), QStringLiteral("/run/codeharbor/control-fixture.sock")},
+            {QStringLiteral("agentSocket"), QStringLiteral("/run/codeharbor/agent-fixture.sock")},
+            {QStringLiteral("recoveryDir"), QString()}};
+        transport.deliver(QJsonDocument(QJsonObject{
+            {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+            {QStringLiteral("id"), request.value(QStringLiteral("id"))},
+            {QStringLiteral("result"), info}}).toJson(QJsonDocument::Compact) + '\n');
+        ++answered;
+    }
+    return answered == 1 && app.serverId() == serverId
+        && app.acceptedServerId() == serverId && (!layouts || layouts->workspaceReady());
+}
+
+bool acceptFixtureServer(ShellFixture &fixture, AgentTransport &transport,
+                         ch::SessionLayouts *layouts, const QString &serverId)
+{
+    return acceptServer(fixture.controller(), fixture.client(), fixture.bootstrap(),
+                        transport, layouts, serverId);
+}
+
+QJsonArray fixtureWorkspace(const QString &serverId, const QString &sessionId, bool archived = false)
+{
+    const QJsonObject session{
+        {QStringLiteral("id"), sessionId}, {QStringLiteral("serverId"), serverId},
+        {QStringLiteral("groupId"), QStringLiteral("group")},
+        {QStringLiteral("name"), sessionId}, {QStringLiteral("repositoryRoot"), QString()},
+        {QStringLiteral("defaultWorkingDirectory"), QJsonValue(QJsonValue::Null)},
+        {QStringLiteral("taskDescription"), QJsonValue(QJsonValue::Null)},
+        {QStringLiteral("position"), 0}, {QStringLiteral("archived"), archived},
+        {QStringLiteral("pinned"), false}, {QStringLiteral("viewerPanes"), QJsonArray{}},
+        {QStringLiteral("terminalPanes"), QJsonArray{}}, {QStringLiteral("layouts"), QJsonObject{}}};
+    return QJsonArray{QJsonObject{
+        {QStringLiteral("id"), QStringLiteral("group")}, {QStringLiteral("serverId"), serverId},
+        {QStringLiteral("name"), QStringLiteral("Group")}, {QStringLiteral("position"), 0},
+        {QStringLiteral("collapsed"), false}, {QStringLiteral("sessions"), QJsonArray{session}}}};
+}
+
 // What Main.qml answered one command with.
 struct AgentAnswer {
     bool answered = false;
@@ -1100,6 +1217,556 @@ AgentAnswer askViewer(AgentTransport &transport, const QString &devSessionId,
 }
 
 } // namespace
+
+void TstQmlLoad::agentCommandsFillAnEmptiedViewerRegion_data()
+{
+    QTest::addColumn<QString>("operation");
+    QTest::addColumn<bool>("newPane");
+    QTest::newRow("open") << QStringLiteral("open") << false;
+    QTest::newRow("open-new-pane") << QStringLiteral("open") << true;
+    QTest::newRow("split") << QStringLiteral("split") << false;
+}
+
+void TstQmlLoad::agentCommandsFillAnEmptiedViewerRegion()
+{
+    QFETCH(QString, operation);
+    QFETCH(bool, newPane);
+    ShellFixture fixture;
+    AgentTransport transport;
+    auto &controller = fixture.controller();
+    auto *layouts = new ch::SessionLayouts(controller.workspaceDb(), controller.uiState(),
+                                           &controller);
+    QVERIFY(acceptFixtureServer(fixture, transport, layouts, QStringLiteral("placeholder-test")));
+    controller.refresh();
+    const auto deliverResult = [&transport](const QJsonValue &id, const QJsonValue &result) {
+        transport.deliver(QJsonDocument(QJsonObject{
+            {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+            {QStringLiteral("id"), id}, {QStringLiteral("result"), result}})
+                              .toJson(QJsonDocument::Compact) + '\n');
+    };
+    const QJsonArray groups = fixtureWorkspace(controller.serverId(), QStringLiteral("session"));
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) == QStringLiteral("workspace.list"))
+            deliverResult(request.value(QStringLiteral("id")), groups);
+    }
+    controller.activateSession(QStringLiteral("session"));
+    QCOMPARE(controller.activeSessionId(), QStringLiteral("session"));
+    const QJsonObject placeholder{{QStringLiteral("type"), QStringLiteral("leaf")},
+                                  {QStringLiteral("paneId"), QString()}};
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) == QStringLiteral("workspace.getLayout"))
+            deliverResult(request.value(QStringLiteral("id")),
+                          QJsonObject{{QStringLiteral("id"), QStringLiteral("layout")},
+                                      {QStringLiteral("tree"), placeholder}});
+    }
+    QVERIFY(layouts->viewerTree().isValid());
+    QCOMPARE(layouts->viewerTree().toMap(), placeholder.toVariantMap());
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    settle();
+    QVariantMap args{{QStringLiteral("url"), QStringLiteral("/target.bin")},
+                     {QStringLiteral("kind"), QStringLiteral("binary")},
+                     {QStringLiteral("orientation"), QStringLiteral("horizontal")},
+                     {QStringLiteral("newPane"), newPane}};
+    QVariantMap missing = args;
+    missing.insert(QStringLiteral("pane"), QStringLiteral("viewer-missing"));
+    const AgentAnswer refused = askViewer(transport, QStringLiteral("session"), operation, missing);
+    QVERIFY(refused.answered);
+    QVERIFY(!refused.ok);
+    QCOMPARE(refused.code, QStringLiteral("unknown_pane"));
+    QCOMPARE(layouts->viewerTree().toMap(), placeholder.toVariantMap());
+
+    const AgentAnswer answer = askViewer(transport, QStringLiteral("session"), operation, args);
+    QVERIFY(answer.answered);
+    QVERIFY2(answer.ok, qPrintable(answer.code));
+    const QString created = answer.data.value(QStringLiteral("paneId")).toString();
+    QVERIFY(!created.isEmpty());
+    const QVariantMap tree = layouts->viewerTree().toMap();
+    QCOMPARE(tree.value(QStringLiteral("paneId")).toString(), created);
+    QVERIFY(tree.value(QStringLiteral("children")).toList().isEmpty());
+    if (operation == QLatin1String("open"))
+        QCOMPARE(tree.value(QStringLiteral("url")).toString(), QStringLiteral("file:///target.bin"));
+    const AgentAnswer inventory = askViewer(transport, QStringLiteral("session"),
+                                             QStringLiteral("list"), {});
+    QVERIFY(inventory.ok);
+    const QVariantList panes = inventory.data.value(QStringLiteral("panes")).toList();
+    QCOMPARE(panes.size(), 1);
+    QCOMPARE(panes.constFirst().toMap().value(QStringLiteral("paneId")).toString(), created);
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::authoritativeArchiveRetainsEditorsBeforeSessionNotification_data()
+{
+    QTest::addColumn<bool>("closeWithoutActiveSession");
+    QTest::newRow("palette-close-without-active-session") << true;
+    QTest::newRow("retention-across-new-owner") << false;
+}
+
+void TstQmlLoad::authoritativeArchiveRetainsEditorsBeforeSessionNotification()
+{
+    QFETCH(bool, closeWithoutActiveSession);
+    ShellFixture fixture;
+    AgentTransport transport;
+    auto &app = fixture.controller();
+    auto *layouts = new ch::SessionLayouts(app.workspaceDb(), app.uiState(), &app);
+    QVERIFY(acceptFixtureServer(fixture, transport, layouts, QStringLiteral("archive-retirement")));
+    const auto deliverResult = [&transport](const QJsonValue &id, const QJsonValue &result) {
+        transport.deliver(QJsonDocument(QJsonObject{
+            {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+            {QStringLiteral("id"), id}, {QStringLiteral("result"), result}})
+                              .toJson(QJsonDocument::Compact) + '\n');
+    };
+    const auto publishWorkspace = [&](const QString &sessionId, bool archived) {
+        app.refresh();
+        bool answered = false;
+        const QJsonArray groups = fixtureWorkspace(app.serverId(), sessionId, archived);
+        for (const QByteArray &line : transport.takeSent().split('\n')) {
+            const QJsonObject request = QJsonDocument::fromJson(line).object();
+            if (request.value(QStringLiteral("method")).toString() == QStringLiteral("workspace.list")) {
+                answered = true;
+                deliverResult(request.value(QStringLiteral("id")), groups);
+            }
+        }
+        return answered;
+    };
+    const QJsonObject placeholder{{QStringLiteral("type"), QStringLiteral("leaf")},
+                                  {QStringLiteral("paneId"), QString()}};
+    const auto publishLayouts = [&](const QString &viewerUrl) {
+        int answered = 0;
+        for (const QByteArray &line : transport.takeSent().split('\n')) {
+            const QJsonObject request = QJsonDocument::fromJson(line).object();
+            if (request.value(QStringLiteral("method")).toString() != QStringLiteral("workspace.getLayout"))
+                continue;
+            const bool viewer = request.value(QStringLiteral("params")).toObject()
+                .value(QStringLiteral("region")).toString() == QStringLiteral("viewer");
+            const QJsonObject tree = viewer ? QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("leaf")},
+                {QStringLiteral("paneId"), QStringLiteral("viewer-1")},
+                {QStringLiteral("url"), viewerUrl}, {QStringLiteral("children"), QJsonArray{}}}
+                : placeholder;
+            deliverResult(request.value(QStringLiteral("id")),
+                          QJsonObject{{QStringLiteral("id"), QStringLiteral("layout")},
+                                      {QStringLiteral("tree"), tree}});
+            ++answered;
+        }
+        return answered;
+    };
+    QVERIFY(publishWorkspace(QStringLiteral("session-old"), false));
+    app.activateSession(QStringLiteral("session-old"));
+    QCOMPARE(app.activeSessionId(), QStringLiteral("session-old"));
+    QCOMPARE(publishLayouts(QStringLiteral("file:///old/retained.txt")), 2);
+    fixture.engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!fixture.engine.rootObjects().isEmpty());
+    QObject *root = fixture.engine.rootObjects().constFirst();
+    QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
+    QVERIFY(region);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardWindow"), root);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
+    const auto evaluate = [&](const QString &script) {
+        QQmlExpression expression(fixture.engine.rootContext(), root, script);
+        const QVariant value = expression.evaluate();
+        if (expression.hasError())
+            fixture.engineWarnings.append(expression.error().toString());
+        return value;
+    };
+    settle();
+    QObject *pane = nullptr;
+    QTRY_VERIFY((pane = qmlObject(evaluate(QStringLiteral("guardRegion.paneCache['viewer-1']")))));
+    QObject *editor = nullptr;
+    ch::EditorController *controller = nullptr;
+    QTRY_VERIFY((editor = qmlObject(pane->property("documentObject"))));
+    QTRY_VERIFY((controller = qobject_cast<ch::EditorController *>(
+        qmlObject(pane->property("documentController")))));
+    auto *paneItem = qobject_cast<QQuickItem *>(pane);
+    QVERIFY(paneItem);
+    QTRY_VERIFY(paneItem->width() > 0 && paneItem->height() > 0);
+    // Complete a real editable read, watch and permission response before
+    // editing. An error/no-transport buffer is not an accepted native document.
+    int fileReads = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) != QStringLiteral("file.readFile"))
+            continue;
+        deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+            {QStringLiteral("path"), QStringLiteral("/old/retained.txt")},
+            {QStringLiteral("encoding"), QStringLiteral("utf-8")},
+            {QStringLiteral("content"), QStringLiteral("original native document")},
+            {QStringLiteral("revision"), QStringLiteral("fixture-revision-1")},
+            {QStringLiteral("truncated"), false}});
+        ++fileReads;
+    }
+    QCOMPARE(fileReads, 1);
+    int fileWatches = 0;
+    int fileStats = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        const QString method = request.value(QStringLiteral("method")).toString();
+        if (method == QStringLiteral("file.watch")) {
+            deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+                {QStringLiteral("subscriptionId"), QStringLiteral("fixture-watch-1")}});
+            ++fileWatches;
+        } else if (method == QStringLiteral("file.stat")) {
+            deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+                {QStringLiteral("path"), QStringLiteral("/old/retained.txt")},
+                {QStringLiteral("kind"), QStringLiteral("file")},
+                {QStringLiteral("size"), 24}, {QStringLiteral("mode"), 0644},
+                {QStringLiteral("writable"), true},
+                {QStringLiteral("revision"), QStringLiteral("fixture-revision-1")}});
+            ++fileStats;
+        }
+    }
+    QCOMPARE(fileWatches, 1);
+    QCOMPARE(fileStats, 1);
+    QCOMPARE(controller->fileState(), QStringLiteral("clean"));
+    QVERIFY(!controller->readOnly());
+    QCOMPARE(controller->revision(), QStringLiteral("fixture-revision-1"));
+    controller->reportDirty(true, controller->revision());
+    QVERIFY(controller->dirty());
+    QVERIFY(pane->property("contentDirty").toBool());
+    QPointer<QObject> retainedPane(pane);
+    QPointer<QObject> retainedEditor(editor);
+    QPointer<ch::EditorController> retainedController(controller);
+    evaluate(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'obsolete-workspace-action'; })"));
+    QVERIFY(qmlObject(root->property("workspaceDialog")));
+    QStringList retirementOrder;
+    QObject retirementObserver;
+    QObject::connect(layouts, &ch::SessionLayouts::viewerTreeChanged, &retirementObserver, [&] {
+        if (layouts->viewerTree().isNull())
+            retirementOrder.append(QStringLiteral("tree-cleared"));
+    });
+    QObject::connect(&app, &ch::AppController::activeSessionChanged, &retirementObserver, [&] {
+        if (app.activeSessionId().isEmpty())
+            retirementOrder.append(QStringLiteral("session-notified"));
+    });
+    QVERIFY(publishWorkspace(QStringLiteral("session-old"), true));
+    QVERIFY(app.activeSessionId().isEmpty());
+    QVERIFY(retirementOrder.indexOf(QStringLiteral("tree-cleared")) >= 0);
+    QVERIFY(retirementOrder.indexOf(QStringLiteral("tree-cleared"))
+            < retirementOrder.indexOf(QStringLiteral("session-notified")));
+    QTRY_VERIFY(region->property("contextRetired").toBool());
+    QVERIFY(!retainedPane.isNull() && !retainedEditor.isNull() && !retainedController.isNull());
+    QVERIFY(editor->property("serverContextRetired").toBool());
+    QCOMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///old/retained.txt")));
+    QTRY_VERIFY(paneItem->height() > 0);
+    // Native detachment preserves a locally editable document, not a read-only
+    // replacement. Only exact old-watch cleanup may cross the server boundary.
+    int detachedUnwatches = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        const QString method = request.value(QStringLiteral("method")).toString();
+        if (!method.startsWith(QStringLiteral("file.")))
+            continue;
+        QCOMPARE(method, QStringLiteral("file.unwatch"));
+        QCOMPARE(request.value(QStringLiteral("params")).toObject()
+                     .value(QStringLiteral("subscriptionId")).toString(),
+                 QStringLiteral("fixture-watch-1"));
+        deliverResult(request.value(QStringLiteral("id")), QJsonObject{});
+        ++detachedUnwatches;
+    }
+    QCOMPARE(detachedUnwatches, 1);
+    QVERIFY(!controller->readOnly());
+    controller->reportDirty(false, controller->revision());
+    QVERIFY(!controller->dirty());
+    controller->reportContent(QStringLiteral("local edit after authoritative retirement"));
+    QVERIFY(controller->dirty());
+    QSignalSpy detachedSaveErrors(controller, &ch::EditorController::saveError);
+    controller->save(QStringLiteral("local edit after authoritative retirement"), controller->revision());
+    QCOMPARE(detachedSaveErrors.size(), 1);
+    QVERIFY(transport.takeSent().isEmpty());
+    // The old modal describes the retired workspace, not the current empty
+    // selection. Its stale acceptance must not destroy the retained RAM.
+    evaluate(QStringLiteral(
+        "(function() { var dialog = guardWindow.workspaceDialog;"
+        "dialog.standardButton(dialog.standardButtons & ~dialog.defaultButton).clicked(); })()"));
+    QVERIFY(root->property("title").toString() != QStringLiteral("obsolete-workspace-action"));
+    QVERIFY(!retainedPane.isNull() && !retainedController.isNull());
+    QTRY_VERIFY(!qmlObject(root->property("workspaceDialog")));
+
+    if (closeWithoutActiveSession) {
+        QVERIFY(app.activeSessionId().isEmpty());
+        transport.takeSent();
+        QSignalSpy remoteLayoutChange(layouts, &ch::SessionLayouts::viewerTreeChanged);
+        evaluate(QStringLiteral(
+            "(function() { var command = guardWindow.paletteCommands.find("
+            "item => item.id === 'pane.close.viewer');"
+            "if (!command) throw new Error('missing viewer close command');"
+            "command.invoke(); })()"));
+        QObject *closeDialog = findNamed(root, QStringLiteral("viewerCloseUnsavedDialog"));
+        QVERIFY(closeDialog && closeDialog->property("visible").toBool());
+        QVERIFY(app.activeSessionId().isEmpty());
+        QVERIFY(!retainedPane.isNull() && !retainedController.isNull());
+        QVERIFY(QMetaObject::invokeMethod(closeDialog, "accept"));
+        QTRY_VERIFY(retainedPane.isNull());
+        QTRY_VERIFY(retainedEditor.isNull());
+        QTRY_VERIFY(retainedController.isNull());
+        QTRY_VERIFY(!region->property("contextRetired").toBool());
+        QVERIFY(app.activeSessionId().isEmpty());
+        QVERIFY(layouts->viewerTree().isNull());
+        QCOMPARE(remoteLayoutChange.size(), 0);
+        for (const QByteArray &line : transport.takeSent().split('\n')) {
+            const QString method = QJsonDocument::fromJson(line).object()
+                .value(QStringLiteral("method")).toString();
+            QVERIFY(method != QStringLiteral("workspace.setLayout"));
+            QVERIFY(method != QStringLiteral("workspace.deleteViewerPane"));
+        }
+        QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+        return;
+    }
+
+    QVERIFY(publishWorkspace(QStringLiteral("session-new"), false));
+    app.activateSession(QStringLiteral("session-new"));
+    QCOMPARE(publishLayouts(QStringLiteral("file:///new/current.bin")), 2);
+    QCOMPARE(app.activeSessionId(), QStringLiteral("session-new"));
+    const QVariant currentAuthority = layouts->viewerTree();
+    app.uiState()->setSelectedPane(QStringLiteral("session-new"), QStringLiteral("new-owner-choice"));
+    QVERIFY(QMetaObject::invokeMethod(region, "noteFocus",
+                                      Q_ARG(QVariant, QStringLiteral("viewer-1"))));
+    QVERIFY(QMetaObject::invokeMethod(root, "armFocusRestore"));
+    QVERIFY(QMetaObject::invokeMethod(root, "tryRestoreFocus"));
+    QCOMPARE(app.uiState()->selectedPane(QStringLiteral("session-new")),
+             QStringLiteral("new-owner-choice"));
+    const AgentAnswer inventory = askViewer(transport, QStringLiteral("session-new"),
+                                             QStringLiteral("list"), {});
+    QVERIFY(inventory.ok);
+    QCOMPARE(inventory.data.value(QStringLiteral("focusedPaneId")).toString(), QString());
+    const QVariantList panes = inventory.data.value(QStringLiteral("panes")).toList();
+    QCOMPARE(panes.size(), 1);
+    QCOMPARE(panes.constFirst().toMap().value(QStringLiteral("url")).toString(),
+             QStringLiteral("file:///new/current.bin"));
+    for (const QString &op : {QStringLiteral("focus"), QStringLiteral("open"),
+                              QStringLiteral("reload"), QStringLiteral("close"),
+                              QStringLiteral("split")}) {
+        const AgentAnswer answer = askViewer(transport, QStringLiteral("session-new"), op,
+            {{QStringLiteral("pane"), QStringLiteral("viewer-1")},
+             {QStringLiteral("url"), QStringLiteral("/new/requested.bin")},
+             {QStringLiteral("orientation"), QStringLiteral("horizontal")}});
+        QVERIFY(answer.answered);
+        QVERIFY(!answer.ok);
+        QCOMPARE(answer.code, QStringLiteral("unsaved_changes"));
+        QCOMPARE(layouts->viewerTree(), currentAuthority);
+        QCOMPARE(qmlObject(evaluate(QStringLiteral("guardRegion.paneCache['viewer-1']"))), pane);
+    }
+    transport.takeSent();
+    QSignalSpy saveErrors(controller, &ch::EditorController::saveError);
+    controller->save(QStringLiteral("retired text"), controller->revision());
+    QCOMPARE(saveErrors.size(), 1);
+    QVERIFY(transport.takeSent().isEmpty());
+    QSignalSpy remoteLayoutChange(layouts, &ch::SessionLayouts::viewerTreeChanged);
+    QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+    QObject *closeDialog = findNamed(root, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(closeDialog && closeDialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(closeDialog, "accept"));
+    QTRY_VERIFY(retainedPane.isNull());
+    QTRY_VERIFY(retainedEditor.isNull());
+    QTRY_VERIFY(retainedController.isNull());
+    QTRY_VERIFY(!region->property("contextRetired").toBool());
+    QCOMPARE(layouts->viewerTree(), currentAuthority);
+    QCOMPARE(remoteLayoutChange.size(), 0);
+    QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
+}
+
+void TstQmlLoad::workspaceDiscardRejectsAcceptedPeerAndRetirementChanges_data()
+{
+    QTest::addColumn<QString>("nextAcceptedIdentity");
+    QTest::addColumn<bool>("retireBeforeAcceptance");
+    QTest::newRow("accepted-peer-replaced") << QStringLiteral("server-B") << true;
+    QTest::newRow("accepted-peer-cleared-retired") << QString() << true;
+    QTest::newRow("accepted-peer-cleared-reconnect-gap") << QString() << false;
+    QTest::newRow("same-peer-document-retired") << QStringLiteral("server-A") << true;
+}
+
+void TstQmlLoad::workspaceDiscardRejectsAcceptedPeerAndRetirementChanges()
+{
+    QFETCH(QString, nextAcceptedIdentity);
+    QFETCH(bool, retireBeforeAcceptance);
+    QTemporaryDir directory;
+    const QString privateRoot = checkedTemporaryRoot(directory);
+    AgentTransport transport;
+    ch::CodeharbordClient client;
+    ch::AgentStatusMonitor monitor;
+    ch::SessionBootstrap bootstrap(nullptr, &client, &monitor);
+    AcceptedIdentityController app(&client, nullptr, privateRoot + QStringLiteral("/ui.ini"));
+    app.setAgentMonitor(&monitor);
+    ch::ViewerProfiles profiles(&client, privateRoot + QStringLiteral("/webengine"));
+    ch::ViewerModel viewers(&client);
+    viewers.setProfiles(&profiles);
+    ch::EditorFactory factory(&client);
+    ch::ViewerCommandService commands(&client);
+    app.setViewerCommands(&commands);
+    app.setEditorFactory(&factory);
+    QVERIFY(acceptServer(app, client, bootstrap, transport, nullptr, QStringLiteral("server-A")));
+    QCOMPARE(app.acceptedServerId(), QStringLiteral("server-A"));
+    // Only the later accepted-property publication is controlled. The initial
+    // peer and native file I/O cross real AppController/server.info boundaries.
+    app.setAcceptedIdentity(app.acceptedServerId());
+    const auto deliverResult = [&transport](const QJsonValue &id, const QJsonValue &result) {
+        transport.deliver(QJsonDocument(QJsonObject{
+            {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+            {QStringLiteral("id"), id}, {QStringLiteral("result"), result}})
+                              .toJson(QJsonDocument::Compact) + '\n');
+    };
+    int workspaceLists = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) != QStringLiteral("workspace.list"))
+            continue;
+        deliverResult(request.value(QStringLiteral("id")), QJsonArray{});
+        ++workspaceLists;
+    }
+    QCOMPARE(workspaceLists, 1);
+    QStringList engineWarnings;
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("app"), &app);
+    engine.rootContext()->setContextProperty(QStringLiteral("viewers"), &viewers);
+    engine.rootContext()->setContextProperty(QStringLiteral("agentMonitor"), &monitor);
+    engine.rootContext()->setContextProperty(QStringLiteral("editorFactory"), &factory);
+    QObject::connect(&engine, &QQmlEngine::warnings, &engine,
+                     [&engineWarnings](const QList<QQmlError> &warnings) {
+        for (const QQmlError &warning : warnings)
+            engineWarnings.append(warning.toString());
+    });
+    engine.load(moduleUrl(QStringLiteral("Main.qml")));
+    QVERIFY(!engine.rootObjects().isEmpty());
+    QObject *root = engine.rootObjects().constFirst();
+    auto *window = qobject_cast<QQuickWindow *>(root);
+    QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
+    QVERIFY(window && region);
+    engine.rootContext()->setContextProperty(QStringLiteral("guardWindow"), root);
+    engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
+    const auto evaluate = [&](const QString &script) {
+        QQmlExpression expression(engine.rootContext(), root, script);
+        const QVariant result = expression.evaluate();
+        if (expression.hasError())
+            engineWarnings.append(expression.error().toString());
+        return result;
+    };
+    region->setProperty("node", QVariantMap{
+        {QStringLiteral("paneId"), QStringLiteral("viewer-1")},
+        {QStringLiteral("url"), QStringLiteral("file:///old/retained.txt")},
+        {QStringLiteral("children"), QVariantList{}}});
+    QObject *pane = nullptr;
+    QTRY_VERIFY((pane = qmlObject(evaluate(
+        QStringLiteral("guardRegion.paneCache['viewer-1']")))));
+    ch::EditorController *controller = nullptr;
+    QTRY_VERIFY((controller = qobject_cast<ch::EditorController *>(
+        qmlObject(pane->property("documentController")))));
+    auto *paneItem = qobject_cast<QQuickItem *>(pane);
+    QVERIFY(paneItem);
+    QTRY_VERIFY(paneItem->width() > 0 && paneItem->height() > 0);
+    int fileReads = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        if (request.value(QStringLiteral("method")) != QStringLiteral("file.readFile"))
+            continue;
+        deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+            {QStringLiteral("path"), QStringLiteral("/old/retained.txt")},
+            {QStringLiteral("encoding"), QStringLiteral("utf-8")},
+            {QStringLiteral("content"), QStringLiteral("accepted native baseline")},
+            {QStringLiteral("revision"), QStringLiteral("guard-revision-1")},
+            {QStringLiteral("truncated"), false}});
+        ++fileReads;
+    }
+    QCOMPARE(fileReads, 1);
+    int fileWatches = 0;
+    int fileStats = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        const QString method = request.value(QStringLiteral("method")).toString();
+        if (method == QStringLiteral("file.watch")) {
+            deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+                {QStringLiteral("subscriptionId"), QStringLiteral("guard-watch-1")}});
+            ++fileWatches;
+        } else if (method == QStringLiteral("file.stat")) {
+            deliverResult(request.value(QStringLiteral("id")), QJsonObject{
+                {QStringLiteral("path"), QStringLiteral("/old/retained.txt")},
+                {QStringLiteral("kind"), QStringLiteral("file")},
+                {QStringLiteral("size"), 24}, {QStringLiteral("mode"), 0644},
+                {QStringLiteral("writable"), true},
+                {QStringLiteral("revision"), QStringLiteral("guard-revision-1")}});
+            ++fileStats;
+        }
+    }
+    QCOMPARE(fileWatches, 1);
+    QCOMPARE(fileStats, 1);
+    QCOMPARE(controller->fileState(), QStringLiteral("clean"));
+    QCOMPARE(controller->revision(), QStringLiteral("guard-revision-1"));
+    QVERIFY(!controller->readOnly());
+    controller->reportDirty(true, controller->revision());
+    QVERIFY(controller->dirty());
+    QVERIFY(pane->property("contentDirty").toBool());
+    QVERIFY(!pane->property("contextRetired").toBool());
+    QPointer<QObject> retainedPane(pane);
+    QPointer<ch::EditorController> retainedController(controller);
+    evaluate(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'obsolete-peer-action'; })"));
+    QObject *dialog = qmlObject(root->property("workspaceDialog"));
+    QVERIFY(dialog && dialog->property("visible").toBool());
+    QCOMPARE(dialog->property("requestedAcceptedServerId").toString(), QStringLiteral("server-A"));
+    QCOMPARE(dialog->property("requestedGeneration").toDouble(), 0.0);
+    app.setAcceptedIdentity(nextAcceptedIdentity);
+    if (retireBeforeAcceptance && !region->property("contextRetired").toBool())
+        QVERIFY(QMetaObject::invokeMethod(region, "retainRetiredContext"));
+    QCOMPARE(region->property("contextRetired").toBool(), retireBeforeAcceptance);
+    QCOMPARE(app.serverId(), QStringLiteral("server-A"));
+    QVERIFY(app.activeSessionId().isEmpty());
+    QVERIFY(app.layouts() == nullptr); // Same generation and selected server throughout.
+    QCOMPARE(pane->property("documentServerId").toString(), QStringLiteral("server-A"));
+    evaluate(QStringLiteral(
+        "(function() { var dialog = guardWindow.workspaceDialog;"
+        "dialog.standardButton(dialog.standardButtons & ~dialog.defaultButton).clicked(); })()"));
+    QVERIFY(root->property("title").toString() != QStringLiteral("obsolete-peer-action"));
+    QVERIFY(!retainedPane.isNull() && !retainedController.isNull());
+    QTRY_VERIFY(!qmlObject(root->property("workspaceDialog")));
+    QCOMPARE(qmlObject(evaluate(QStringLiteral("guardRegion.paneCache['viewer-1']"))), pane);
+
+    // A fresh question about THESE already-retired objects remains valid
+    // offline. Empty accepted identity is explicit state, not missing proof.
+    controller->reportDirty(true, controller->revision()); // A local edit, never server I/O.
+    QVERIFY(controller->dirty());
+    if (!region->property("contextRetired").toBool())
+        QVERIFY(QMetaObject::invokeMethod(region, "retainRetiredContext"));
+    app.setAcceptedIdentity(QString());
+    int detachedUnwatches = 0;
+    for (const QByteArray &line : transport.takeSent().split('\n')) {
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        const QString method = request.value(QStringLiteral("method")).toString();
+        if (method.isEmpty())
+            continue;
+        QCOMPARE(method, QStringLiteral("file.unwatch"));
+        QCOMPARE(request.value(QStringLiteral("params")).toObject()
+                     .value(QStringLiteral("subscriptionId")).toString(),
+                 QStringLiteral("guard-watch-1"));
+        deliverResult(request.value(QStringLiteral("id")), QJsonObject{});
+        ++detachedUnwatches;
+    }
+    QCOMPARE(detachedUnwatches, 1);
+    QVERIFY(!controller->readOnly());
+    controller->reportContent(QStringLiteral("local edit before fresh offline consent"));
+    QVERIFY(controller->dirty());
+    QSignalSpy saveErrors(controller, &ch::EditorController::saveError);
+    controller->save(QStringLiteral("local edit before fresh offline consent"), controller->revision());
+    QCOMPARE(saveErrors.size(), 1);
+    QVERIFY(transport.takeSent().isEmpty());
+    client.setTransport(nullptr);
+    QVERIFY(!client.transport());
+    region->setProperty("node", QVariant());
+    QVERIFY(!window->close());
+    dialog = qmlObject(root->property("workspaceDialog"));
+    QVERIFY(dialog && dialog->property("visible").toBool());
+    QVERIFY(dialog->property("requestedAcceptedServerId").isValid());
+    QCOMPARE(dialog->property("requestedAcceptedServerId").toString(), QString());
+    evaluate(QStringLiteral(
+        "(function() { var dialog = guardWindow.workspaceDialog;"
+        "dialog.standardButton(dialog.standardButtons & ~dialog.defaultButton).clicked(); })()"));
+    QVERIFY(!window->isVisible());
+    QTRY_VERIFY(retainedPane.isNull());
+    QTRY_VERIFY(retainedController.isNull());
+    engineWarnings.append(takeLoggedQmlWarnings());
+    QVERIFY2(engineWarnings.isEmpty(), qPrintable(engineWarnings.join(QLatin1Char('\n'))));
+}
 
 void TstQmlLoad::everyAgentCommandIsAnswered()
 {
@@ -1287,40 +1954,44 @@ void TstQmlLoad::workspaceExitRequiresExplicitDiscard()
     QObject *root = fixture.engine.rootObjects().constFirst();
     settle();
     QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
-    QObject *dialog = findNamed(root, QStringLiteral("unsavedWorkspaceDialog"));
-    QVERIFY(region && dialog);
+    QVERIFY(region);
     fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardWindow"), root);
     fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
-    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardDialog"), dialog);
     const auto run = [&](const QString &script) {
         QQmlExpression expression(fixture.engine.rootContext(), root,
                                  QStringLiteral("(function() { %1 })()").arg(script));
         expression.evaluate();
         return expression.hasError() ? expression.error().toString() : QString();
     };
-    // The editor bridge is not involved in this shell test. Supply its existing
-    // cache contract, retaining all real panes so destruction stays observable.
-    QCOMPARE(run(QStringLiteral(
+    const auto activeDialog = [root] { return qmlObject(root->property("workspaceDialog")); };
+    // The shell guard owns consent, not the editor bridge. Its fixture exposes
+    // document identity and an observable local retirement, while real panes
+    // remain in the same cache and participate in the actual reset.
+    const QString seed = QStringLiteral(
         "guardRegion.paneCache['dirty-test'] = Qt.createQmlObject("
         "'import QtQuick; Item { objectName: \"dirtyShellEditor\"; "
-        "property bool contentDirty: true }', guardRegion);"
+        "property bool contentDirty: true; "
+        "property bool contextRetired: false; "
+        "property QtObject documentObject: QtObject {}; "
+        "property var documentController: null; "
+        "function retireServerContext() { contextRetired = true; contentDirty = false; } }', guardRegion);");
+    const QString discard = QStringLiteral(
+        "var dialog = guardWindow.workspaceDialog;"
+        "dialog.standardButton(dialog.standardButtons & ~dialog.defaultButton).clicked();");
+    QCOMPARE(run(seed + QStringLiteral(
         "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-B'; });")),
         QString());
     QObject *dirty = findNamed(root, QStringLiteral("dirtyShellEditor"));
-    QVERIFY(dirty);
-    QVERIFY(dialog->property("visible").toBool());
+    QVERIFY(dirty && activeDialog());
+    QVERIFY(activeDialog()->property("visible").toBool());
     QVERIFY(root->property("title").toString() != QStringLiteral("target-B"));
     auto *window = qobject_cast<QQuickWindow *>(root);
     QVERIFY(window);
     settle(80);
-    // Enter must choose Cancel, not discard; the dirty item remains alive.
-    QTest::keyClick(window, Qt::Key_Return);
-    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QTest::keyClick(window, Qt::Key_Return); // Cancel remains the safe default.
+    QTRY_VERIFY(!activeDialog());
     QVERIFY(root->property("title").toString() != QStringLiteral("target-B"));
     QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
-
-    // Exercise the real shell entry points, not just the shared helper. None
-    // may retire the workspace before this dialog's explicit discard choice.
     const QStringList exits{
         QStringLiteral("guardWindow.requestSessionActivation('other-session');"),
         QStringLiteral("guardWindow.requestServerConnect('other-profile');"),
@@ -1328,51 +1999,73 @@ void TstQmlLoad::workspaceExitRequiresExplicitDiscard()
         QStringLiteral("guardWindow.requestServerUpgrade('other-profile');")};
     for (const QString &exit : exits) {
         QCOMPARE(run(exit), QString());
-        QVERIFY(dialog->property("visible").toBool());
-        QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+        QVERIFY(activeDialog() && activeDialog()->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(activeDialog(), "reject"));
+        QTRY_VERIFY(!activeDialog());
         QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
     }
     QObject *settings = findNamed(root, QStringLiteral("settingsWindow"));
     QVERIFY(settings);
-    QVERIFY(QMetaObject::invokeMethod(settings, "connectRequested",
-                                     Q_ARG(QString, QStringLiteral("other-profile"))));
-    QVERIFY(dialog->property("visible").toBool());
-    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
-    QVERIFY(QMetaObject::invokeMethod(settings, "disconnectRequested"));
-    QVERIFY(dialog->property("visible").toBool());
-    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
-    QVERIFY(QMetaObject::invokeMethod(settings, "upgradeRequested",
-                                     Q_ARG(QString, QStringLiteral("other-profile"))));
-    QVERIFY(dialog->property("visible").toBool());
-    QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
-
+    for (const char *request : {"connectRequested", "disconnectRequested", "upgradeRequested"}) {
+        const bool called = QByteArray(request) == "disconnectRequested"
+            ? QMetaObject::invokeMethod(settings, request)
+            : QMetaObject::invokeMethod(settings, request,
+                                       Q_ARG(QString, QStringLiteral("other-profile")));
+        QVERIFY(called);
+        QVERIFY(activeDialog() && activeDialog()->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(activeDialog(), "reject"));
+        QTRY_VERIFY(!activeDialog());
+        QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+    }
+    // A replacement document in the same pane/context is NOT covered by the
+    // earlier question, even if session/generation have not changed.
     QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'stale-document'; });"
+        "guardRegion.paneCache['dirty-test'].documentObject = "
+        "Qt.createQmlObject('import QtQml; QtObject {}', guardRegion);") + discard), QString());
+    QTRY_VERIFY(!activeDialog());
+    QVERIFY(root->property("title").toString() != QStringLiteral("stale-document"));
+    QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+    QVERIFY(dirty->property("contentDirty").toBool());
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'unasked-buffer'; });"
+        "guardRegion.paneCache['extra-dirty'] = Qt.createQmlObject("
+        "'import QtQuick; Item { objectName: \"extraDirtyEditor\"; "
+        "property bool contentDirty: true }', guardRegion);") + discard), QString());
+    QTRY_VERIFY(!activeDialog());
+    QVERIFY(root->property("title").toString() != QStringLiteral("unasked-buffer"));
+    QVERIFY(findNamed(root, QStringLiteral("extraDirtyEditor")));
+    QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+    QCOMPARE(run(QStringLiteral(
+        "guardRegion.paneCache['extra-dirty'].destroy();"
+        "delete guardRegion.paneCache['extra-dirty'];")), QString());
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'stale-context'; });"
+        "guardWindow.workspaceDialog.requestedSessionId = 'retired-session';") + discard), QString());
+    QTRY_VERIFY(!activeDialog());
+    QVERIFY(root->property("title").toString() != QStringLiteral("stale-context"));
+    QCOMPARE(findNamed(root, QStringLiteral("dirtyShellEditor")), dirty);
+    // The old modal can emit a delayed discard in the same turn a fresh modal
+    // opens. It must neither invoke the new action nor consume its consent.
+    QCOMPARE(run(QStringLiteral(
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'obsolete-action'; });"
+        "var oldDialog = guardWindow.workspaceDialog;"
+        "oldDialog.reject();"
         "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-B'; });"
-        // A second intent cannot replace the operation the dialog describes.
-        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-C'; });"
-        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked();")),
+        "oldDialog.discarded();"
+        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'target-C'; });")),
         QString());
+    QVERIFY(activeDialog() && activeDialog()->property("visible").toBool());
+    QVERIFY(root->property("title").toString() != QStringLiteral("obsolete-action"));
+    QPointer<QObject> discarded(dirty);
+    QCOMPARE(run(discard), QString());
     QCOMPARE(root->property("title").toString(), QStringLiteral("target-B"));
-    QVERIFY(!dialog->property("visible").toBool());
-
-    QCOMPARE(run(QStringLiteral(
-        "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'stale-target'; });"
-        "guardWindow.pendingWorkspaceSessionId = 'retired-session';"
-        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked();")),
-        QString());
-    QCOMPARE(root->property("title").toString(), QStringLiteral("target-B"));
-    QVERIFY(!dialog->property("visible").toBool());
-    QCOMPARE(run(QStringLiteral(
-        "if (guardWindow.pendingWorkspaceAction !== null) throw new Error('retained action');")),
-        QString());
-    QCOMPARE(run(QStringLiteral(
-        "guardRegion.paneCache['dirty-test'].destroy();"
-        "delete guardRegion.paneCache['dirty-test'];")), QString());
+    QTRY_VERIFY(!activeDialog());
+    QTRY_VERIFY(discarded.isNull());
     QCOMPARE(run(QStringLiteral(
         "guardWindow.requestWorkspaceAction(function() { guardWindow.title = 'clean-target'; });")),
         QString());
     QCOMPARE(root->property("title").toString(), QStringLiteral("clean-target"));
-    QVERIFY(!dialog->property("visible").toBool());
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }
 
@@ -1385,29 +2078,33 @@ void TstQmlLoad::windowCloseKeepsDirtyEditorsAlive()
     settle();
     auto *window = qobject_cast<QQuickWindow *>(root);
     QObject *region = findNamed(root, QStringLiteral("viewerRegion"));
-    QObject *dialog = findNamed(root, QStringLiteral("unsavedWorkspaceDialog"));
-    QVERIFY(window && region && dialog);
+    QVERIFY(window && region);
+    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardWindow"), root);
     fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardRegion"), region);
-    fixture.engine.rootContext()->setContextProperty(QStringLiteral("guardDialog"), dialog);
     QQmlExpression inject(fixture.engine.rootContext(), root, QStringLiteral(
         "guardRegion.paneCache['dirty-test'] = Qt.createQmlObject("
         "'import QtQuick; Item { objectName: \"dirtyShellEditor\"; "
-        "property bool contentDirty: true }', guardRegion)"));
+        "property bool contentDirty: true; "
+        "property bool contextRetired: false; "
+        "function retireServerContext() { contextRetired = true; contentDirty = false; } }', guardRegion)"));
     inject.evaluate();
     QVERIFY2(!inject.hasError(), qPrintable(inject.error().toString()));
     QVERIFY(!window->close());
     QVERIFY(window->isVisible());
-    QVERIFY(dialog->property("visible").toBool());
+    QObject *dialog = qmlObject(root->property("workspaceDialog"));
+    QVERIFY(dialog && dialog->property("visible").toBool());
     QVERIFY(findNamed(root, QStringLiteral("dirtyShellEditor")));
     QVERIFY(QMetaObject::invokeMethod(dialog, "reject"));
+    QTRY_VERIFY(!qmlObject(root->property("workspaceDialog")));
     QVERIFY(window->isVisible());
     QVERIFY(!window->close());
     QQmlExpression discard(fixture.engine.rootContext(), root, QStringLiteral(
-        "guardDialog.standardButton(guardDialog.standardButtons & ~guardDialog.defaultButton).clicked()"));
+        "(function() { var dialog = guardWindow.workspaceDialog;"
+        "dialog.standardButton(dialog.standardButtons & ~dialog.defaultButton).clicked(); })()"));
     discard.evaluate();
     QVERIFY2(!discard.hasError(), qPrintable(discard.error().toString()));
     QVERIFY(!window->isVisible());
-    QVERIFY(!dialog->property("visible").toBool());
+    QTRY_VERIFY(!qmlObject(root->property("workspaceDialog")));
     QVERIFY2(fixture.allWarnings().isEmpty(), qPrintable(fixture.warningReport()));
 }
 

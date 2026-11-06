@@ -242,6 +242,27 @@ test("an ABSENT version means the current revision", () => {
     assert.equal(isRefusal(parsed), false);
 });
 
+test("a deeply nested unsupported version is refused without taking down the listener", { timeout: 2000 }, async () => {
+    const h = await harness();
+    try {
+        const depth = 10_000;
+        const payload = '{"version":' + "[".repeat(depth) + "0" + "]".repeat(depth) +
+            ',"devSessionId":"d","terminalId":"t","op":"list"}\n';
+        assert.ok(Buffer.byteLength(payload) <= MAX_CONTROL_LINE_BYTES);
+        const response: ControlResponse = JSON.parse(await rawExchange(h.listener.socketPath, payload));
+        assert.equal(response.ok, false);
+        assert.equal(response.error?.code, "bad_request");
+        assert.equal(h.relayed.length, 0);
+
+        const pending = sendControlRequest("list", {}, h.env);
+        const command = await h.command(1);
+        h.listener.settle({ commandId: command.commandId, ok: true, data: { panes: [] } });
+        assert.deepEqual((await pending).data, { panes: [] });
+    } finally {
+        h.dispose();
+    }
+});
+
 // ---------------------------------------------------------------------------
 // The whole round trip.
 // ---------------------------------------------------------------------------
@@ -901,7 +922,7 @@ test("invalid socket paths and unserializable requests resolve with refusals", a
     const env = { OMP_DEV_SESSION_ID: "d", OMP_TERMINAL_ID: "t" };
     const invalidPath = await sendControlRequest("list", {}, env, "invalid\0socket");
     assert.equal(invalidPath.ok, false);
-    assert.equal(invalidPath.error?.code, "failed");
+    assert.equal(invalidPath.error?.code, "bad_request");
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     for (const args of [circular, { value: 1n }]) {

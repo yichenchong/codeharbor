@@ -48,6 +48,29 @@ using namespace ch;
 
 namespace {
 
+// Validate before constructing a store: an empty QTemporaryDir::filePath()
+// must never turn an isolation failure into opening native user settings.
+QString checkedPrivatePath(const QTemporaryDir& root, const QString& name)
+{
+    if (!root.isValid())
+        qFatal("Could not create private AppController fixture directory");
+    const QString path = root.filePath(name);
+    if (path.isEmpty() || !QDir::isAbsolutePath(path))
+        qFatal("AppController fixture path must be private and absolute");
+    return path;
+}
+
+// Never open native settings, including the shared QStandardPaths test store.
+// Each controller gets its own file beneath this process's private root.
+QString isolatedControllerSettingsPath()
+{
+    static QTemporaryDir root;
+    static quint64 sequence = 0;
+    if (!root.isValid())
+        qFatal("Could not create private AppController test settings");
+    return root.filePath(QStringLiteral("controller-%1.ini").arg(++sequence));
+}
+
 // Minimal in-process QIODevice standing in for the RPC transport. Captures the
 // client's writes verbatim (takeSent) and injects server->client frames through
 // deliver(). Opened Unbuffered so writeData() and readyRead dispatch are
@@ -444,8 +467,8 @@ struct ConnectFixture {
     CodeharbordClient client;
     AgentStatusMonitor monitor;
     FakeBootstrap boot{&pool, &client, &monitor};
-    ServerProfiles profiles{dir.filePath(QStringLiteral("servers.ini"))};
-    AppController controller{&client};
+    ServerProfiles profiles{checkedPrivatePath(dir, QStringLiteral("servers.ini"))};
+    AppController controller{&client, nullptr, checkedPrivatePath(dir, QStringLiteral("ui.ini"))};
     QString profileId;
 
     ConnectFixture()
@@ -600,6 +623,7 @@ private slots:
     void reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness_data();
     void reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness();
     void acceptedIdentityObserverCanDisconnectBeforeReadiness();
+    void reentrantFirstWorkspaceRestorationResumesLayoutLoading();
 
     void hostKeyPromptParksTheAttemptAndAcceptRetriesWithItPinned();
     void rejectedHostKeyEndsTheAttemptAndLeavesNothingPinned();
@@ -935,7 +959,7 @@ void TstAppController::setServerIdRefreshesForNewServer()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.setServerId(QStringLiteral("srv-x"));
@@ -963,7 +987,7 @@ void TstAppController::setServerIdUnchangedDoesNotRefresh()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.setServerId(QStringLiteral("srv-x"));
@@ -978,7 +1002,7 @@ void TstAppController::refreshUpdatesModelAndEmitsRefreshed()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     QSignalSpy refreshedSpy(&controller, &AppController::refreshed);
@@ -999,7 +1023,7 @@ void TstAppController::staleRefreshResultDoesNotClobberNewer()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1025,7 +1049,7 @@ void TstAppController::refreshErrorEmitsErrorVerbatim()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     QSignalSpy errorSpy(&controller, &AppController::error);
@@ -1043,7 +1067,7 @@ void TstAppController::mutationSuccessChainsRefresh()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.createGroup(QStringLiteral("New"));
@@ -1070,7 +1094,7 @@ void TstAppController::deleteGroupSendsRequestAndRefreshes()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.deleteGroup(QStringLiteral("g1"));
@@ -1105,7 +1129,7 @@ void TstAppController::deleteGroupErrorEmitsErrorWithoutRefresh()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1130,7 +1154,7 @@ void TstAppController::deleteSessionErrorEmitsErrorWithoutRefresh()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1166,7 +1190,7 @@ void TstAppController::deletingASessionKillsItsPanesRemoteSessions()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1212,7 +1236,7 @@ void TstAppController::deletingASessionSkipsAPaneThatWasNeverAttached()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1264,7 +1288,7 @@ void TstAppController::aFailedKillIsReportedAndTheDeletionStands()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1312,7 +1336,7 @@ void TstAppController::deletingAGroupKillsEveryPaneOfEverySessionInIt()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -1354,7 +1378,7 @@ void TstAppController::archiveSessionSendsArchivedAndRefreshes()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.archiveSession(QStringLiteral("s1"));
@@ -1405,7 +1429,7 @@ void TstAppController::archiveSessionErrorEmitsErrorWithoutRefresh()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1426,7 +1450,7 @@ void TstAppController::setTerminalPaneHarnessWritesTheRowAndRefreshes()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1457,7 +1481,7 @@ void TstAppController::setTerminalPaneHarnessRefusesAnUnknownValue()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1485,7 +1509,7 @@ void TstAppController::terminalPaneHarnessReadsTheAuthoritativeTree()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     QVERIFY(controller.terminalPaneHarness(QStringLiteral("term-1")).isEmpty());
@@ -1521,6 +1545,7 @@ void TstAppController::newlyCreatedTerminalRowsReachTheirOwnSidebar()
     QFETCH(QString, source);
     QFETCH(bool, eventBeforeSnapshot);
     QTemporaryDir dir;
+    QVERIFY(dir.isValid());
     FakeTransport transport;
     CodeharbordClient client;
     AppController controller(&client, nullptr, dir.filePath(QStringLiteral("ui.ini")));
@@ -1589,6 +1614,13 @@ void TstAppController::newlyCreatedTerminalRowsReachTheirOwnSidebar()
             {"id", "terminal-layout"},
             {"tree", QJsonObject{{"type", "leaf"}, {"paneId", "terminal-1"},
                                  {"terminalPaneId", "born-row"}}}});
+    } else if (source == QLatin1String("legacy")) {
+        // A legacy lookup is addressed by label, not row id. Its authoritative
+        // result must retain that label while introducing the new row identity.
+        respond(create.value(QStringLiteral("id")).toInt(), QJsonObject{
+            {"id", "born-row"}, {"serverId", "srv-1"}, {"devSessionId", "s1"},
+            {"name", "terminal-1"}, {"tmuxTarget", "ch_s1_born-row"},
+            {"harness", "generic"}, {"position", 0}});
     } else {
         transport.deliver(terminalPaneResultFrame(
             create.value(QStringLiteral("id")).toInt(), QStringLiteral("born-row"),
@@ -1658,7 +1690,7 @@ void TstAppController::observedHarnessUpgradesAGenericPaneOnce()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1723,7 +1755,7 @@ void TstAppController::observedHarnessUpgradeKeepsTheTriggeringState()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     FakeTransport agentTransport;
@@ -1780,7 +1812,7 @@ void TstAppController::observedHarnessArrivingBeforeTheTreeIsNotLost()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1859,7 +1891,7 @@ void TstAppController::aParkedObservationSurvivesIdsWithSeparators()
 
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1902,7 +1934,7 @@ void TstAppController::observedHarnessLeavesAPlainShellAlone()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1943,7 +1975,7 @@ void TstAppController::observedHarnessLeavesAnExplicitAdapterAlone()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     QSignalSpy errors(&controller, &AppController::error);
 
@@ -1980,7 +2012,7 @@ void TstAppController::refreshResultAfterControllerDestroyedIsNoop()
 
     int pendingId = 0;
     {
-        AppController controller(&client);
+        AppController controller(&client, nullptr, isolatedControllerSettingsPath());
         controller.refresh();
         pendingId =
             takeRequest(transport).value(QStringLiteral("id")).toInt();
@@ -2003,7 +2035,8 @@ void TstAppController::harnessRegistrationObserverMayDestroyTheController()
     monitor.noteTerminalAttached(session, pane);
     QCOMPARE(monitor.stateFor(session, pane),
              static_cast<int>(AgentState::Starting));
-    QPointer<AppController> controller = new AppController(&client);
+    QPointer<AppController> controller = new AppController(
+        &client, nullptr, isolatedControllerSettingsPath());
     controller->setAgentMonitor(&monitor);
     client.setTransport(&transport);
     QSignalSpy destroyed(controller.data(), &QObject::destroyed);
@@ -2031,7 +2064,8 @@ void TstAppController::activeSessionRetirementObserverMayDestroyTheController()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    QPointer<AppController> controller = new AppController(&client);
+    QPointer<AppController> controller = new AppController(
+        &client, nullptr, isolatedControllerSettingsPath());
     SessionLayouts layouts(controller->workspaceDb(), controller->uiState());
     controller->setConnection(nullptr, nullptr, nullptr, &layouts);
     controller->setServerId(QStringLiteral("retirement-server"));
@@ -2068,7 +2102,7 @@ void TstAppController::agentMonitorMergesStateIntoSidebar()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     // A real monitor over its own in-process transport (no SSH needed).
@@ -2103,7 +2137,7 @@ void TstAppController::agentMonitorMergesStateIntoSidebar()
 void TstAppController::terminalConnectionStateMergesIntoSidebar()
 {
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     // Seed the server key without issuing a request: setServerId() is allowed
     // to run before a transport is wired, and the subsequent refresh is the
     // one request this test answers.
@@ -2159,7 +2193,7 @@ void TstAppController::refreshDoesNotWipeAgentDerivedState()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     FakeTransport agentTransport;
@@ -2207,7 +2241,7 @@ void TstAppController::refreshDoesNotWipeAgentDerivedState()
 void TstAppController::aGenericPaneFromTheTreeReachesRunningInTheSidebar()
 {
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     // Seeded before the transport, so the only request in flight is the
     // refresh below (see terminalConnectionStateMergesIntoSidebar).
     controller.setServerId(QStringLiteral("srv-1"));
@@ -2288,7 +2322,7 @@ void TstAppController::markSeenClearsFinishedUnseenBadge()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     FakeTransport agentTransport;
@@ -2337,7 +2371,7 @@ void TstAppController::activationRejectsUnknownOrArchivedSessions()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
 
     controller.refresh();
@@ -2355,10 +2389,8 @@ void TstAppController::activationRejectsUnknownOrArchivedSessions()
     QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
-// AppController's own UiStateStore is the REAL per-user QSettings (it is
-// constructed with an empty ini path, exactly as main.cpp leaves it). The
-// active-session cases below drive it for real, so redirect QSettings at the
-// process level rather than writing into the developer's actual config.
+// Ancillary QStandardPaths consumers use test locations; controllers themselves
+// always receive explicit private settings files.
 void TstAppController::initTestCase()
 {
     QStandardPaths::setTestModeEnabled(true);
@@ -2371,9 +2403,10 @@ namespace {
 // BEFORE the transport so the setter's refresh() no-ops, with session "s1"
 // active and BOTH region layouts loaded and editable.
 struct ActiveSessionFixture {
+    QTemporaryDir dir;
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller{&client};
+    AppController controller{&client, nullptr, checkedPrivatePath(dir, QStringLiteral("ui.ini"))};
     SessionLayouts layouts{controller.workspaceDb(), controller.uiState()};
 
     ActiveSessionFixture()
@@ -2559,7 +2592,8 @@ void TstAppController::activationObserverMayDestroyTheController()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    QPointer<AppController> controller = new AppController(&client);
+    QPointer<AppController> controller = new AppController(
+        &client, nullptr, isolatedControllerSettingsPath());
     auto* layouts = new SessionLayouts(
         controller->workspaceDb(), controller->uiState(), controller);
     controller->setConnection(nullptr, nullptr, nullptr, layouts);
@@ -2996,6 +3030,7 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
 {
     ActiveSessionFixture f;
     QTemporaryDir dir;
+    QVERIFY(dir.isValid());
     SshConnectionPool pool;
     AgentStatusMonitor monitor;
     WiredBootstrap bootstrap(&pool, &f.client, &monitor);
@@ -3089,7 +3124,7 @@ void TstAppController::disconnectRetiresActiveSessionButStillRemembersIt()
 void TstAppController::refreshWithoutATransportIsASilentNoOp()
 {
     CodeharbordClient client;  // no setTransport()
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     QSignalSpy errorSpy(&controller, &AppController::error);
     QSignalSpy refreshedSpy(&controller, &AppController::refreshed);
 
@@ -4023,7 +4058,7 @@ void TstAppController::aFailedProfileWriteReachesTheShellWithoutClaimingDurabili
     QVERIFY(QDir().mkpath(blocked)); // a directory cannot be replaced by QSettings
     ServerProfiles profiles(blocked);
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     controller.setConnection(nullptr, nullptr, &profiles, nullptr);
     QSignalSpy errors(&controller, &AppController::error);
     const QString id = profiles.addProfile(
@@ -4053,6 +4088,7 @@ void TstAppController::missingOrInvalidAgentSocketRefusesTheWire()
 {
     QFETCH(QJsonValue, agentSocket);
     QTemporaryDir dir;
+    QVERIFY(dir.isValid());
     SshConnectionPool pool;
     CodeharbordClient client;
     AgentStatusMonitor monitor;
@@ -4108,6 +4144,7 @@ void TstAppController::missingOrInvalidAgentSocketRefusesTheWire()
 void TstAppController::acceptedIdentityObserverCanDisconnectBeforeReadiness()
 {
     QTemporaryDir dir;
+    QVERIFY(dir.isValid());
     SshConnectionPool pool;
     CodeharbordClient client;
     AgentStatusMonitor monitor;
@@ -4162,6 +4199,7 @@ void TstAppController::reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness(
 {
     QFETCH(bool, sameServer);
     QTemporaryDir dir;
+    QVERIFY(dir.isValid());
     SshConnectionPool pool;
     CodeharbordClient client;
     AgentStatusMonitor monitor;
@@ -4300,8 +4338,18 @@ void TstAppController::reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness(
             QCOMPARE(params.value(QStringLiteral("serverId")).toString(), accepted);
             QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(), readySession);
             QCOMPARE(params.value(QStringLiteral("id")).toString(), readyRow);
-            second->deliver(terminalPaneResultFrame(
-                requestId, readyRow, readySession, QStringLiteral("generic")));
+            // Answer for the captured request's owner, not the helper's
+            // unrelated srv-1 default or a later mutable factory context.
+            const QJsonObject row{
+                {"id", params.value(QStringLiteral("id"))},
+                {"serverId", params.value(QStringLiteral("serverId"))},
+                {"devSessionId", params.value(QStringLiteral("devSessionId"))},
+                {"name", "terminal-1"},
+                {"tmuxTarget", QStringLiteral("ch_%1_%2").arg(readySession, readyRow)},
+                {"harness", "generic"}, {"position", 0}};
+            second->deliver(QJsonDocument(QJsonObject{
+                {"jsonrpc", "2.0"}, {"id", requestId}, {"result", row}})
+                                .toJson(QJsonDocument::Compact) + '\n');
         } else {
             QFAIL("unexpected pre-identity/initialization request during reconnect");
         }
@@ -4344,6 +4392,57 @@ void TstAppController::reconnectWaitsForAcceptedIdentityBeforeTerminalReadiness(
     }
     QCOMPARE(errors.count(), 0);
     QVERIFY(takeRequestsExcludingPolls(second->frames).isEmpty());
+}
+
+void TstAppController::reentrantFirstWorkspaceRestorationResumesLayoutLoading()
+{
+    FakeTransport transport;
+    ConnectFixture f;
+    SessionLayouts layouts(f.controller.workspaceDb(), f.controller.uiState());
+    f.controller.setConnection(&f.pool, &f.boot, &f.profiles, &layouts);
+    f.controller.uiState()->setActiveSession(QStringLiteral("new-server"),
+                                            QStringLiteral("s1"));
+    f.client.setTransport(&transport);
+    bool restoredWhileSuspended = false;
+    connect(&f.controller, &AppController::acceptedServerIdChanged, &layouts, [&] {
+        if (f.controller.acceptedServerId() != QStringLiteral("new-server"))
+            return;
+        const auto list = takeRequest(transport);
+        QCOMPARE(list.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.list"));
+        transport.deliver(listWithSessionFrame(list.value(QStringLiteral("id")).toInt(),
+                                               QStringLiteral("g"), QStringLiteral("s1"),
+                                               false));
+        restoredWhileSuspended = f.controller.activeSessionId() == QStringLiteral("s1")
+            && !layouts.workspaceReady();
+        QVERIFY(layouts.viewerTree().isNull());
+        QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
+    });
+    f.boot.fireWired();
+    const auto identity = takeRequest(transport);
+    QCOMPARE(identity.value(QStringLiteral("method")).toString(),
+             QStringLiteral("server.info"));
+    transport.deliver(serverInfoFrame(identity.value(QStringLiteral("id")).toInt(),
+                                      AppController::kMinimumServerSchemaVersion,
+                                      QStringLiteral("new-server"), QStringLiteral("current")));
+    QVERIFY(restoredWhileSuspended);
+    QVERIFY(layouts.workspaceReady());
+    const auto requests = takeRequestsExcludingPolls(transport);
+    QCOMPARE(requests.size(), 2);
+    for (const auto& request : requests) {
+        QCOMPARE(request.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.getLayout"));
+        const auto params = request.value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
+                 QStringLiteral("s1"));
+        transport.deliver(layoutLeafFrame(request.value(QStringLiteral("id")).toInt(),
+                                          params.value(QStringLiteral("region")).toString()
+                                              + QStringLiteral("-1")));
+    }
+    QVERIFY(!layouts.viewerTree().isNull());
+    QVERIFY(!layouts.terminalTree().isNull());
+    QCOMPARE(f.controller.activeSessionId(), QStringLiteral("s1"));
+    QVERIFY(takeRequestsExcludingPolls(transport).isEmpty());
 }
 
 // ServerProfiles serialises its saves against a second copy of the application
@@ -4750,7 +4849,7 @@ void TstAppController::reorderingSendsTheOrderedIdsInOrderAndRefreshes()
 {
     FakeTransport transport;
     CodeharbordClient client;
-    AppController controller(&client);
+    AppController controller(&client, nullptr, isolatedControllerSettingsPath());
     client.setTransport(&transport);
     controller.setServerId(QStringLiteral("srv-1"));
     // setServerId() drives its own workspace.list; drain it so the assertions

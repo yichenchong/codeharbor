@@ -124,7 +124,8 @@ public slots:
     //     as though it were the file is the exact dishonesty the mobile viewers
     //     exist to avoid. Bytes for the one consumer that genuinely wants them
     //     (an image) travel through requestImage() instead.
-    //   * `truncated` is the SERVER's flag, forwarded verbatim, never inferred.
+    //   * `truncated` is REQUIRED and forwarded verbatim from the SERVER, never
+    //     inferred from payload length or defaulted when absent.
     //   * `revision` is REQUIRED. A reply without one is an error rather than a
     //     read with an empty token, because an empty token means CREATE-ONLY to
     //     file.writeFile: the page would load the buffer happily and only find
@@ -141,6 +142,8 @@ public slots:
     // fileWritten(path, revision) or fileError(path, message) — a revision
     // mismatch (ch::rpc::kRevisionMismatch) reaches the user through the same
     // error path carrying the server's own wording, exactly as on the desktop.
+    // A successful write must carry a nonempty revision: the empty token is
+    // create-only and cannot guard a subsequent overwrite of this file.
     Q_INVOKABLE void writeFile(const QString &path, const QString &content,
                                const QString &expectedRevision);
 
@@ -225,6 +228,14 @@ public slots:
     // until OS eviction: there is no unsafe sweep of another live service's
     // directory, and no secure-erasure guarantee.
     Q_INVOKABLE void requestPdf(const QString &path);
+
+    // Drive the public Qt PDF extension, not source="" (which does not close
+    // QQuickPdfDocument's native decoder). Empty closes synchronously; nonempty
+    // URLs must exactly identify a spool currently owned by THIS service.
+    // Reopening an unchanged wrapper source explicitly reloads the native file.
+    // Returns false for unsupported builds/documents, unowned URLs, or a
+    // nonempty source requested during service destruction.
+    Q_INVOKABLE bool setPdfDocumentSource(QObject *document, const QUrl &source);
 
     // Delete the spooled file for `path`, and retire a read for it that is still
     // in flight so its reply never spools a file nobody will release (see
@@ -328,6 +339,7 @@ private:
     QString pdfSpoolDir();
     // Remove only this service's private directory and remembered files.
     void purgePdfSpool();
+    void closePdfDocuments(const QUrl &source = {});
     void resetPeerState();
 
     // QPointer: see the constructor note — the client may be destroyed first.
@@ -338,7 +350,11 @@ private:
     // Remote path -> absolute spooled file. Cleared by releasePdf() and by the
     // destructor.
     QHash<QString, QString> m_pdfSpool;
+    // Live QML wrappers and their active owned sources. Empty entries retain
+    // their destruction connection so repeated close/reopen does not add one.
+    QHash<QObject *, QUrl> m_pdfDocuments;
     std::unique_ptr<QTemporaryDir> m_pdfDirectory;
+    bool m_pdfShuttingDown = false;
 
     // Only the latest request for a target may publish a reply. Entries exist
     // only while requests are in flight, and are removed by completion, release,

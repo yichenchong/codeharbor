@@ -262,16 +262,30 @@ qsizetype findLinkTextEnd(QStringView s, qsizetype from, InlineLimits *limits)
     return -1;
 }
 
-// Matching ')' for the '(' at `from - 1`, honouring nesting and escapes.
+// Matching ')' for the '(' at `from - 1`, honouring nesting, escapes and the
+// angle destination spelling, whose parentheses are literal path characters.
 qsizetype findDestEnd(QStringView s, qsizetype from, InlineLimits *limits)
 {
     int depth = 1;
+    bool destinationStarted = false;
+    bool inAngle = false;
     for (qsizetype i = from; i < s.size(); ++i) {
         if (!spend(limits))
             return -1;
         const QChar ch = s.at(i);
+        if (!destinationStarted && !ch.isSpace()) {
+            destinationStarted = true;
+            inAngle = ch == QLatin1Char('<');
+            if (inAngle)
+                continue;
+        }
         if (ch == QLatin1Char('\\')) {
             ++i;
+            continue;
+        }
+        if (inAngle) {
+            if (ch == QLatin1Char('>'))
+                inAngle = false;
             continue;
         }
         if (ch == QLatin1Char('('))
@@ -281,6 +295,20 @@ qsizetype findDestEnd(QStringView s, qsizetype from, InlineLimits *limits)
     }
     return -1;
 }
+// Backslash escapes are syntax, not part of the remote filename or URL.
+QString unescapeDestination(QStringView source)
+{
+    QString result;
+    result.reserve(source.size());
+    for (qsizetype i = 0; i < source.size(); ++i) {
+        if (source.at(i) == QLatin1Char('\\') && i + 1 < source.size()
+            && isAsciiPunct(source.at(i + 1)))
+            ++i;
+        result.append(source.at(i));
+    }
+    return result;
+}
+
 
 // The destination out of a link/image target, discarding any title. Handles the
 // <angle-bracketed> spelling, which is how a destination containing spaces is
@@ -289,7 +317,15 @@ QString destinationOf(QStringView raw)
 {
     QStringView t = raw.trimmed();
     if (t.startsWith(QLatin1Char('<'))) {
-        const qsizetype close = t.indexOf(QLatin1Char('>'));
+        qsizetype close = 1;
+        for (; close < t.size(); ++close) {
+            if (t.at(close) == QLatin1Char('\\') && close + 1 < t.size()
+                && isAsciiPunct(t.at(close + 1))) {
+                ++close;
+            } else if (t.at(close) == QLatin1Char('>')) {
+                break;
+            }
+        }
         // An UNTERMINATED angle destination is not a destination at all —
         // CommonMark does not make "[a](<https://x)" a link. Falling through to
         // the whitespace scan below (which is what happened) handed the page
@@ -297,15 +333,15 @@ QString destinationOf(QStringView raw)
         // safeLinkTarget() cannot recognise as a scheme so it passed as a
         // "relative reference", and that the delegate then drew as a tappable
         // link to a path that does not exist.
-        if (close < 0)
+        if (close == t.size())
             return {};
-        return close > 1 ? t.mid(1, close - 1).toString() : QString();
+        return unescapeDestination(t.mid(1, close - 1));
     }
     for (qsizetype i = 0; i < t.size(); ++i) {
         if (t.at(i).isSpace())
-            return t.left(i).toString();
+            return unescapeDestination(t.left(i));
     }
-    return t.toString();
+    return unescapeDestination(t);
 }
 
 // Matching '>' for the '<' at `from - 1`, or -1. A manual charged loop rather
@@ -801,13 +837,17 @@ ListMarker listMarkerAt(const QString &line)
     if (i < line.size() && !line.at(i).isSpace())
         return marker;
     const qsizetype markerEnd = i;
-    while (i < line.size() && line.at(i).isSpace())
+    int contentColumn = indent + int(markerEnd - first);
+    while (i < line.size() && line.at(i).isSpace()) {
+        contentColumn += line.at(i) == QLatin1Char('\t')
+            ? 4 - contentColumn % 4 : 1;
         ++i;
+    }
     marker.valid = true;
     marker.indent = indent;
-    marker.contentIndent = indent + int(i - first);
+    marker.contentIndent = contentColumn;
     if (i == markerEnd) // marker ends the line
-        marker.contentIndent = indent + int(markerEnd - first) + 1;
+        ++marker.contentIndent;
     marker.text = line.mid(i);
     return marker;
 }
@@ -933,9 +973,9 @@ QVector<MarkdownModel::Block> MarkdownModel::parse(const QString &source)
 
     QVector<Block> blocks;
     QStringList paragraph;
-    // Indent columns of the enclosing list markers, innermost last. The DEPTH of
-    // this stack is a list item's `level`; the columns themselves only decide
-    // whether the next marker is a sibling, a child or a pop.
+    // Content columns of enclosing items, innermost last. A child marker must
+    // reach its parent's content column, not merely be right of its marker:
+    // "100. item" needs five columns, whereas "- item" only needs two.
     QVector<int> listIndents;
 
     const auto flushParagraph = [&]() {
@@ -1100,12 +1140,14 @@ QVector<MarkdownModel::Block> MarkdownModel::parse(const QString &source)
         // Four columns at top level start literal code, even if its first
         // character looks like a list marker. Deeper markers are only list
         // items when a containing list is already open.
-        if (marker.valid && (marker.indent <= 3 || !listIndents.isEmpty())) {
-            flushParagraph();
+        if (marker.valid && paragraph.isEmpty()) {
             while (!listIndents.isEmpty() && marker.indent < listIndents.last())
                 listIndents.removeLast();
-            if (listIndents.isEmpty() || marker.indent > listIndents.last())
-                listIndents.append(marker.indent);
+        }
+        if (marker.valid && (marker.indent <= 3
+                             || (paragraph.isEmpty() && !listIndents.isEmpty()))) {
+            flushParagraph();
+            listIndents.append(marker.contentIndent);
 
             QString text = marker.text;
             qsizetype j = i + 1;

@@ -599,9 +599,9 @@ auto okHandler(const char* method, WorkspaceDb::OkCallback cb)
 
 // Response handler for every workspace.* method whose result is a single record
 // object: forwards a server error verbatim, rejects a non-object result and an
-// object without the record's required non-empty id or with a wrong-kind member,
-// and otherwise hands the decoded record to `cb`. `decode` returns an optional
-// typed payload so malformed objects cannot become plausible records.
+// object without the record's required non-empty id, with a wrong-kind member,
+// or failing the decoder's method-specific identity checks. `decode` returns an
+// optional typed payload so malformed objects cannot become plausible records.
 template <typename Callback, typename Decode>
 auto recordHandler(const char* method, Callback cb, Decode decode)
 {
@@ -618,7 +618,7 @@ auto recordHandler(const char* method, Callback cb, Decode decode)
         auto decoded = decode(result.toObject());
         if (!decoded) {
             cb(std::nullopt,
-               malformedResult(method, "a valid record object with a non-empty id"));
+               malformedResult(method, "a valid record object with the expected identity"));
             return;
         }
         cb(std::move(decoded), std::nullopt);
@@ -887,8 +887,23 @@ void WorkspaceDb::resolveTerminalPane(const ResolveTerminalPaneParams& params,
         obj[QStringLiteral("workingDirectory")] = *params.workingDirectory;
     m_client->call(QString::fromLatin1(rpc::kMethodWorkspaceResolveTerminalPane),
                    obj,
-                   recordHandler(rpc::kMethodWorkspaceResolveTerminalPane,
-                                 std::move(cb), parseTerminalPane));
+                   recordHandler(
+                       rpc::kMethodWorkspaceResolveTerminalPane, std::move(cb),
+                       [serverId = params.serverId, devSessionId = params.devSessionId,
+                        id = params.id, name = params.name](const QJsonObject& row)
+                           -> std::optional<TerminalPane> {
+                           std::optional<TerminalPane> pane = parseTerminalPane(row);
+                           // Resolving a layout leaf is not permission to adopt
+                           // another row or another session's shell. The label is
+                           // only an address for legacy leaves; a row-id lookup
+                           // may legitimately return a renamed pane.
+                           if (!pane || pane->serverId != serverId ||
+                               pane->devSessionId != devSessionId ||
+                               (!id.value.isEmpty() ? pane->id != id
+                                                    : pane->name != name))
+                               return std::nullopt;
+                           return pane;
+                       }));
 }
 
 void WorkspaceDb::updateTerminalPane(const UpdateTerminalPaneParams& params,

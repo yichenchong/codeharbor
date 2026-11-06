@@ -26,6 +26,7 @@ Item {
     property string devSessionId: ""
     signal openRequested(string path)
     signal titleRequested(string title)
+    signal closeRequested()
 
     readonly property var factory: (typeof editorFactory !== "undefined") ? editorFactory : null
 
@@ -48,6 +49,7 @@ Item {
     function retireRecoveryScope() {
         if (!root.controller)
             return;
+        root.clearLeaveConsent();
         root.clearRecoveryOffer();
         // Retire old replies immediately; apply only the final bound context,
         // never a transient new-server/old-session combination.
@@ -86,6 +88,7 @@ Item {
         return i >= 0 ? path.substring(i + 1) : path;
     }
     onOpenedPathChanged: {
+        root.clearLeaveConsent();
         if (root.openedPath.length > 0)
             root.titleRequested(root.fileNameOf(root.openedPath));
     }
@@ -96,6 +99,7 @@ Item {
         if (!root.controller || path.length === 0)
             return;
         root.clearRecoveryOffer();
+        root.clearLeaveConsent();
         root.openedPath = path;
         root.controller.open(path);
     }
@@ -124,20 +128,58 @@ Item {
             root.openPath(root.remotePath);
     }
 
+    // Pane/header/system Back all arrive here before the host releases this
+    // controller. Recovery is not permission to throw away dirty RAM.
+    function requestClose() {
+        if (!root.dirty) {
+            root.closeRequested();
+            return;
+        }
+        root.requestLeave("", true);
+    }
+
     onRemotePathChanged: {
         if (!root.controller || root.remotePath.length === 0)
             return;
         if (root.dirty) {
             // The guard is not advisory: a pane that silently threw away edits
             // when the host reassigned its path would lose work with no trace.
-            pendingPath = root.remotePath;
-            leaveGuard.open();
+            root.requestLeave(root.remotePath, false);
             return;
         }
         root.openPath(root.remotePath);
     }
 
     property string pendingPath: ""
+    property var leaveContext: null
+
+    function requestLeave(path, closing) {
+        root.pendingPath = path;
+        root.leaveContext = {
+            "controller": root.controller,
+            "path": root.openedPath,
+            "server": root.acceptedServerId,
+            "session": root.devSessionId,
+            "pane": root.paneId,
+            "target": path,
+            "closing": closing
+        };
+        leaveGuard.open();
+    }
+
+    function clearLeaveConsent() {
+        root.leaveContext = null;
+        root.pendingPath = "";
+        leaveGuard.close();
+    }
+
+    function leaveConsentIsCurrent(consent) {
+        return consent !== null && consent.controller === root.controller
+            && consent.path === root.openedPath
+            && consent.server === root.acceptedServerId
+            && consent.session === root.devSessionId
+            && consent.pane === root.paneId;
+    }
 
     Connections {
         target: root.controller
@@ -258,8 +300,7 @@ Item {
                 enabled: root.controller !== null
                 onClicked: {
                     if (root.dirty) {
-                        pendingPath = "";
-                        leaveGuard.open();
+                        root.requestLeave("", false);
                         return;
                     }
                     root.controller.requestReload();
@@ -461,21 +502,29 @@ Item {
         }
 
         onDiscarded: {
-            root.dirty = false;
-            if (root.pendingPath.length > 0) {
-                root.openPath(root.pendingPath);
-                root.pendingPath = "";
-            } else {
-                root.controller.requestReload();
+            const consent = root.leaveContext;
+            if (!root.leaveConsentIsCurrent(consent)) {
+                root.clearLeaveConsent();
+                return;
             }
-            leaveGuard.close();
+            // Consume before emitting any signal: duplicate/late confirmation
+            // must never act on another document, context or replacement pane.
+            root.clearLeaveConsent();
+            snapshot.stop();
+            root.dirty = false;
+            if (consent.closing)
+                root.closeRequested();
+            else if (consent.target.length > 0)
+                root.openPath(consent.target);
+            else
+                root.controller.requestReload();
         }
         onRejected: {
             // The page keeps editing the file it already had open: `openedPath`
             // was never moved, so the header and the Save button still speak
             // about the buffer on screen even though the host has moved
             // `remotePath` on.
-            root.pendingPath = "";
+            root.clearLeaveConsent();
         }
     }
 

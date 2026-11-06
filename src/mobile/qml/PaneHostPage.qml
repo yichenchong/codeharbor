@@ -157,10 +157,23 @@ Page {
         return properties;
     }
 
+    function unloadPane() {
+        if (paneLoader.item && typeof paneLoader.item.deactivate === "function")
+            paneLoader.item.deactivate();
+        paneLoader.setSource("");
+    }
+
+    function requestBack() {
+        if (paneLoader.item && typeof paneLoader.item.requestClose === "function")
+            paneLoader.item.requestClose();
+        else if (page.ctl)
+            page.ctl.back();
+    }
+
     function reload() {
         // The explicit unload. See the class comment: this is what bounds the
         // number of live panes to one at every instant.
-        paneLoader.setSource("");
+        page.unloadPane();
         // The header label belongs to the pane that is going away, so it goes
         // with it. Without this a page that reports no title of its own would
         // inherit the last one that did.
@@ -211,7 +224,7 @@ Page {
                 implicitWidth: MobileTheme.touchTarget
                 implicitHeight: MobileTheme.touchTarget
                 enabled: page.ctl !== null
-                onClicked: page.ctl.back()
+                onClicked: page.requestBack()
 
                 contentItem: Text {
                     text: "\u2039"
@@ -265,16 +278,21 @@ Page {
         onLoaded: {
             if (!item)
                 return;
+            const loadedItem = item;
             // Signals are optional: pages declare only the actions they offer.
             if (item.openRequested)
-                item.openRequested.connect(page.navigateTo);
+                item.openRequested.connect(function(path) {
+                    if (paneLoader.item === loadedItem)
+                        page.navigateTo(path);
+                });
             if (item.titleRequested)
                 item.titleRequested.connect(function(title) {
-                    page.titleOverride = String(title);
+                    if (paneLoader.item === loadedItem)
+                        page.titleOverride = String(title);
                 });
             if (item.closeRequested)
                 item.closeRequested.connect(function() {
-                    if (page.ctl)
+                    if (paneLoader.item === loadedItem && page.ctl)
                         page.ctl.back();
                 });
         }
@@ -302,6 +320,7 @@ Page {
         page.currentUrl = page.pane && page.pane.url ? String(page.pane.url) : "";
         page.reload();
     }
+    Component.onDestruction: page.unloadPane()
 
     Connections {
         target: page.ctl
@@ -312,7 +331,7 @@ Page {
             // is precisely the second live pane this design forbids.
             if (!page.ctl || !page.ctl.selectedPaneKey
                     || page.ctl.selectedPaneKey.length === 0) {
-                paneLoader.setSource("");
+                page.unloadPane();
                 return;
             }
             page.currentUrl = page.pane && page.pane.url

@@ -48,7 +48,8 @@ public:
 private:
     void installShellStyles(QWindow *window);
     QRect maximizeButtonRect() const;
-    void setNativeButtonState(bool hovered, bool down);
+    // False when a synchronous property observer destroys/replaces a participant.
+    bool setNativeButtonState(bool hovered, bool down);
 
     QPointer<QWindow> m_window;
     QPointer<QQuickItem> m_button;

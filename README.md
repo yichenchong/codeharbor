@@ -85,8 +85,10 @@ reduces to it. Relative paths are not installation targets.
 
 ### Updating the server
 
-The client and the service are released together, and the client only drives the
-release that matches it. Two things keep them in step:
+The client and service are released together. Installation and update target the
+release matching the client; connecting to an existing service instead checks its
+RPC schema and required endpoint metadata, not an exact release-version match.
+Two things keep managed installations in step:
 
 - **Automatically.** When a client installed the service itself, upgrading the
   client makes the next connect replace the copy on the server with the matching
@@ -114,8 +116,12 @@ busy message**, because removing it can defeat an active lock.
 If it is unavailable, automatic installation/update refuses without changing the
 installation; an existing usable service remains available as the fallback.
 
-A **git checkout** is never overwritten by either path. **Update server** on one
-says so and changes nothing: update it with `git pull` and a build instead.
+A **source-checkout layout** (`remote/dist/` or `remote/src/` under the profile's
+repository root) is not replaced by **Update server**: update it with `git pull`
+and a build instead. This protection is based on the selected service entry point,
+not the presence of `.git`. Do not use an unrelated checkout or shared directory as
+an installation target; a root already containing release-layout `dist/` is treated
+as an installed release even if it also contains a git repository.
 
 **Failed updates preserve recovery data for the previous installation.** The
 archive is unpacked into a staging directory beside the installation and checked
@@ -241,7 +247,7 @@ A few things worth knowing about the shipped client:
   typing in a terminal, you can keep typing without clicking first.
 - **Viewer panes navigate like a browser**: Back, Forward, Reload and Home beside the
   address field, with a history per pane. The address field opens on Enter.
-  An editor with unsaved changes refuses navigation, but its **Reload** refreshes
+  An active-context editor with unsaved changes refuses navigation, but its **Reload** refreshes
   the editor page while retaining the in-memory buffer and dirty/pending-save state;
   it does not revert to the remote file. Save or explicitly close the editor before
   navigating away. Opening another pane leaves the unsaved editor in place.
@@ -250,9 +256,24 @@ A few things worth knowing about the shipped client:
   connect/disconnect/update, and closing the window offer **Discard** or **Cancel**,
   with Cancel as the default. Save first if you want to keep the edits.
   This does not add a confirmation to agent-driven `viewer_close`.
-  Automatic reconnect to the same server/session keeps the editor and unsaved
-  buffer alive when its authoritative pane layout is unchanged; this does not
-  protect panes removed by a remote layout change.
+  Automatic reconnect to the same server/session keeps dirty editor RAM alive.
+  If a remote layout removes that editor or changes its URL, the desktop retains
+  the old visible layout with a warning instead of discarding the buffer or
+  writing the old layout back. Save or explicitly close the retained document to
+  reconcile with the current remote layout; layout-changing commands wait until
+  the conflicting editors are resolved.
+- **Retired desktop contexts keep unsaved editor text visible locally.** If an
+  authoritative server/session or document-context change would replace it, the
+  old dirty editor stays visible and copyable with a previous-workspace warning.
+  It is permanently detached from server access: Save and Reload are unavailable,
+  and it cannot write recovery snapshots into the new context. Close the retained
+  documents locally to show the current workspace; that never closes a same-id
+  pane in the replacement workspace. This is temporary RAM retention, not a saved
+  draft or history.
+- **The native mobile editor asks before Back discards unsaved work.** Its header
+  Back, hardware Back/`Alt+Left`, and the mobile window's close/back route offer
+  **Discard** or **Cancel**. Cancel keeps the editor open. This does not promise
+  to preserve RAM through forced transport or controller retirement.
 - **The explorer can open a file with a specific viewer** ("Open as"), in place or in
   a new pane, and can hand it to a local application by `<appName>://` scheme.
 - **Terminal panes can be renamed** from their header, and the name travels with the
@@ -358,8 +379,11 @@ node remote/src/tools/viewctl.ts close --pane viewer-2
 
 Things to know:
 
-- **It only drives the Dev Session you are looking at.** A command from a pane of
-  another session is refused by name rather than applied to the wrong layout.
+- **It only drives the active Dev Session.** A command from a pane of another
+  session is refused by name rather than applied to the wrong layout. If an old
+  workspace's unsaved editors are retained on screen, mutations pause;
+  `viewer_list` describes current authoritative panes with no focused pane,
+  not the retired editors.
 - **Agent-driven closing does not ask about unsaved editor changes.** Unlike a
   user-facing close, `viewer_close` applies directly. The shipped skills tell the
   agent to ask you first.

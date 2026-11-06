@@ -152,6 +152,20 @@ test("an unknown tool is an invalid-params error, not a silent success", async (
     assert.match(response.error?.message ?? "", /viewer_teleport/);
 });
 
+test("malformed tool names are invalid params with the caller's id (TIN2)", async () => {
+    for (const name of [undefined, null, false, 42, [], {}, { toString: null }]) {
+        const response = await handleLine(
+            request(53, "tools/call", { name }),
+            NO_ENV,
+        );
+        assert.equal(response?.id, 53);
+        assert.equal(response?.error?.code, -32602);
+        assert.equal(response?.result, undefined);
+    }
+    // A bad call must not poison the rest of the MCP conversation.
+    assert.deepEqual((await handleLine(request(54, "ping"), NO_ENV))?.result, {});
+});
+
 test("an unknown method is method-not-found", async () => {
     const response = await handleLine(request(6, "resources/list"), NO_ENV);
     assert.ok(response);

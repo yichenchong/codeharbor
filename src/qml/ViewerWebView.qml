@@ -55,6 +55,14 @@ Item {
                && String(candidate) === root.internalUrl.toString();
     }
 
+    function isInternalDocument(candidate) {
+        // Fragments address a location inside this document, not another
+        // remote file. Keep them in Chromium and never expose an opaque
+        // implementation URL as a pane-level navigation.
+        return root.internalUrl.toString().length > 0
+               && String(candidate).split("#")[0] === root.internalUrl.toString();
+    }
+
     Connections {
         target: root.viewerModel
         function onInternalResourceError(internalUrl, message) {
@@ -76,7 +84,7 @@ Item {
         settings.localContentCanAccessFileUrls: !root.remoteFile
         onNavigationRequested: function(request) {
             if (root.remoteFile) {
-                if (request.url.toString() === root.internalUrl.toString())
+                if (root.isInternalDocument(request.url))
                     return;
                 request.action = WebEngineNavigationRequest.IgnoreRequest;
                 root.navigated(request.url);

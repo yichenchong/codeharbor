@@ -219,6 +219,68 @@ bool EditorController::hasPageReloadContent(QObject* pageBridge) const
         && m_pageReloadContent.has_value();
 }
 
+bool EditorController::restoreRecovery(QString content, quint64 expectedRecoveryContext,
+                                       QString expectedRevision)
+{
+    if (m_serverDetached || expectedRecoveryContext != m_recoveryGeneration
+        || expectedRevision != m_revision || m_path.isEmpty() || !m_ready
+        || !m_pageBridge || m_dirty || m_saveInFlight || m_readOnly
+        || m_fileState == FileState::Loading)
+        return false;
+    // Keep the real loaded baseline intact. contentLoaded would instead make
+    // the snapshot the page's clean baseline, so editing and undoing back to it
+    // could clear dirty/recovery while those bytes were still nowhere on disk.
+    m_pageReloadContent = content;
+    reportContent(content);
+    emit m_pageBridge->bufferRestored(content, m_loadedContent, m_revision,
+                                      QString(), false);
+    return true;
+}
+
+void EditorController::detachFromServer()
+{
+    if (m_serverDetached)
+        return;
+    const bool hadRecovery = recoveryEnabled();
+    const QPointer<CodeharbordClient> cleanupClient = m_client;
+    const QString subscriptionId = m_watchSubscriptionId;
+    const quint64 watchTransport = m_watchTransportGeneration;
+    m_serverDetached = true;
+    ++m_loadGeneration;
+    ++m_saveGeneration;
+    ++m_watchGeneration;
+    ++m_permissionGeneration;
+    // Retire every continuation before severing the borrowed client. Nothing
+    // below announces a state change until the client capability is gone.
+    m_watchSubscriptionId.clear();
+    m_watchTransportGeneration = 0;
+    m_watchPending = false;
+    m_saveInFlight = false;
+    m_inFlightSaveContent.clear();
+    m_queuedSave.reset();
+    m_externalChangeDuringSave = false;
+    m_resumeState.reset();
+    m_pageNeedsContent = false;
+    resetRecoverySlot(false);
+    if (m_client)
+        disconnect(m_client, nullptr, this, nullptr);
+    m_client.clear();
+    // Resource release is the only retained capability: never re-acquire the
+    // shared client, and never cancel an opaque id on another binding.
+    if (!subscriptionId.isEmpty() && cleanupClient
+        && cleanupClient->transportGeneration() == watchTransport
+        && cleanupClient->transport() && cleanupClient->transport()->isWritable())
+        cleanupClient->call(QString::fromLatin1(rpc::kMethodUnwatch),
+                            unwatchParams(subscriptionId),
+                            [](QJsonValue, std::optional<RpcError>) {});
+    emit recoveryContextRevisionChanged();
+    if (hadRecovery)
+        emit recoveryEnabledChanged();
+    // Keep the adapter connected: subsequent saves must report a refusal,
+    // not disappear into an inert proxy while the user sees editable text.
+    setFileState(FileState::Disconnected);
+}
+
 EditorPageBridge::EditorPageBridge(EditorController* controller)
     : QObject(controller), m_controller(controller)
 {
@@ -287,12 +349,13 @@ void EditorPageBridge::ready()
 
 void EditorController::unwatchCurrent()
 {
-    if (!m_client || m_watchSubscriptionId.isEmpty())
+    const QString subscriptionId = std::exchange(m_watchSubscriptionId, QString());
+    if (!m_client || subscriptionId.isEmpty()
+        || m_watchTransportGeneration != m_client->transportGeneration())
         return;
     m_client->call(QString::fromLatin1(rpc::kMethodUnwatch),
-                   unwatchParams(m_watchSubscriptionId),
+                   unwatchParams(subscriptionId),
                    [](QJsonValue, std::optional<RpcError>) {});
-    m_watchSubscriptionId.clear();
 }
 
 void EditorController::subscribeWatch()
@@ -303,21 +366,20 @@ void EditorController::subscribeWatch()
     // would create a duplicate watcher and double every watchEvent.
     if (m_watchPending)
         return;
-    // An id we still hold means no EOF was seen on the way here, so the server
-    // that minted it may well be the one we are about to ask. Release it first:
-    // that is the only way a rebind can never leave two live watchers on the
-    // same path (SPEC 8.7). After a real reconnect the id was already dropped
-    // by onTransportClosed(), so this costs nothing on that path.
+    // Within one transport an existing subscription belongs to this same peer.
+    // A new binding forgets its predecessor's id in onTransportBound(), even
+    // when the predecessor never emitted EOF; ids cannot cross peer lifetimes.
     unwatchCurrent();
 
     const quint64 generation = ++m_watchGeneration;
     const QString path = m_path;
     m_watchPending = true;
+    const quint64 transportGeneration = m_client->transportGeneration();
 
     QPointer<EditorController> self(this);
     m_client->call(
         QString::fromLatin1(rpc::kMethodWatch), readParams(path),
-        [self, client = m_client, path, generation](
+        [self, client = m_client, path, generation, transportGeneration](
             QJsonValue watchRes, std::optional<RpcError> watchErr) {
             const QString subId =
                 watchErr.has_value()
@@ -336,7 +398,9 @@ void EditorController::subscribeWatch()
             // tell, and the subscription died with its process anyway.
             if (!self || generation != self->m_watchGeneration
                 || self->m_path != path) {
-                if (!subId.isEmpty() && client)
+                if (!subId.isEmpty() && client
+                    && client->transportGeneration() == transportGeneration
+                    && client->transport() && client->transport()->isWritable())
                     client->call(QString::fromLatin1(rpc::kMethodUnwatch),
                                  unwatchParams(subId),
                                  [](QJsonValue, std::optional<RpcError>) {});
@@ -347,6 +411,7 @@ void EditorController::subscribeWatch()
             if (subId.isEmpty())
                 return;  // no subscription was created
             self->m_watchSubscriptionId = subId;
+            self->m_watchTransportGeneration = transportGeneration;
         });
 }
 
@@ -385,13 +450,19 @@ void EditorController::onTransportClosed(quint64 generation)
     setFileState(FileState::Disconnected);
 }
 
-void EditorController::onTransportBound()
+void EditorController::onTransportBound(quint64 generation)
 {
+    // An earlier bound listener may synchronously replace this transport.
+    // Its nested notification already reconciled the current peer; the outer
+    // notification must not retire that peer's watch and subscribe it twice.
+    if (!m_client || generation != m_client->transportGeneration())
+        return;
     // Whatever was in flight belonged to the previous process and can never be
     // answered by this one; supersede it before issuing anything new so a late
     // reply cannot install a dead subscription id or clear the guard below.
     ++m_watchGeneration;
     m_watchPending = false;
+    m_watchSubscriptionId.clear();
 
     if (m_path.isEmpty())
         return;  // nothing open in this pane
@@ -648,6 +719,8 @@ void EditorController::ready()
         m_pageNeedsContent = false;
         return;
     }
+    if (m_serverDetached)
+        return;
     // ...but not over a dead transport. Every fetch below mutates pane state
     // before it can know the request will fail — open() in particular clears
     // the dirty flag, the revision baseline and the whole recovery slot — and
@@ -719,7 +792,7 @@ void EditorController::updateRecoveryPath()
 // in-flight count, or carry out a truncate the new slot never asked for — the
 // generation bump is what makes every outstanding reply recognise itself as
 // stale.
-void EditorController::resetRecoverySlot()
+void EditorController::resetRecoverySlot(bool notify)
 {
     m_recoveryRevision.clear();
     m_recoveryHasContent = false;
@@ -729,7 +802,8 @@ void EditorController::resetRecoverySlot()
     m_recoveryCheckInFlight = false;
     m_recoveryClearPending = false;
     ++m_recoveryGeneration;
-    emit recoveryContextRevisionChanged();
+    if (notify)
+        emit recoveryContextRevisionChanged();
 }
 
 // A recovery key can settle AFTER the file is already on screen, so the slot it
@@ -747,6 +821,8 @@ void EditorController::probeRecoveryForOpenFile()
 
 void EditorController::setRecoveryDir(const QString& dir)
 {
+    if (m_serverDetached)
+        return;
     // The server-reported recovery base (server.info.recoveryDir), pushed in by
     // EditorFactory once server.info answers. It can arrive AFTER this pane and
     // its controller already exist, so it is a mutable setter rather than a
@@ -763,6 +839,8 @@ void EditorController::setRecoveryScope(const QString& serverId,
                                        const QString& devSessionId,
                                        const QString& paneId)
 {
+    if (m_serverDetached)
+        return;
     if (m_recoveryServerId == serverId && m_recoverySessionId == devSessionId
         && m_recoveryPaneId == paneId)
         return;
@@ -1125,6 +1203,11 @@ void EditorController::save(QString content, QString expectedRevision)
     // hands the buffer over, cancels the crash-recovery snapshot timer it had
     // armed, and waits for one of saved/saveConflict/saveError. A silent return
     // leaves the user believing the file was written when nothing was even sent.
+    if (m_serverDetached) {
+        emit saveError(QStringLiteral(
+            "This editor belongs to a retired workspace; its buffer was not written."));
+        return;
+    }
     if (!m_client) {
         // The borrowed RPC client has been destroyed (the session is being torn
         // down). Nothing can be written and nothing ever will be on this client.
@@ -1532,7 +1615,7 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             // stat revision alone cannot prove another record is ours.
             if (!(retryOnMismatch && self->m_client
                   && error->code == rpc::kRevisionMismatch)
-                || self->m_editSerial != editSerial) {
+                || (self->m_editSerial != editSerial && !self->m_recoveryClearPending)) {
                 // THIS snapshot never landed. Whether there is anything left to
                 // truncate depends on an earlier write having succeeded, which
                 // m_recoveryHasContent already records — so run the same check
@@ -1543,15 +1626,16 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
             // Keep the retry counted across the bounded ownership read, so a
             // successful main save cannot clear before this chain settles.
             ++self->m_recoveryWritesInFlight;
+            const quint64 slotSerial = self->m_recoverySlotSerial;
             self->readRecoverySnapshot(
                 recoveryPath, self->m_loadGeneration, recoveryGeneration, {}, {},
-                [self, content, recoveryGeneration, editSerial](
+                [self, content, recoveryGeneration, editSerial, slotSerial](
                     QString payload, QString revision) {
                     if (!self || recoveryGeneration != self->m_recoveryGeneration)
                         return;
                     if (self->m_recoveryWritesInFlight > 0)
                         --self->m_recoveryWritesInFlight;
-                    if (self->m_editSerial != editSerial || revision.isEmpty()) {
+                    if (revision.isEmpty()) {
                         self->honourDeferredRecoveryClear();
                         return;
                     }
@@ -1559,14 +1643,22 @@ void EditorController::writeRecovery(const QString& content, bool retryOnMismatc
                     const bool owned = payload.isEmpty() || parseRecovery(
                         payload, self->m_recoveryServerId, self->m_recoverySessionId,
                         self->m_recoveryPaneId, self->m_path, previousContent);
-                    if (!owned) {
-                        self->m_recoverySlotBlocked = true;
+                    // Even a clean save acknowledgment can advance editSerial.
+                    // Learn the verified existing slot before abandoning those
+                    // old bytes, so a deferred clear can retire the pre-save
+                    // snapshot. A newer installed revision still wins.
+                    if (self->m_recoverySlotSerial == slotSerial) {
+                        self->m_recoverySlotBlocked = !owned;
+                        if (owned) {
+                            ++self->m_recoverySlotSerial;
+                            self->m_recoveryRevision = revision;
+                            self->m_recoveryHasContent = !payload.isEmpty();
+                        }
+                    }
+                    if (!owned || self->m_editSerial != editSerial) {
                         self->honourDeferredRecoveryClear();
                         return;
                     }
-                    self->m_recoverySlotBlocked = false;
-                    ++self->m_recoverySlotSerial;
-                    self->m_recoveryRevision = revision;
                     self->writeRecovery(content, /*retryOnMismatch=*/false);
                 });
         });

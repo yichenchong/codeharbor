@@ -16,6 +16,7 @@
 #include <QtTest/QtTest>
 
 #include <optional>
+#include <utility>
 
 using ch::CodeharbordClient;
 using ch::EditorController;
@@ -220,6 +221,8 @@ private slots:
     void aSuccessfulSaveStillClearsASnapshotThatWasStillInFlight();
     void aReportAfterASaveCancelsTheTruncateThatSaveDeferred();
     void aDeferredTruncateSurvivesTheSnapshotRetryChain();
+    void cleanSaveAcknowledgmentClearsAnOwnedSnapshotRetry_data();
+    void cleanSaveAcknowledgmentClearsAnOwnedSnapshotRetry();
     void aStaleSnapshotReplyDoesNotDisturbTheNextFilesBookkeeping();
     void aSecondSaveOfTheSameBufferIsNotASecondWriteAndNotAConflict();
     void aSecondSaveOfChangedBytesIsRewrittenAgainstTheRevisionItNowNeeds();
@@ -274,6 +277,14 @@ private slots:
     void preparedReloadPreservesRAMAcrossSaveCompletion();
     void preparedReloadCanRetryBeforeAndAfterReady();
     void pageBridgeDisposalChecksOwnershipAndRetiresImmediately();
+    void recoveryRestorePreservesTheDiskBaseline();
+    void recoveryRestoreRejectsSupersededOffers_data();
+    void recoveryRestoreRejectsSupersededOffers();
+    void reentrantTransportBindKeepsOneCurrentWatch();
+    void detachedDocumentRetainsRAMAcrossLateRepliesAndPeerReplacement_data();
+    void detachedDocumentRetainsRAMAcrossLateRepliesAndPeerReplacement();
+    void detachedDocumentRejectsLateWatchAndRecoveryContinuations_data();
+    void detachedDocumentRejectsLateWatchAndRecoveryContinuations();
     void missingRecoveryScopeDisablesRemoteSnapshots_data();
     void missingRecoveryScopeDisablesRemoteSnapshots();
     void recoveryScopeTupleKeepsDocumentsIndependent_data();
@@ -2957,6 +2968,76 @@ void TstEditorController::aDeferredTruncateSurvivesTheSnapshotRetryChain()
     QCOMPARE(reqExpectedRevision(truncate), QStringLiteral("recY"));
 }
 
+void TstEditorController::cleanSaveAcknowledgmentClearsAnOwnedSnapshotRetry_data()
+{
+    QTest::addColumn<bool>("acknowledgeBeforeMismatch");
+    QTest::addColumn<QString>("record");
+    for (const bool before : {false, true}) {
+        const QByteArray timing = before ? "ack-before-mismatch-" : "ack-during-read-";
+        QTest::newRow((timing + "owned").constData()) << before << QStringLiteral("owned");
+        QTest::newRow((timing + "foreign").constData()) << before << QStringLiteral("foreign");
+        QTest::newRow((timing + "tombstone").constData()) << before << QStringLiteral("tombstone");
+    }
+}
+
+void TstEditorController::cleanSaveAcknowledgmentClearsAnOwnedSnapshotRetry()
+{
+    QFETCH(bool, acknowledgeBeforeMismatch);
+    QFETCH(QString, record);
+    makePair();
+    const QString path = QStringLiteral("/foo/f.txt");
+    openClean(path, QStringLiteral("original"), QStringLiteral("r1"));
+    connect(m_controller, &EditorController::saved, m_controller,
+            [this](const QString& revision) {
+                // The real Monaco saved handler reconciles exact byte equality.
+                m_controller->reportDirty(false, revision);
+            });
+    m_controller->reportContent(QStringLiteral("old edit"));
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(method(snapshot), kWriteFile);
+    QJsonObject ownershipRead;
+    if (!acknowledgeBeforeMismatch) {
+        respondError(reqId(snapshot), ch::rpc::kRevisionMismatch,
+                     QStringLiteral("snapshot exists"), QJsonObject{});
+        ownershipRead = nextRequest();
+        QCOMPARE(method(ownershipRead), kReadFile);
+    }
+
+    QSignalSpy saved(m_controller, &EditorController::saved);
+    m_controller->save(QStringLiteral("latest saved text"), QStringLiteral("r1"));
+    const QJsonObject save = nextRequest();
+    QCOMPARE(reqPath(save), path);
+    respondResult(reqId(save), {{"revision", "r2"}});
+    QTRY_COMPARE(saved.count(), 1);
+    QVERIFY(!m_controller->dirty());
+    if (acknowledgeBeforeMismatch) {
+        respondError(reqId(snapshot), ch::rpc::kRevisionMismatch,
+                     QStringLiteral("snapshot exists"), QJsonObject{});
+        ownershipRead = nextRequest();
+        QCOMPARE(method(ownershipRead), kReadFile);
+    }
+    const QString payload = record == QLatin1String("tombstone") ? QString()
+        : snapshotEnvelope(path, QStringLiteral("previous crash text"),
+                           record == QLatin1String("foreign")
+                               ? QStringLiteral("another-pane") : kPaneId);
+    respondResult(reqId(ownershipRead),
+                  {{"encoding", "utf-8"}, {"content", payload},
+                   {"revision", "recX"}, {"truncated", false}});
+    if (record == QLatin1String("owned")) {
+        const QJsonObject clear = nextRequest();
+        QCOMPARE(method(clear), kWriteFile);
+        QCOMPARE(reqPath(clear), recoveryFilePath());
+        QCOMPARE(reqContent(clear), QString());
+        QCOMPARE(reqExpectedRevision(clear), QStringLiteral("recX"));
+        respondResult(reqId(clear), {{"revision", "recY"}});
+    }
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+    QVERIFY2(nextRequest(100).isEmpty(),
+             "a superseded retry rewrote old edits, cleared foreign work, or duplicated a clear");
+    QVERIFY(!m_controller->dirty());
+    QCOMPARE(m_controller->revision(), QStringLiteral("r2"));
+}
+
 // The in-flight count and the deferred-truncate intent are shared pane state, so a
 // snapshot write belonging to a file the pane has since left must not touch either.
 // Without a generation stamp the stale reply decrements the NEW file's count, which
@@ -5541,6 +5622,357 @@ void TstEditorController::foreignRecoveryEnvelopeIsNeverOverwritten()
     respondResult(reqId(mainWrite), {{"revision", "r2"}});
     QTRY_VERIFY(!m_controller->dirty());
     QVERIFY2(nextRequest(100).isEmpty(), "a successful save truncated a foreign record");
+}
+
+void TstEditorController::recoveryRestorePreservesTheDiskBaseline()
+{
+    makePair();
+    auto* page = qobject_cast<ch::EditorPageBridge*>(m_controller->createPageBridge());
+    QVERIFY(page);
+    const QString path = QStringLiteral("/foo/f.txt");
+    openClean(path, QStringLiteral("disk baseline"), QStringLiteral("r1"));
+    QSignalSpy restored(page, &ch::EditorPageBridge::bufferRestored);
+    QSignalSpy loaded(page, &ch::EditorPageBridge::contentLoaded);
+    QVERIFY(m_controller->restoreRecovery(QStringLiteral("recovered work"),
+                                         m_controller->recoveryContextRevision(),
+                                         QStringLiteral("r1")));
+    QCOMPARE(restored.count(), 1);
+    QCOMPARE(restored.first().at(0).toString(), QStringLiteral("recovered work"));
+    QCOMPARE(restored.first().at(1).toString(), QStringLiteral("disk baseline"));
+    QCOMPARE(restored.first().at(2).toString(), QStringLiteral("r1"));
+    QCOMPARE(restored.first().at(4).toBool(), false);
+    QCOMPARE(loaded.count(), 0);
+    QVERIFY(m_controller->dirty());
+    const QJsonObject snapshot = nextRequest();
+    QCOMPARE(snapshotContentOf(snapshot), QStringLiteral("recovered work"));
+    respondResult(reqId(snapshot), {{"revision", "rec1"}});
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+
+    // Edit and undo to the recovered text, not to the on-disk baseline.
+    page->reportDirty(true, QStringLiteral("r1"));
+    page->reportContent(QStringLiteral("recovered work"));
+    const QJsonObject afterUndo = nextRequest();
+    QCOMPARE(snapshotContentOf(afterUndo), QStringLiteral("recovered work"));
+    respondResult(reqId(afterUndo), {{"revision", "rec2"}});
+    sendNotification(kWatchEvent, {{"path", path}, {"revision", "external-r2"}});
+    servePermissionStat();
+    QTRY_COMPARE(m_controller->fileState(), QStringLiteral("externally_modified"));
+    QVERIFY(m_controller->dirty());
+    QCOMPARE(loaded.count(), 0);
+    QVERIFY2(nextRequest(100).isEmpty(), "a watch change replaced restored unsaved work");
+}
+
+void TstEditorController::recoveryRestoreRejectsSupersededOffers_data()
+{
+    QTest::addColumn<QString>("change");
+    for (const auto* change : {"scope-gap", "scope-change", "scope-gap-restored",
+                               "disk-reload", "new-local-edits", "pending-save",
+                               "new-page-not-ready", "loading"})
+        QTest::newRow(change) << QString::fromLatin1(change);
+}
+
+void TstEditorController::recoveryRestoreRejectsSupersededOffers()
+{
+    QFETCH(QString, change);
+    makePair();
+    auto* page = qobject_cast<ch::EditorPageBridge*>(m_controller->createPageBridge());
+    QVERIFY(page);
+    const QString path = QStringLiteral("/foo/f.txt");
+    openClean(path, QStringLiteral("disk baseline"), QStringLiteral("r1"));
+    const quint64 context = m_controller->recoveryContextRevision();
+    if (change.startsWith(QLatin1String("scope-gap"))) {
+        m_controller->setRecoveryScope(kServerId, QString(), kPaneId);
+        if (change == QLatin1String("scope-gap-restored")) {
+            m_controller->setRecoveryScope(kServerId, kSessionId, kPaneId);
+            const QJsonObject probe = nextRequest();
+            QCOMPARE(method(probe), kStat);
+            respondError(reqId(probe), -32002, QStringLiteral("ENOENT"));
+            QTRY_COMPARE(m_client->pendingCount(), 0);
+        }
+    } else if (change == QLatin1String("scope-change")) {
+        m_controller->setRecoveryScope(kServerId, QStringLiteral("other-session"), kPaneId);
+    } else if (change == QLatin1String("disk-reload") || change == QLatin1String("loading")) {
+        page->requestReload();
+        const QJsonObject read = nextRequest();
+        QCOMPARE(method(read), kReadFile);
+        if (change == QLatin1String("disk-reload")) {
+            respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "new disk baseline"},
+                                       {"revision", "r2"}, {"truncated", false}});
+            servePermissionStat();
+            QTRY_COMPARE(m_controller->fileState(), QStringLiteral("clean"));
+        }
+    } else if (change == QLatin1String("new-local-edits")) {
+        page->reportDirty(true, QStringLiteral("r1"));
+    } else if (change == QLatin1String("pending-save")) {
+        page->save(QStringLiteral("newer work"), QStringLiteral("r1"));
+        QCOMPARE(method(nextRequest()), kWriteFile);
+    } else {
+        m_controller->createPageBridge();
+    }
+    const bool dirty = m_controller->dirty();
+    const QString revision = m_controller->revision();
+    QSignalSpy restored(page, &ch::EditorPageBridge::bufferRestored);
+    QSignalSpy loaded(m_controller, &EditorController::contentLoaded);
+    QVERIFY(!m_controller->restoreRecovery(QStringLiteral("stale recovered work"),
+                                          context, QStringLiteral("r1")));
+    QCOMPARE(m_controller->dirty(), dirty);
+    QCOMPARE(m_controller->revision(), revision);
+    QCOMPARE(restored.count(), 0);
+    QCOMPARE(loaded.count(), 0);
+    QVERIFY2(nextRequest(100).isEmpty(), "a stale recovery offer wrote or replaced current work");
+}
+
+void TstEditorController::reentrantTransportBindKeepsOneCurrentWatch()
+{
+    // Install this listener BEFORE constructing the editor, as an application
+    // connection manager can synchronously finish another bind in this signal.
+    delete m_controller;
+    m_controller = nullptr;
+    QLocalServer replacementServer;
+    const QString socketName = QStringLiteral("ch_editor_reentrant_%1_%2")
+                                   .arg(QCoreApplication::applicationPid()).arg(++s_seq);
+    QVERIFY(replacementServer.listen(socketName));
+    QLocalSocket finalClient;
+    finalClient.connectToServer(socketName);
+    QVERIFY(finalClient.waitForConnected(2000));
+    QVERIFY(replacementServer.waitForNewConnection(2000));
+    QLocalSocket* finalServer = replacementServer.nextPendingConnection();
+    QVERIFY(finalServer);
+    bool replaceOnBind = false;
+    const auto earlier = connect(m_client, &CodeharbordClient::transportBound, m_client,
+                                 [this, &replaceOnBind, &finalClient](quint64) {
+        if (std::exchange(replaceOnBind, false))
+            m_client->setTransport(&finalClient);
+    });
+    m_controller = new EditorController(m_client, kServerId, kSessionId, kPaneId);
+    m_controller->setRecoveryDir(kRecoveryBase);
+    makePair();
+    const QString path = QStringLiteral("/foo/f.txt");
+    openClean(path, QStringLiteral("disk baseline"), QStringLiteral("r1"));
+    replaceOnBind = true;
+    m_client->setTransport(nullptr);
+    m_client->setTransport(m_clientSide);
+    disconnect(earlier);
+    delete m_serverSide;
+    m_serverSide = finalServer;
+    finalServer->setParent(m_server);
+    m_serverBuf.clear();
+
+    const QJsonObject watch = nextRequest();
+    QCOMPARE(method(watch), kWatch);
+    respondResult(reqId(watch), {{"subscriptionId", "final-watch"}});
+    const QJsonObject stat = nextRequest();
+    QCOMPARE(method(stat), kStat);
+    respondResult(reqId(stat), {{"revision", "r1"}, {"kind", "file"}, {"writable", true}});
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+    QVERIFY2(nextRequest(100).isEmpty(), "an obsolete bound signal duplicated the current watch");
+
+    // Teardown must release exactly the id established on the final peer.
+    delete m_controller;
+    m_controller = nullptr;
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("final-watch"));
+    respondResult(reqId(unwatch), {});
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+    m_client->setTransport(nullptr);
+}
+
+void TstEditorController::detachedDocumentRetainsRAMAcrossLateRepliesAndPeerReplacement_data()
+{
+    QTest::addColumn<bool>("pendingSave");
+    QTest::newRow("late-save") << true;
+    QTest::newRow("late-reload") << false;
+}
+
+void TstEditorController::detachedDocumentRetainsRAMAcrossLateRepliesAndPeerReplacement()
+{
+    QFETCH(bool, pendingSave);
+    makePair();
+    auto* page = qobject_cast<ch::EditorPageBridge*>(m_controller->createPageBridge());
+    QVERIFY(page);
+    const QString path = QStringLiteral("/old-workspace/file.txt");
+    const QString baseline = QStringLiteral("original disk bytes");
+    const QString ram = QStringLiteral("unsaved RAM kept for copying");
+    openClean(path, baseline, QStringLiteral("r1"));
+    const quint64 oldContext = m_controller->recoveryContextRevision();
+    QVERIFY(m_controller->preparePageReload(ram, oldContext));
+    const QJsonObject recoveryWrite = nextRequest();
+    QCOMPARE(snapshotContentOf(recoveryWrite), ram);
+    sendNotification(kWatchEvent, {{"path", path}, {"revision", "external"}});
+    const QJsonObject permission = nextRequest();
+    QCOMPARE(method(permission), kStat);
+    if (pendingSave)
+        page->save(ram, QStringLiteral("r1"));
+    else
+        page->requestReload();
+    const QJsonObject operation = nextRequest();
+    QCOMPARE(method(operation), pendingSave ? kWriteFile : kReadFile);
+    QSignalSpy loaded(page, &ch::EditorPageBridge::contentLoaded);
+    QSignalSpy restored(page, &ch::EditorPageBridge::bufferRestored);
+    QSignalSpy saved(page, &ch::EditorPageBridge::saved);
+    QSignalSpy errors(page, &ch::EditorPageBridge::saveError);
+    QSignalSpy recovery(m_controller, &EditorController::recoveryAvailable);
+    m_controller->detachFromServer();
+    QVERIFY(m_controller->dirty());
+    QVERIFY(!m_controller->readOnly());
+    QVERIFY(!m_controller->recoveryEnabled());
+    QVERIFY(m_controller->hasPageReloadContent(page));
+    QCOMPARE(m_controller->path(), path);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->fileState(), QStringLiteral("disconnected"));
+    const quint64 retiredContext = m_controller->recoveryContextRevision();
+    QVERIFY(retiredContext != oldContext);
+    const QJsonObject unwatch = nextRequest();
+    QCOMPARE(method(unwatch), kUnwatch);
+    QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+    respondResult(reqId(unwatch), {});
+    m_controller->detachFromServer();
+    QCOMPARE(m_controller->recoveryContextRevision(), retiredContext);
+
+    // Replies from the former authority cannot re-baseline or clear retained
+    // work, refresh its permissions, or deliver a fetched replacement.
+    respondResult(reqId(recoveryWrite), {{"revision", "old-rec1"}});
+    respondResult(reqId(permission), {{"kind", "file"}, {"writable", false}});
+    respondResult(reqId(operation), pendingSave
+        ? QJsonObject{{"revision", "r2"}}
+        : QJsonObject{{"encoding", "utf-8"}, {"content", "late server replacement"},
+                      {"revision", "r2"}, {"truncated", false}});
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+    QCOMPARE(loaded.count(), 0);
+    QCOMPARE(saved.count(), 0);
+    QCOMPARE(recovery.count(), 0);
+    QVERIFY(m_controller->dirty());
+    QVERIFY(!m_controller->readOnly());
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QVERIFY2(nextRequest(100).isEmpty(), "retired replies started another file operation");
+    page->ready();
+    QCOMPARE(restored.count(), 1);
+    QCOMPARE(restored.first().at(0).toString(), ram);
+    QCOMPARE(restored.first().at(1).toString(), baseline);
+    QCOMPARE(restored.first().at(2).toString(), QStringLiteral("r1"));
+    QCOMPARE(restored.first().at(4).toBool(), false);
+
+    // The borrowed client is still alive and may serve another workspace.
+    // This document must never acquire that new peer or recovery identity.
+    reconnectTransport();
+    QVERIFY2(nextRequest(100).isEmpty(), "a retired document subscribed on the replacement peer");
+    m_controller->setRecoveryScope(QStringLiteral("new-server"),
+                                    QStringLiteral("new-session"), QStringLiteral("new-pane"));
+    m_controller->setRecoveryDir(QStringLiteral("/new-workspace/recovery"));
+    m_controller->open(QStringLiteral("/new-workspace/other.txt"));
+    page->requestReload();
+    page->reportDirty(true, QStringLiteral("r1"));
+    page->reportContent(QStringLiteral("retained page can still edit locally"));
+    page->save(QStringLiteral("must not cross peers"), QStringLiteral("r1"));
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(errors.first().first().toString().contains(QStringLiteral("retired workspace")));
+    QCOMPARE(m_controller->path(), path);
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(m_controller->recoveryContextRevision(), retiredContext);
+    QVERIFY(!m_controller->recoveryEnabled());
+    QVERIFY(m_controller->dirty());
+    QVERIFY(!m_controller->preparePageReload(QStringLiteral("stale capture"), oldContext));
+    sendNotification(kWatchEvent, {{"path", path}, {"revision", "new-peer-change"}});
+    QVERIFY2(nextRequest(100).isEmpty(), "a retired document read or wrote through the new peer");
+    QCOMPARE(loaded.count(), 0);
+    QCOMPARE(saved.count(), 0);
+}
+
+void TstEditorController::detachedDocumentRejectsLateWatchAndRecoveryContinuations_data()
+{
+    QTest::addColumn<bool>("pendingWatch");
+    QTest::addColumn<bool>("replacePeer");
+    QTest::newRow("late-watch-same-peer") << true << false;
+    QTest::newRow("late-watch-foreign-peer") << true << true;
+    QTest::newRow("late-recovery-ownership-read") << false << false;
+}
+
+void TstEditorController::detachedDocumentRejectsLateWatchAndRecoveryContinuations()
+{
+    QFETCH(bool, pendingWatch);
+    QFETCH(bool, replacePeer);
+    makePair();
+    auto* page = qobject_cast<ch::EditorPageBridge*>(m_controller->createPageBridge());
+    QVERIFY(page);
+    const QString path = QStringLiteral("/old-workspace/file.txt");
+    QJsonObject pending;
+    QJsonObject permission;
+    if (pendingWatch) {
+        page->ready();
+        m_controller->open(path);
+        const QJsonObject read = nextRequest();
+        respondResult(reqId(read), {{"encoding", "utf-8"}, {"content", "disk baseline"},
+                                   {"revision", "r1"}, {"truncated", false}});
+        pending = nextRequest();
+        QCOMPARE(method(pending), kWatch);
+        permission = nextRequest();
+        QCOMPARE(method(permission), kStat);
+        page->reportDirty(true, QStringLiteral("r1"));
+    } else {
+        openClean(path, QStringLiteral("disk baseline"), QStringLiteral("r1"));
+        page->reportContent(QStringLiteral("visible dirty work"));
+        const QJsonObject snapshot = nextRequest();
+        respondError(reqId(snapshot), ch::rpc::kRevisionMismatch,
+                     QStringLiteral("existing owned snapshot"));
+        pending = nextRequest();
+        QCOMPARE(method(pending), kReadFile);
+    }
+    QSignalSpy loaded(page, &ch::EditorPageBridge::contentLoaded);
+    QSignalSpy recovery(m_controller, &EditorController::recoveryAvailable);
+    m_controller->detachFromServer();
+    if (!pendingWatch) {
+        const QJsonObject unwatch = nextRequest();
+        QCOMPARE(method(unwatch), kUnwatch);
+        QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("sub1"));
+        respondResult(reqId(unwatch), {});
+    }
+    QLocalServer replacementServer;
+    QLocalSocket replacementClient;
+    QLocalSocket* replacementPeer = nullptr;
+    if (replacePeer) {
+        const QString name = QStringLiteral("ch_retired_editor_peer_%1_%2")
+                                 .arg(QCoreApplication::applicationPid()).arg(++s_seq);
+        QVERIFY(replacementServer.listen(name));
+        replacementClient.connectToServer(name);
+        QVERIFY(replacementClient.waitForConnected(2000));
+        QVERIFY(replacementServer.waitForNewConnection(2000));
+        replacementPeer = replacementServer.nextPendingConnection();
+        QVERIFY(replacementPeer);
+        m_client->setTransport(&replacementClient);
+    }
+    respondResult(reqId(pending), pendingWatch
+        ? QJsonObject{{"subscriptionId", "retired-watch"}}
+        : QJsonObject{{"encoding", "utf-8"},
+                      {"content", snapshotEnvelope(path, QStringLiteral("former crash text"))},
+                      {"revision", "old-rec1"}, {"truncated", false}});
+    if (pendingWatch)
+        respondResult(reqId(permission), {{"kind", "file"}, {"writable", false}});
+    if (replacePeer) {
+        // The late success is delivered only on the former socket, never
+        // relabeled as a reply from the new peer. It has no current callback.
+        delete m_serverSide;
+        m_serverSide = replacementPeer;
+        replacementPeer->setParent(m_server);
+        m_serverBuf.clear();
+    } else if (pendingWatch) {
+        // Retirement revoked document authority, not the one-shot capability
+        // to release a subscription this exact old binding just created.
+        const QJsonObject unwatch = nextRequest();
+        QCOMPARE(method(unwatch), kUnwatch);
+        QCOMPARE(reqSubscriptionId(unwatch), QStringLiteral("retired-watch"));
+        respondResult(reqId(unwatch), {});
+    }
+    QTRY_COMPARE(m_client->pendingCount(), 0);
+    QVERIFY(m_controller->dirty());
+    QVERIFY(!m_controller->readOnly());
+    QCOMPARE(m_controller->revision(), QStringLiteral("r1"));
+    QCOMPARE(loaded.count(), 0);
+    QCOMPARE(recovery.count(), 0);
+    page->ready();
+    QVERIFY2(nextRequest(100).isEmpty(), "a retired continuation used new document or foreign-peer I/O");
+    if (replacePeer)
+        m_client->setTransport(nullptr);
 }
 
 QTEST_GUILESS_MAIN(TstEditorController)

@@ -31,6 +31,146 @@ Rectangle {
     // default node before its real node arrived. The app supplies the SPEC 4.5
     // "always one pane" default (see Main.qml).
     property var node: null
+    // `node` remains authoritative. Only rendering may wait for an unsaved
+    // document to be saved or explicitly discarded after a remote layout edit.
+    property var displayNode: null
+    property bool layoutDeferred: false
+    property var consentedPaneRetirement: null
+    property bool contextRetired: false
+
+    function retainRetiredContext() {
+        region.contextRetired = true;
+        region.layoutDeferred = true;
+        region.paneStamps = ({});
+        region.pendingOpenTargets = ({});
+        let snapshot = region.displayNode;
+        for (const key in region.paneCache) {
+            const pane = region.paneCache[key];
+            if (pane.contentDirty || pane.contextRetired) {
+                // Native detachment happens before changing any pane identity
+                // or page state. The same visible document can now only be local.
+                pane.retireServerContext();
+            } else {
+                // Destruction is deferred by QML; retire clean controllers too
+                // before a replacement peer can be wired in the same turn.
+                pane.retireServerContext();
+                delete region.paneCache[key];
+                delete region.paneStamps[key];
+                pane.destroy();
+                snapshot = region.replaceDisplayedLeaf(snapshot, key, null);
+            }
+        }
+        region.displayNode = snapshot;
+    }
+
+    function withConsentedPaneClose(paneId, action) {
+        const previous = region.consentedPaneRetirement;
+        region.consentedPaneRetirement = region.paneCache[paneId] || null;
+        try {
+            action();
+        } finally {
+            if (region.regionAlive === true)
+                region.consentedPaneRetirement = previous;
+        }
+    }
+
+    function leafForPane(tree, paneId) {
+        if (!tree)
+            return null;
+        if (region.isLeaf(tree))
+            return region.paneKeyOf(tree) === paneId ? tree : null;
+        for (const child of tree.children) {
+            const leaf = region.leafForPane(child, paneId);
+            if (leaf)
+                return leaf;
+        }
+        return null;
+    }
+
+    function leafAddress(leaf) {
+        const address = leaf && leaf.url ? String(leaf.url) : "";
+        return address.length > 0 ? String(Qt.resolvedUrl(address)) : "";
+    }
+
+    function reconcileDisplayNode() {
+        if (region.rootRegion) {
+            region.displayNode = region.node;
+            return;
+        }
+        if (region.contextRetired)
+            return; // Detached documents remain visible until locally closed.
+        let deferred = false;
+        for (const key in region.paneCache) {
+            const pane = region.paneCache[key];
+            const leaf = region.leafForPane(region.node, key);
+            pane.layoutConflict = pane.contentDirty
+                && ((!leaf && pane !== region.consentedPaneRetirement)
+                    || (leaf && pane.url.toString() !== region.leafAddress(leaf)));
+            deferred = deferred || pane.layoutConflict;
+        }
+        region.layoutDeferred = deferred;
+        for (const key in region.paneCache)
+            region.paneCache[key].layoutBlocked = deferred;
+        if (!deferred)
+            region.displayNode = region.node;
+    }
+
+    // Consenting to close a retained document discards ONLY that local
+    // document, never the current same-id remote replacement. Other dirty
+    // documents can still hold the remaining rendered snapshot.
+    function replaceDisplayedLeaf(tree, paneId, replacement) {
+        if (!tree || region.isLeaf(tree))
+            return tree && region.paneKeyOf(tree) === paneId ? replacement : tree;
+        const children = [];
+        let changed = false;
+        for (const child of tree.children) {
+            const next = region.replaceDisplayedLeaf(child, paneId, replacement);
+            changed = changed || next !== child;
+            if (next)
+                children.push(next);
+        }
+        if (!changed)
+            return tree;
+        if (children.length === 0)
+            return null;
+        if (children.length === 1)
+            return children[0];
+        return Object.assign({}, tree, {
+            children: children,
+            ratios: children.length === tree.children.length
+                    ? tree.ratios : children.map(() => 1 / children.length)
+        });
+    }
+
+    function closeRetainedPane(paneId) {
+        const pane = region.paneCache[paneId];
+        if (!pane || !region.layoutDeferred || !pane.layoutConflict)
+            return false;
+        if (region.contextRetired) {
+            delete region.paneCache[paneId];
+            delete region.paneStamps[paneId];
+            pane.destroy();
+            if (Object.keys(region.paneCache).length === 0) {
+                region.resetPanesForNewTree(true);
+            } else {
+                region.displayNode = region.replaceDisplayedLeaf(region.displayNode, paneId, null);
+                region.paneEpoch += 1;
+            }
+            return true;
+        }
+        delete region.paneCache[paneId];
+        delete region.paneStamps[paneId];
+        pane.destroy();
+        region.reconcileDisplayNode();
+        if (region.layoutDeferred) {
+            region.displayNode = region.replaceDisplayedLeaf(
+                region.displayNode, paneId, region.leafForPane(region.node, paneId));
+        }
+        // The leaf may still be present at the same address in the rendered
+        // shape, so force a new borrow after retiring the old local document.
+        region.paneEpoch += 1;
+        return true;
+    }
     // The host stamps every write with the session and layout load generation
     // that was current when the gesture began. A delayed pane callback can
     // therefore be rejected in C++ even if QML has already switched sessions.
@@ -110,6 +250,8 @@ Rectangle {
 
     function reportRatiosForSession(sessionId, generation, pathIndexes, ratios) {
         const owner = region.paneOwner;
+        if (owner.layoutDeferred)
+            return;
         if (owner.hostStampsWrites) {
             if (String(sessionId).length === 0)
                 return; // production has no session to stamp, so do not write
@@ -169,6 +311,8 @@ Rectangle {
         if (!host)
             return null;
         let pane = region.paneCache[paneId];
+        if (!pane && region.contextRetired)
+            return null; // Never mint a new owner's document into the retired view.
         if (!pane) {
             // Parked first and given its identity only afterwards: a pane must
             // already be in the tree when it announces a paneId, or an observer
@@ -184,6 +328,12 @@ Rectangle {
             // Item is re-parented, never rebuilt, so the connection (and the id
             // it reports) outlive the republish that moved it.
             pane.paneActivated.connect(region.noteFocus);
+            pane.contentDirtyChanged.connect(() => Qt.callLater(() => {
+                // Local URL reports deliberately do not republish the tree.
+                // Only reconcile an already-detected remote divergence here.
+                if (region.layoutDeferred)
+                    region.reconcileDisplayNode();
+            }));
             // Same reasoning for what the pane is SHOWING: wired once, at mint
             // time, so the report survives the re-parenting a split performs.
             //
@@ -212,10 +362,13 @@ Rectangle {
                 region.reportForPane(id, (sessionId, generation) =>
                     region.paneOwner.notePaneUrlForSession(
                         sessionId, generation, id, url)));
-            pane.closeRequested.connect(id =>
-                region.reportForPane(id, (sessionId, generation) =>
-                    region.paneOwner.notePaneCloseForSession(
-                        sessionId, generation, id)));
+            pane.closeRequested.connect(id => {
+                if (region.closeRetainedPane(id))
+                    return;
+                region.withConsentedPaneClose(id, () =>
+                    region.reportForPane(id, (sessionId, generation) =>
+                        region.paneOwner.notePaneCloseForSession(sessionId, generation, id)));
+            });
             pane.splitRequested.connect((id, orientation) =>
                 region.reportForPane(id, (sessionId, generation) =>
                     region.paneOwner.notePaneSplitForSession(
@@ -229,15 +382,15 @@ Rectangle {
             pane.messageRequested.connect(
                 message => region.paneOwner.messageRequested(message));
         }
-        pane.acceptedServerId = region.paneOwner.acceptedServerId;
-        pane.sessionId = region.paneOwner.sessionId;
-        // Refreshed on EVERY take, not only at mint: this is the moment the
-        // pane becomes part of whatever tree is on screen now, so it is the
-        // moment its reports start belonging to that session.
-        region.paneOwner.paneStamps[paneId] = {
-            sessionId: String(region.paneOwner.sessionId),
-            generation: Number(region.paneOwner.layoutGeneration)
-        };
+        if (!region.paneOwner.contextRetired) {
+            pane.acceptedServerId = region.paneOwner.acceptedServerId;
+            pane.sessionId = region.paneOwner.sessionId;
+            region.paneOwner.paneStamps[paneId] = {
+                sessionId: String(region.paneOwner.sessionId),
+                generation: Number(region.paneOwner.layoutGeneration)
+            };
+        }
+        pane.layoutBlocked = region.paneOwner.layoutDeferred;
         if (pane.parent !== host) {
             pane.anchors.fill = null;
             pane.parent = host;
@@ -255,6 +408,10 @@ Rectangle {
     // to, so both drop the report rather than guessing at the current session -
     // guessing is precisely how one session's edit lands on another's layout.
     function reportForPane(paneId, deliver) {
+        if (region.paneOwner.layoutDeferred) {
+            region.paneOwner.messageRequested(qsTr("Save or close the retained unsaved editors before changing the viewer layout."));
+            return;
+        }
         // An unstamped pane is one no tree has taken yet; it has nothing to
         // report about. Otherwise deliver under the pane's own stamp and let
         // the owner decide what an empty session means - in production it
@@ -294,7 +451,7 @@ Rectangle {
     // lot, invisibly holding its page open.
     function sweepPanes() {
         const cache = region.paneCache;
-        const live = region.collectPaneKeys(region.node, {});
+        const live = region.collectPaneKeys(region.displayNode, {});
         for (const key in cache) {
             if (live[key])
                 continue;
@@ -391,15 +548,17 @@ Rectangle {
     // materialised the pane yet; Main.qml retries rather than dropping focus.
     function focusPane(paneId) {
         const owner = region.paneOwner;
+        if (owner.contextRetired)
+            return false; // Host focus names the current owner, not old local RAM.
         if (owner !== region)
             return owner.focusPane(paneId);
         let requested = paneId === undefined || paneId === null
                         || String(paneId).length === 0
-                      ? region.firstPaneId(region.node)
+                      ? region.firstPaneId(region.displayNode)
                       : String(paneId);
         let pane = owner.paneCache[requested];
-        if (!pane && !region.hasPane(region.node, requested)) {
-            requested = region.firstPaneId(region.node);
+        if (!pane && !region.hasPane(region.displayNode, requested)) {
+            requested = region.firstPaneId(region.displayNode);
             pane = owner.paneCache[requested];
         }
         if (!pane)
@@ -549,16 +708,17 @@ Rectangle {
     function syncPane() {
         if (!region.paneHostReady)
             return;
-        const leaf = region.node && region.isLeaf(region.node);
-        const key = leaf ? region.paneKeyOf(region.node) : "";
+        const leaf = region.displayNode && region.isLeaf(region.displayNode);
+        const key = leaf ? region.paneKeyOf(region.displayNode) : "";
         if (region.showingPane && (!leaf || key !== region.shownPaneId))
             region.releasePane();
         if (!leaf)
             return;
-        const url = region.node.url ? region.node.url : "";
+        const url = region.displayNode.url ? region.displayNode.url : "";
         const pane = region.paneOwner.takePane(key, paneHost,
                                                { url: url, placeholder: key.length === 0,
                                                  acceptedServerId: region.paneOwner.acceptedServerId,
+                                                 documentServerId: region.paneOwner.serverId,
                                                  sessionId: region.paneOwner.sessionId });
         if (!pane)
             return;
@@ -580,7 +740,9 @@ Rectangle {
         // is only safe for a NON-empty value: given "" it answers this
         // component's own address.
         const shown = String(url).length > 0 ? String(Qt.resolvedUrl(url)) : "";
-        if (pane.url.toString() !== shown) {
+        if (pane.url.toString() !== shown
+                && !region.paneOwner.contextRetired
+                && !(pane.contentDirty && region.paneOwner.layoutDeferred)) {
             pane.forcedKind = "";
             pane.url = url;
         }
@@ -603,29 +765,35 @@ Rectangle {
         region.shownPaneId = "";
     }
 
-    onNodeChanged: {
-        // Only the OWNER sweeps: its `node` IS the whole tree, while a nested
-        // region's is a subtree — sweeping from one would destroy every pane
-        // outside it.
+    onNodeChanged: region.reconcileDisplayNode()
+    onDisplayNodeChanged: {
         if (!region.rootRegion)
             region.sweepPanes();
         region.syncPane();
     }
 
-    // A Dev Session change replaces the whole tree, and a pane is not portable
-    // between sessions: it holds a page, its scroll position and its own
-    // navigation history, all of which belong to the session that opened it.
-    // Pane ids are per-session labels, so "viewer-1" usually exists on both
-    // sides of the switch and sweepPanes() - which only drops ids that LEFT the
-    // tree - would hand the next session the previous one's pane. Dropping them
-    // here also closes the window in which a report from an old pane could
-    // still be delivered: the pane is gone before the new tree arrives.
-    function resetPanesForNewTree() {
+    // A new server/session/document generation normally retires the old cache.
+    // Unsaved documents instead remain visible with their original identity,
+    // permanently detached from peer I/O, until the user closes/discards them.
+    function resetPanesForNewTree(forceDiscard) {
         if (region.rootRegion)
             return; // only the owner holds the cache
+        if (forceDiscard !== true) {
+            for (const key in region.paneCache) {
+                if (region.contextRetired || region.paneCache[key].contentDirty) {
+                    region.retainRetiredContext();
+                    return;
+                }
+            }
+        }
+        for (const key in region.paneCache)
+            region.paneCache[key].retireServerContext();
+        region.contextRetired = false;
         region.destroyAllPanes();
         region.paneStamps = ({});
         region.pendingOpenTargets = ({});
+        region.layoutDeferred = false;
+        region.displayNode = region.node;
         region.focusResetting = true;
         region.focusedPaneId = "";
         region.focusResetting = false;
@@ -638,7 +806,18 @@ Rectangle {
     onServerIdChanged: region.resetPanesForNewTree()
 
     onAcceptedServerIdChanged: {
-        if (!region.rootRegion) {
+        if (!region.rootRegion && !region.contextRetired) {
+            // Acceptance may notify before serverId. Never relabel an old
+            // dirty controller with a newly accepted peer's recovery scope.
+            for (const key in region.paneCache) {
+                const pane = region.paneCache[key];
+                if (pane.contentDirty && pane.documentServerId.length > 0
+                        && region.acceptedServerId.length > 0
+                        && pane.documentServerId !== region.acceptedServerId) {
+                    region.retainRetiredContext();
+                    return;
+                }
+            }
             for (const key in region.paneCache)
                 region.paneCache[key].acceptedServerId = region.acceptedServerId;
         }
@@ -648,6 +827,10 @@ Rectangle {
         if (region.rootRegion)
             return;
         region.pendingOpenTargets = ({});
+        if (region.contextRetired) {
+            region.paneStamps = ({});
+            return;
+        }
         for (const key in region.paneCache) {
             region.paneCache[key].retireLayoutRequests();
             region.paneStamps[key] = {
@@ -730,6 +913,33 @@ Rectangle {
 
     }
 
+    Rectangle {
+        id: layoutWarning
+        objectName: "viewerLayoutDeferredWarning"
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: region.isRootRegion ? regionHeader.bottom : parent.top
+        visible: region.isRootRegion && region.layoutDeferred
+        height: visible ? layoutWarningText.implicitHeight + 16 : 0
+        color: Theme.surfaceRaised
+        Label {
+            id: layoutWarningText
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 8
+            text: region.contextRetired
+                ? qsTr("Editors from a previous workspace are kept only in local memory. They cannot be saved to any server. Copy the text you need, then close these editors to show the current workspace.")
+                : qsTr("The remote viewer layout changed. Unsaved editors are kept here until you save them or close them without saving. Layout actions are paused; the latest remote layout will then appear.")
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: Theme.warning
+            font.pixelSize: Theme.fontSizeSmall
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: text
+        }
+    }
+
     // Everything the region header does NOT occupy, and the one parent every
     // pane in this region is re-homed into (see syncPane/releasePane). Panes are
     // parented HERE rather than to the region itself so the header cannot end up
@@ -738,7 +948,7 @@ Rectangle {
         id: paneHost
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.top: regionHeader.visible ? regionHeader.bottom : parent.top
+        anchors.top: layoutWarning.bottom
         anchors.bottom: parent.bottom
 
         Loader {
@@ -747,7 +957,7 @@ Rectangle {
             // any Loader, so syncPane() borrows them from the cache instead. A null
             // node still keeps this inert, which is what stops a recursive child
             // from building anything at all before its real node arrives.
-            sourceComponent: region.node && !region.isLeaf(region.node)
+            sourceComponent: region.displayNode && !region.isLeaf(region.displayNode)
                              ? branchComponent : null
         }
     }
@@ -758,7 +968,7 @@ Rectangle {
     function ratioFor(i, count) {
         if (count <= 0)
             return 1;
-        const r = region.node && region.node.ratios ? region.node.ratios : null;
+        const r = region.displayNode && region.displayNode.ratios ? region.displayNode.ratios : null;
         if (r && r.length === count) {
             let sum = 0;
             let valid = true;
@@ -780,7 +990,7 @@ Rectangle {
         id: branchComponent
         SplitView {
             id: split
-            orientation: region.node && region.node.orientation === "vertical"
+            orientation: region.displayNode && region.displayNode.orientation === "vertical"
                          ? Qt.Vertical : Qt.Horizontal
 
             // The application's one divider (SPEC 4.1). Without it the Basic
@@ -792,6 +1002,7 @@ Rectangle {
             // move on screen and then be forgotten at the next reload.
             handle: AppSplitHandle {
                 id: keyHandle
+                enabled: !region.paneOwner.layoutDeferred
                 onResizeStarted: split.beginKeyboardResize(keyHandle)
                 onResizeCancelled: split.cancelKeyboardResize()
                 onResized: split.finishKeyboardResize(keyHandle)
@@ -999,7 +1210,7 @@ Rectangle {
             // children are; this connection is what keeps that visible.
             Connections {
                 target: region
-                function onNodeChanged() {
+                function onDisplayNodeChanged() {
                     split.cancelKeyboardResize();
                     split.ratiosApplied = false;
                     split.applyRatios();
@@ -1020,8 +1231,8 @@ Rectangle {
                 // precisely how a split used to take the user's pane down. Keyed
                 // on the count, a republish that only changes what the children
                 // ARE re-points the surviving regions at their new nodes.
-                model: region.node && region.node.children
-                       ? region.node.children.length : 0
+                model: region.displayNode && region.displayNode.children
+                       ? region.displayNode.children.length : 0
                 // Re-apply on any change to the child set (a new pane added by a
                 // split, or a whole new tree): without resetting the latch a pane
                 // added after first layout would get no preferred size and render
@@ -1036,8 +1247,8 @@ Rectangle {
                     id: childLoader
                     required property int index
                     readonly property var childNode:
-                        region.node && region.node.children
-                        ? region.node.children[childLoader.index] : null
+                        region.displayNode && region.displayNode.children
+                        ? region.displayNode.children[childLoader.index] : null
                     // A divider may be dragged all the way to an edge unless
                     // each child declares a minimum on the active axis. Keep a
                     // live pane reachable and clickable even when the user

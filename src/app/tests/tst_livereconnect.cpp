@@ -49,6 +49,7 @@
 
 #include <memory>
 #include <optional>
+#include <utility>
 
 using ch::AgentStatusMonitor;
 using ch::CodeharbordClient;
@@ -81,6 +82,12 @@ constexpr const char* kDropConnectionCommand =
     "*sshd*) kill -9 \"$pp\";; "
     "*) echo \"refusing to kill non-sshd parent: $(ps -o args= -p $pp)\" >&2;; "
     "esac";
+
+class ScriptBootstrap final : public SessionBootstrap {
+public:
+    using SessionBootstrap::SessionBootstrap;
+    using SessionBootstrap::runRemoteScript;
+};
 
 QString env(const char* key)
 {
@@ -134,6 +141,7 @@ private slots:
     void cleanupTestCase();
 
     void survivesADroppedConnection();
+    void remoteScriptOutputIsBounded();
     void provisionsAnEmptyLocationThenWires();
 
 private:
@@ -243,6 +251,50 @@ void TstLiveReconnect::dropTheConnection()
     QVERIFY2(!killerStderr.contains(QStringLiteral("refusing to kill")),
              qPrintable(QStringLiteral("kill helper refused: %1")
                             .arg(killerStderr)));
+}
+
+void TstLiveReconnect::remoteScriptOutputIsBounded()
+{
+    if (!m_live)
+        QSKIP("live gate not armed");
+    m_bootstrap.reset();
+    m_pool.disconnectFromHost();
+    m_bootstrapErrors.clear();
+    auto bootstrap =
+        std::make_unique<ScriptBootstrap>(&m_pool, &m_client, &m_monitor);
+    ScriptBootstrap* runner = bootstrap.get();
+    m_bootstrap = std::move(bootstrap);
+    connect(runner, &SessionBootstrap::error, this,
+            [this](const QString& message) { m_bootstrapErrors.append(message); });
+    QVERIFY2(runner->connectAndWireFromEnvironment(),
+             qPrintable(m_bootstrapErrors.join(QStringLiteral(" | "))));
+
+    // Use the configured Node and memory only: no remote files, sockets,
+    // history, or database state is created by either noisy command.
+    const QString node = sq(env("CH_LIVE_NODE"));
+    QString output;
+    QString error;
+    const QString stdoutFlood =
+        node + QStringLiteral(" -e ")
+        + sq(QStringLiteral("process.stdout.write('x'.repeat(2 * 1024 * 1024))"));
+    QVERIFY(!runner->runRemoteScript(stdoutFlood, kExecTimeoutMs, &output, &error));
+    QVERIFY2(error.contains(QStringLiteral("output limit")), qPrintable(error));
+    QVERIFY(output.size() <= 1024 * 1024);
+    // Closing the oversized throwaway channel must not close the RPC session.
+    QString detail;
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
+
+    const QString stderrFlood =
+        node + QStringLiteral(" -e ")
+        + sq(QStringLiteral(
+            "process.stderr.write('x'.repeat(2 * 1024 * 1024) + 'TAIL'); "
+            "process.stdout.write('DONE\\n')"));
+    QVERIFY2(runner->runRemoteScript(stderrFlood, kExecTimeoutMs, &output, &error),
+             qPrintable(error));
+    QCOMPARE(output, QStringLiteral("DONE\n"));
+    QVERIFY(error.size() <= 64 * 1024);
+    QVERIFY(error.endsWith(QStringLiteral("TAIL")));
+    QVERIFY2(serverInfoAnswers(&detail), qPrintable(detail));
 }
 
 

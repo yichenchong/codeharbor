@@ -9,15 +9,11 @@
 //     empty/false RESULT — never a thrown RPC error. Malformed requests and
 //     other operational failures remain errors rather than invented absences.
 //
-//  2. No shell. Every tmux invocation goes through execFile with an argv array,
-//     so names cannot interpolate shell commands. tmux ALSO parses command-list
-//     separators: killSession escapes a final `;` to keep it in the name.
-//     Names are passed to `-t` with tmux's `=` exact-match prefix, which stops a
-//     leading `-` from being read as an option
-//     and stops fnmatch/prefix matching from hitting the wrong session. `=` is
-//     NOT total, though: a LEADING `$` is tmux's session-ID form and is
-//     resolved before the exact-name lookup, so it is rejected outright rather
-//     than shielded — see requireKillName.
+//  2. No shell. Every tmux invocation goes through execFile with an argv array.
+//     Destructive operations resolve names against a marked session listing
+//     and target only the session ID from that listing. Even tmux's `=name`
+//     exact-match syntax falls back to an attached client name or tty when no
+//     session has that name, so it is not safe for a destructive name lookup.
 //
 // The command runner is injectable (CommandRunner) so the unit tests drive
 // realistic tmux output without a live server; the real thing is exercised by
@@ -87,10 +83,10 @@ const TMUX_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 // rewrites both characters to `_` at creation time. Verified against the tmux
 // 3.6 on this host: `tmux new-session -s 'ch_a.b:c'` produces a session whose
 // `#{session_name}` reads back `ch_a_b_c`. A stored target carrying either
-// character therefore names a session that CANNOT exist, so the exact-match
-// form (`-t '=<target>'`, which attach and kill both use) misses it outright,
-// while an un-anchored form resolves to whatever session the prefix happens to
-// hit — somebody else's shell.
+// character therefore names a session that CANNOT exist. Attach paths must
+// reject these values instead of letting target parsing resolve them to some
+// other session's window. killSession separately resolves literal names against
+// the session listing and never hands a name to this target grammar.
 //
 // The accepted set is a WHITELIST rather than a blacklist of those two
 // characters, because several more are meaningful in a target position: `$`,
@@ -414,34 +410,6 @@ function requireName(params: unknown, method: string): string {
     }
     throw new InvalidParamsError(`${method} requires a non-empty string name`);
 }
-// `=` makes tmux use an exact target, but it does not make every character
-// literal.
-//
-//  * `:` and `.` remain the window/pane separators, so `other:0` under an
-//    unshielded target addresses another session's window.
-//  * A LEADING `$` is tmux's session-ID form, and it is read BEFORE the
-//    exact-name lookup, so `=` does not shield it. Verified against the tmux
-//    3.6 on this host: with sessions `victim` ($0) and a second session
-//    literally NAMED `$0`, `tmux kill-session -t '=$0'` killed `victim` — the
-//    session whose ID is 0 — and left the one actually called `$0` alive. A
-//    stored or relayed target of `$0` therefore destroys an unrelated session
-//    and the user's work in it, while tmux.sessionExists (which compares
-//    against the listing) reports that no such session exists at all. Only the
-//    first character matters: `a$0` is an ordinary name and tmux matches it
-//    literally, which is why this is a prefix check and not a ban on `$`.
-//  * Control characters come back vis-escaped in tmux's own output, so a stored
-//    name carrying one never matches the session tmux actually made.
-//
-// Reject all of them before a kill target is built.
-function requireKillName(params: unknown): string {
-    const name = requireName(params, RPC_TMUX_METHODS.killSession);
-    if (/[:.\u0000-\u001f\u007f]/.test(name) || name.startsWith("$")) {
-        throw new InvalidParamsError(
-            `${RPC_TMUX_METHODS.killSession} requires a tmux-safe session name`,
-        );
-    }
-    return name;
-}
 
 /**
  * Exact-name existence check. Derived from the listing rather than
@@ -462,23 +430,48 @@ export async function sessionExists(
  * Kill one session by exact name. Idempotent: killing an absent session, or
  * calling this where tmux is not installed, is a successful no-op.
  *
- * `=` pins the lookup to an exact name, so neither an option-shaped nor a glob
- * name can reach another session. It is not a general quoting mechanism: the
- * target grammar still treats `:` and `.` as session/window/pane structure, and
- * a LEADING `$` still selects a session by ID in preference to any name.
- * requireKillName rejects all of those before the argument is built. Other
- * command failures are surfaced instead of reported as a successful kill.
+ * Resolve the literal name to a tmux-issued session ID first. cmd_find_get_session
+ * tries client names and tty paths BEFORE honoring CMD_FIND_EXACT_SESSION, so
+ * even `=name` can kill an unrelated session when the requested name is absent.
+ * An ID also cannot be reinterpreted as a shell option or command separator.
+ * If the named session disappears after the listing, the ID lookup is simply
+ * absent; it must never fall back to a different session with the same name.
  */
 export async function killSession(
     params: KillSessionParams,
     runner: CommandRunner = execFileRunner,
 ): Promise<KillSessionResult> {
-    const name = requireKillName(params);
-    // execFile bypasses the shell, not tmux's own command-list parser: a final
-    // unescaped ';' is stripped as a command separator, so '=work;' would kill
-    // 'work'. Escape that final byte for tmux to preserve the literal name.
-    const target = `=${name.replace(/;$/, "\\;")}`;
-    const result = await run(runner, ["kill-session", "-t", target]);
+    const name = requireName(params, RPC_TMUX_METHODS.killSession);
+    const marker = randomBytes(12).toString("base64url");
+    const anchor = marker + LIST_FIELD_SEPARATOR;
+    // Frame BOTH ends of the name: an embedded newline must not turn its
+    // first fragment into a different, shorter session name that authorizes a
+    // kill. The random suffix is as unguessable to a session's creator as the
+    // record prefix.
+    const suffix = LIST_FIELD_SEPARATOR + marker;
+    const listing = await run(runner, [
+        "list-sessions",
+        "-F",
+        anchor + "#{session_id}" + LIST_FIELD_SEPARATOR + "#{session_name}" + suffix,
+    ]);
+    if (listing.code !== 0) {
+        if (isMissingTmux(listing) || isNoServer(listing)) return {};
+        throw commandFailure("list-sessions", listing);
+    }
+    let sessionId: string | undefined;
+    for (const line of listing.stdout.split("\n")) {
+        if (!line.startsWith(anchor) || !line.endsWith(suffix)) continue;
+        const record = line.slice(anchor.length, -suffix.length);
+        const separator = record.indexOf(LIST_FIELD_SEPARATOR);
+        if (separator < 0 || record.slice(separator + 1) !== name) continue;
+        const id = record.slice(0, separator);
+        if (/^\$\d+$/.test(id)) {
+            sessionId = id;
+            break;
+        }
+    }
+    if (sessionId === undefined) return {};
+    const result = await run(runner, ["kill-session", "-t", sessionId]);
     if (
         result.code === 0 ||
         isMissingTmux(result) ||

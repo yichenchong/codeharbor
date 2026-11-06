@@ -496,6 +496,58 @@ if git --git-dir="$work/preflight-remote.git" rev-parse -q --verify refs/tags/v0
     fail "preflight published a tag after changing HEAD"
 fi
 
+# Preflight must exercise the committed source, not an uncommitted repair that
+# would be absent from the published tag. Check staged, unstaged and new files.
+for dirty_kind in unstaged staged untracked; do
+    make_repo 0.2.0
+    printf 'broken\n' >release-source.txt
+    node -e '
+      const fs = require("node:fs");
+      const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+      config.preflight = ["test \"$(cat new-source.txt 2>/dev/null || cat release-source.txt)\" = fixed"];
+      fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+    '
+    git add release-source.txt .bumpversion.json
+    git commit -q -m "committed broken source with behavior preflight"
+    printf 'fixed\n' >release-source.txt
+    case "$dirty_kind" in
+        staged) git add release-source.txt ;;
+        untracked)
+            git checkout -- release-source.txt
+            printf 'fixed\n' >new-source.txt
+            ;;
+    esac
+    before="$(snapshot)"
+    if bash "$bump" --set 0.2.0 --no-commit --push >"$work/out-dirty-preflight" 2>&1; then
+        fail "release accepted $dirty_kind changes before preflight"
+    fi
+    if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+        fail "release tagged a tree with $dirty_kind changes outside its commit"
+    fi
+    [ "$(snapshot)" = "$before" ] || fail "dirty preflight guard changed version files"
+done
+
+# A command that reports success after rewriting source must not publish those
+# unchecked committed bytes either.
+make_repo 0.2.0
+printf 'before preflight\n' >release-source.txt
+node -e '
+  const fs = require("node:fs");
+  const config = JSON.parse(fs.readFileSync(".bumpversion.json", "utf8"));
+  config.preflight = ["printf \"after preflight\\n\" >release-source.txt"];
+  fs.writeFileSync(".bumpversion.json", JSON.stringify(config, null, 2) + "\n");
+'
+git add release-source.txt .bumpversion.json
+git commit -q -m "preflight that changes source without changing HEAD"
+if bash "$bump" --set 0.2.0 --no-commit --push >"$work/out-preflight-dirty" 2>&1; then
+    fail "release accepted source edits made during preflight"
+fi
+if git rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "preflight source changes left a local release tag"
+fi
+[ "$(cat release-source.txt)" = 'after preflight' ] \
+    || fail "preflight guard discarded the command's changes"
+
 # --- 18e. an old predictable staging path must not redirect file writes ------
 make_repo 0.1.8
 printf 'outside data must not change\n' >"$work/staging-sentinel"

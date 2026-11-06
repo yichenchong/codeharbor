@@ -107,10 +107,10 @@ target_link_libraries(tst_markdownmodel PRIVATE
 )
 add_test(NAME tst_markdownmodel COMMAND tst_markdownmodel)
 
-# Credentials. This target's job is to prove a NEGATIVE: that after a full
-# import/authenticate/forget cycle no byte of the key and no byte of the
-# passphrase exists anywhere under the app's own storage roots, because SPEC
-# 11.2 does not permit the client to store either.
+# Credentials. Without explicit save opt-in, import/authenticate/forget leaves
+# no key or passphrase bytes under app storage. Explicitly saved keys may have
+# one private app-managed copy; the persisted path/profile roundtrip must retain
+# that opt-in without ever persisting a passphrase (SPEC 11.2).
 qt_add_executable(tst_mobilekeystore tst_mobilekeystore.cpp)
 target_link_libraries(tst_mobilekeystore PRIVATE
     ch_mobile

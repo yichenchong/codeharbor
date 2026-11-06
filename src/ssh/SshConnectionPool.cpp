@@ -857,14 +857,12 @@ SshConnectionPool::AuthMethods SshConnectionPool::methodsFromMask(
 SshConnectionPool::AuthOutcome SshConnectionPool::classifyAuthResult(
     int libsshResult)
 {
-    // SSH_AUTH_PARTIAL is the whole point of this function: the method WAS
-    // accepted and the server wants another one. Everything that is neither
-    // success nor partial (denied, error, again, keyboard-interactive info) ends
-    // this rung — SSH_AUTH_AGAIN cannot occur here because the session is
-    // blocking, and SSH_AUTH_INFO reaches this classifier only when the
-    // keyboard-interactive loop in authenticate() gave up mid-conversation
-    // (nobody supplied an answer, libssh refused one, or the round cap was hit),
-    // which is a refusal and not progress.
+    // Success and partial success are the only progress results. Other results
+    // end this rung without granting access. The initial "none" exchange handles
+    // incomplete/error results before calling this classifier: until it
+    // completes, no authentication-method offer may be inferred. SSH_AUTH_INFO
+    // reaches this classifier only when keyboard-interactive gave up
+    // mid-conversation (no answer, a rejected answer, or the round cap).
     switch (libsshResult) {
     case SSH_AUTH_SUCCESS:
         return AuthOutcome::Granted;
@@ -1279,6 +1277,14 @@ void SshConnectionPool::closeSession()
     ssh_free(session);
 }
 
+void SshConnectionPool::refreshConnectionState()
+{
+    if (m_destroying || m_closingSession || m_state != State::Connected
+        || !m_session || ssh_is_connected(m_session))
+        return;
+    setState(State::Disconnected);
+}
+
 bool SshConnectionPool::verifyHostKey(const QString& host)
 {
     if (!m_session || m_disconnectRequested)
@@ -1347,23 +1353,23 @@ bool SshConnectionPool::authenticate(const QString& user,
     if (cancelled())
         return false;
     m_partialMethods.clear();
-    m_publicKeyOffered = false;
+    m_authMethodsKnown = false;
+    m_authMethodsOffered = {};
     // ssh_userauth_list() is only defined after a "none" request. It is not
     // enough to query it after an auto-key failure: some libssh builds then
     // report no methods at all, silently skipping the passphrase callback.
     const int noneResult = ssh_userauth_none(m_session, nullptr);
-    if (noneResult == SSH_AUTH_ERROR) {
-        // Not a refusal: the request itself failed, which in a blocking session
-        // means the transport is gone (the server dropped us right after key
-        // exchange, MaxStartups, a firewall reset). Every rung below would then
-        // fail identically — and the two rungs that need a secret would first
-        // interrupt the user for a passphrase or password that can no longer be
-        // sent anywhere. Stop here instead. Checked before the classification
-        // below because classifyAuthResult() folds this into Refused, which is
-        // exactly the distinction that matters here.
+    if (noneResult != SSH_AUTH_SUCCESS && noneResult != SSH_AUTH_DENIED
+        && noneResult != SSH_AUTH_PARTIAL) {
+        // No completed response means no authoritative method list. In
+        // particular, libssh can return SSH_AUTH_AGAIN on an already-failed
+        // session even in blocking mode. Treating it as a normal refusal would
+        // turn an empty list into "try everything" and request credentials for
+        // an unfinished exchange. Stop without retrying or assuming every
+        // incomplete result means the transport has gone away.
         appendDiagnostic(
-            QStringLiteral("The SSH connection failed before any "
-                           "authentication method could be tried: %1")
+            QStringLiteral("The initial SSH authentication exchange did not "
+                           "complete: %1")
                 .arg(QString::fromUtf8(ssh_get_error(m_session))));
         return false;
     }
@@ -1440,7 +1446,8 @@ bool SshConnectionPool::authenticate(const QString& user,
     AuthMethods offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
     if (cancelled())
         return false;
-    m_publicKeyOffered = offered.publicKey;
+    m_authMethodsOffered = offered;
+    m_authMethodsKnown = true;
     AuthRungsTried tried;
     const bool canPrompt = static_cast<bool>(m_credentialCallback);
 
@@ -1717,6 +1724,9 @@ bool SshConnectionPool::authenticate(const QString& user,
         if (cancelled())
             return false;
         offered = methodsFromMask(ssh_userauth_list(m_session, nullptr));
+        m_authMethodsOffered.publicKey |= offered.publicKey;
+        m_authMethodsOffered.password |= offered.password;
+        m_authMethodsOffered.keyboardInteractive |= offered.keyboardInteractive;
         if (cancelled())
             return false;
     }
@@ -1727,6 +1737,17 @@ QString SshConnectionPool::authenticationFailure() const
 {
     QStringList details;
     details << QStringLiteral("Authentication failed.");
+    if (!m_authMethodsKnown) {
+        details << QStringLiteral(
+            "The SSH authentication exchange failed before the server's "
+            "authentication methods could be determined.");
+        const QString error =
+            m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
+                      : QString();
+        if (!error.isEmpty())
+            details << QStringLiteral("libssh: %1.").arg(error);
+        return details.join(QLatin1Char(' '));
+    }
 
     // A partial success is a completely different failure from "nothing
     // worked": the server ACCEPTED what CodeHarbor sent and is asking for a
@@ -1749,17 +1770,33 @@ QString SshConnectionPool::authenticationFailure() const
     }
 
     // A server that never offered public-key authentication was never given a
-    // key, so advice about ssh-agent and identity files describes something that
-    // did not happen. Say what actually did.
-    if (!m_publicKeyOffered) {
-        details << QStringLiteral(
-            "The server does not accept public-key authentication, so only its "
-            "password method could be tried.");
-        const QString passwordOnlyError =
+    // key. Describe the actual remaining methods, including an unsupported-only
+    // offer, rather than claiming every such server allowed plain password.
+    if (!m_authMethodsOffered.publicKey) {
+        if (!m_authMethodsOffered.password
+            && !m_authMethodsOffered.keyboardInteractive) {
+            details << QStringLiteral(
+                "The server did not offer any supported authentication method. "
+                "CodeHarbor supports public-key, password and "
+                "keyboard-interactive authentication.");
+        } else if (!m_authMethodsOffered.password) {
+            details << QStringLiteral(
+                "The server offered keyboard-interactive authentication, not "
+                "public-key or password authentication.");
+        } else if (!m_authMethodsOffered.keyboardInteractive) {
+            details << QStringLiteral(
+                "The server did not offer public-key authentication, so only "
+                "its password method could be tried.");
+        } else {
+            details << QStringLiteral(
+                "The server offered password and keyboard-interactive "
+                "authentication, not public-key authentication.");
+        }
+        const QString error =
             m_session ? QString::fromUtf8(ssh_get_error(m_session)).trimmed()
                       : QString();
-        if (!passwordOnlyError.isEmpty())
-            details << QStringLiteral("libssh: %1.").arg(passwordOnlyError);
+        if (!error.isEmpty())
+            details << QStringLiteral("libssh: %1.").arg(error);
         return details.join(QLatin1Char(' '));
     }
 
@@ -1811,11 +1848,14 @@ ssh_channel SshConnectionPool::openChannel()
         return nullptr;
 
     ssh_channel channel = ssh_channel_new(m_session);
-    if (!channel)
+    if (!channel) {
+        refreshConnectionState();
         return nullptr;
+    }
 
     if (ssh_channel_open_session(channel) != SSH_OK) {
         ssh_channel_free(channel);
+        refreshConnectionState();
         return nullptr;
     }
 

@@ -7,6 +7,7 @@
 #include <QList>
 #include <QLockFile>
 #include <QMetaType>
+#include <QPointer>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QStringList>
@@ -547,8 +548,10 @@ void ServerProfiles::setActiveId(QString id)
         return; // never point the selection at a profile that does not exist
 
     m_activeId = std::move(id);
+    const QPointer<ServerProfiles> guard(this);
     persist();
-    emit activeIdChanged();
+    if (guard)
+        emit activeIdChanged();
 }
 
 QString ServerProfiles::addProfile(QVariantMap fields)
@@ -568,9 +571,12 @@ QString ServerProfiles::addProfile(QVariantMap fields)
     if (activated)
         m_activeId = id;
 
+    const QPointer<ServerProfiles> guard(this);
     persist();
+    if (!guard)
+        return id;
     emit profilesChanged();
-    if (activated)
+    if (guard && activated)
         emit activeIdChanged();
     return id;
 }
@@ -596,8 +602,10 @@ void ServerProfiles::updateProfile(QString id, QVariantMap fields)
         return; // no spurious change notification for a no-op edit
 
     m_profiles[index] = stored;
+    const QPointer<ServerProfiles> guard(this);
     persist();
-    emit profilesChanged();
+    if (guard)
+        emit profilesChanged();
 }
 
 void ServerProfiles::removeProfile(QString id)
@@ -624,9 +632,14 @@ void ServerProfiles::removeProfile(QString id)
             m_activeId = m_profiles.last().toMap().value(kId).toString();
     }
 
+    // Both save diagnostics and profile observers may synchronously destroy
+    // their owner. No remaining notification may use that deleted sender.
+    const QPointer<ServerProfiles> guard(this);
     persist();
+    if (!guard)
+        return;
     emit profilesChanged();
-    if (wasActive)
+    if (guard && wasActive)
         emit activeIdChanged();
 }
 

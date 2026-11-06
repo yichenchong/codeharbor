@@ -38,6 +38,11 @@ Item {
     property bool loading: false
     property string errorText: ""
     property url documentSource: ""
+    onDocumentSourceChanged: {
+        if (root.service && !root.service.setPdfDocumentSource(pdfDocument, root.documentSource)
+                && root.documentSource.toString().length > 0)
+            root.errorText = qsTr("This document could not be opened.");
+    }
     property string requestedPath: ""
     // The path whose spooled file is on disk and open in the PdfDocument below.
     // Tracked separately from `remotePath`, which is already the NEXT file by
@@ -75,10 +80,18 @@ Item {
             root.service.releasePdf(paths[i]);
     }
 
+    function deactivate() {
+        root.started = false;
+        // Close the decoder before releasing the file, including early Loader
+        // retirement when this QObject will not be destroyed until later.
+        root.documentSource = "";
+        root.loading = false;
+        root.releaseSpool();
+    }
+
     function reload() {
-        // Close the document BEFORE the file under it is deleted: the
-        // PdfDocument keeps the spool file open, and clearing `source` first
-        // means the engine is never asked to page in from a file that is gone.
+        // The service synchronously closes the native decoder BEFORE release;
+        // the QtQuick wrapper's source="" setter does not perform that close.
         root.errorText = "";
         root.documentSource = "";
         root.releaseSpool();
@@ -114,10 +127,7 @@ Item {
         root.started = true;
         root.reload();
     }
-    Component.onDestruction: {
-        root.documentSource = "";
-        root.releaseSpool();
-    }
+    Component.onDestruction: root.deactivate()
 
     Connections {
         target: root.service
@@ -147,12 +157,9 @@ Item {
 
     PdfDocument {
         id: pdfDocument
-        source: root.documentSource
         onStatusChanged: function(status) {
-            // Only while a document is actually loaded: clearing `source` on the
-            // way to the next file also drives a status change, and reporting
-            // THAT as a failure would print "could not be opened" over the
-            // spinner of the file that is on its way.
+            // Native close also drives a status change. Only a currently
+            // requested nonempty logical source can produce a visible error.
             if (status === PdfDocument.Error
                     && root.documentSource.toString().length > 0)
                 // Our own wording, not the engine's: QPdfDocument reports an
@@ -192,7 +199,10 @@ Item {
             id: pdfPage
             required property int index
             readonly property size pointSize: pdfDocument.pagePointSize(index)
-            readonly property bool validGeometry: pointSize.width > 0 && pointSize.height > 0
+            readonly property bool validGeometry: view.width > 0 && view.height > 0
+                && isFinite(view.width) && isFinite(view.height)
+                && width > 0 && isFinite(width)
+                && pointSize.width > 0 && pointSize.height > 0
                 && isFinite(pointSize.width) && isFinite(pointSize.height)
                 && isFinite(width * pointSize.height / pointSize.width)
             readonly property real rasterWidth: view.width * view.renderedZoom * Screen.devicePixelRatio
@@ -200,18 +210,44 @@ Item {
                 rasterWidth, rasterWidth * pointSize.height / pointSize.width)
             readonly property real pageScale: validGeometry ? width / pointSize.width : 1
             width: view.contentWidth
-            height: validGeometry ? pointSize.height * pageScale : view.height
+            // A very wide page can otherwise have subpixel height. ListView
+            // would instantiate hundreds of such pages (and their text/link
+            // models) to fill one phone screen with only the 4dp spacing.
+            // Each raster's independent pixel cap cannot bound that item fanout.
+            height: Math.max(MobileTheme.touchTarget,
+                             validGeometry ? pointSize.height * pageScale : view.height)
+
+            // PDF page rasters can be transparent: their unpainted paper is
+            // white, not the app's dark surface. Do not whiten the rest of a
+            // wide page's minimum-height virtual slot.
+            Rectangle {
+                x: pageImage.x + (pageImage.width - pageImage.paintedWidth) / 2
+                y: pageImage.y
+                width: pageImage.paintedWidth
+                height: pageImage.paintedHeight
+                color: "white"
+                visible: pdfPage.validGeometry && pdfDocument.status === PdfDocument.Ready
+                    && pageImage.status === Image.Ready
+            }
 
             PdfPageImage {
                 id: pageImage
                 objectName: "pdfPageImage"
                 anchors.fill: parent
-                document: pdfPage.validGeometry ? pdfDocument : null
+                visible: pdfPage.validGeometry
+                document: pdfPage.validGeometry && pdfDocument.status === PdfDocument.Ready
+                    ? pdfDocument : null
+                // Null document alone leaves Qt's old Image source loadable by
+                // the fallback file decoder when sourceSize changes. Clear both
+                // inputs before layout; this absolute owned URL is resolvedSource.
+                source: pdfPage.validGeometry && pdfDocument.status === PdfDocument.Ready
+                    ? root.documentSource : ""
                 currentFrame: pdfPage.index
                 asynchronous: true
                 sourceSize: pdfPage.rasterSize
                 cache: false
                 fillMode: Image.PreserveAspectFit
+                verticalAlignment: Image.AlignTop
             }
             Text {
                 anchors.centerIn: parent
@@ -256,7 +292,7 @@ Item {
                 id: selection
                 objectName: "pdfTextSelection"
                 anchors.fill: parent
-                document: pdfDocument
+                document: pdfPage.validGeometry ? pdfDocument : null
                 page: pdfPage.index
                 renderScale: pdfPage.pageScale
                 from: selectionDrag.centroid.pressPosition
@@ -266,7 +302,7 @@ Item {
             }
             Repeater {
                 model: PdfLinkModel {
-                    document: pdfDocument
+                    document: pdfPage.validGeometry ? pdfDocument : null
                     page: pdfPage.index
                 }
                 delegate: Item {

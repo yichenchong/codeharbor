@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
     id      INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 5);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 6);
 
 -- Server identity (SPEC 3.5) ------------------------------------------------
 --
@@ -123,8 +123,11 @@ CREATE TABLE IF NOT EXISTS viewer_panes (
 -- Being declared here covers FRESH databases only. An existing one gains the
 -- tmux_target rule as a unique index in the schema v3 migration (SQLite has no
 -- ALTER TABLE ADD CONSTRAINT); that step also repairs the duplicates such a
--- database may already contain, and v4 undoes its address index. See
--- migrateTerminalPaneIdentity and migrateDropTerminalPaneAddressUnique in
+-- database may already contain, and v4 undoes its address index. Schema v6
+-- repeats target-only repair and obsolete-address removal for databases the
+-- older migrations already stamped v5 without establishing those invariants.
+-- Existing duplicate labels remain unchanged. See migrateTerminalPaneTargets,
+-- migrateTerminalPaneConstraints, and migrateDropTerminalPaneAddressUnique in
 -- remote/src/workspace.ts.
 CREATE TABLE IF NOT EXISTS terminal_panes (
     id                TEXT    NOT NULL PRIMARY KEY,

@@ -32,15 +32,16 @@ namespace ch {
 //   * INLINE EMPHASIS IS NOT MARKUP EITHER. The delimiters are removed from
 //     `text` and reported separately through the `spans` role as explicit
 //     (start, length, style) triples over the FINAL string, which the page
-//     renders as plain-text runs. No QML anywhere converts this model's output
-//     into StyledText, MarkdownText or RichText.
+//     renders as plain-text runs. Large/token-heavy blocks use a single plain
+//     Text instead, retaining readable text without unbounded QML children. No
+//     QML converts this model's output into StyledText, MarkdownText or RichText.
 //   * LINK DESTINATIONS ARE DATA. A destination that is not http(s) and not a
 //     plain relative reference — javascript:, data:, vbscript:, mailto:,
 //     protocol-relative "//host/x" — is DROPPED: the link text stays, the
 //     destination does not, so nothing can be tapped into existence. Even an
 //     accepted http(s) destination is never opened without the user confirming
 //     it as visible text first (see ViewerMarkdownPage.qml).
-//   * IMAGES CARRY A REPO-RELATIVE PATH AND NOTHING ELSE. An absolute path, a
+//   * IMAGES CARRY A DOCUMENT-RELATIVE PATH AND NOTHING ELSE. An absolute path, a
 //     path with a ".." segment, or any destination with a scheme yields an EMPTY
 //     imagePath, and the page then renders the alt text. A document must not be
 //     able to make the client read arbitrary paths, and it must not be able to
@@ -71,8 +72,8 @@ public:
         // code and for every other kind. A LABEL only: nothing highlights, and
         // nothing is executed or fetched on the strength of it.
         LanguageRole,
-        // "image" only: the document-relative path, percent-DECODED, already
-        // validated by isSafeRelativePath(). Empty when the destination was
+        // "image" only: the document-relative path, Markdown-unescaped and
+        // percent-DECODED, already validated by isSafeRelativePath(). Empty when
         // refused, which is the page's signal to show the alt text instead.
         ImagePathRole,
         // "listItem" only: true for 1. / 1) markers, false for - + *.

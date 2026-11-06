@@ -282,11 +282,15 @@ bool TstLiveEditorReconnect::startSideShell()
                                      const QByteArray&, KnownHosts::Verdict) {
         return SshConnectionPool::HostKeyDecision::Accept;
     });
+    connect(&m_sidePool, &SshConnectionPool::errorOccurred, this,
+            [this](const QString& message) { m_sideErr = message; });
 
     if (!m_sidePool.connectToHost(env("CH_LIVE_HOST"),
                                   static_cast<quint16>(env("CH_LIVE_PORT").toUInt()),
-                                  env("CH_LIVE_USER"))) {
-        m_sideErr = QStringLiteral("side pool could not connect");
+                                  env("CH_LIVE_USER"),
+                                  env("CH_LIVE_IDENTITY"))) {
+        if (m_sideErr.isEmpty())
+            m_sideErr = m_sidePool.diagnosticLog();
         return false;
     }
 

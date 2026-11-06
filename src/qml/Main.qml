@@ -65,9 +65,7 @@ ApplicationWindow {
 
     // Recovery snapshots are debounced remote writes, not a substitute for
     // keeping a dirty editor alive until the user agrees to leave it.
-    property var pendingWorkspaceAction: null
-    property string pendingWorkspaceSessionId: ""
-    property double pendingWorkspaceGeneration: 0
+    property var workspaceDialog: null
     property bool allowWindowClose: false
 
     function hasUnsavedEditors() {
@@ -79,17 +77,65 @@ ApplicationWindow {
         return false;
     }
 
+    function workspaceDocumentsSnapshot() {
+        const documents = [];
+        for (const id of Object.keys(viewerRegion.paneCache || {})) {
+            const pane = viewerRegion.paneCache[id];
+            if (pane) {
+                documents.push({ id: id, pane: pane, document: pane.documentObject,
+                    controller: pane.documentController, url: String(pane.url || ""),
+                    sessionId: String(pane.sessionId || ""),
+                    serverId: String(pane.documentServerId || ""),
+                    contextRetired: typeof pane.contextRetired === "boolean"
+                                    ? pane.contextRetired : null });
+            }
+        }
+        return documents;
+    }
+
+    function workspaceDocumentsMatch(documents) {
+        const cache = viewerRegion.paneCache;
+        for (const snapshot of documents) {
+            const pane = cache[snapshot.id];
+            if (!pane || pane !== snapshot.pane || pane.documentObject !== snapshot.document
+                    || pane.documentController !== snapshot.controller
+                    || String(pane.url || "") !== snapshot.url
+                    || String(pane.sessionId || "") !== snapshot.sessionId
+                    || String(pane.documentServerId || "") !== snapshot.serverId
+                    || typeof snapshot.contextRetired !== "boolean"
+                    || typeof pane.contextRetired !== "boolean"
+                    || pane.contextRetired !== snapshot.contextRetired)
+                return false;
+        }
+        // Even a newly mounted clean document is outside the old question:
+        // its first edit notification may still be crossing the page bridge.
+        for (const id of Object.keys(cache || {})) {
+            if (cache[id] && !documents.some(snapshot => snapshot.pane === cache[id]))
+                return false;
+        }
+        return true;
+    }
+
     function requestWorkspaceAction(action) {
-        if (unsavedWorkspaceDialog.visible)
+        if (window.workspaceDialog && window.workspaceDialog.visible)
             return;
         if (!window.hasUnsavedEditors()) {
             action();
             return;
         }
-        window.pendingWorkspaceAction = action;
-        window.pendingWorkspaceSessionId = String(app.activeSessionId);
-        window.pendingWorkspaceGeneration = app.layouts ? Number(app.layouts.generation) : 0;
-        unsavedWorkspaceDialog.open();
+        // A new instance owns each question, so a late signal from an old
+        // dialog can never accept a replacement action or replacement buffers.
+        const dialog = workspaceDialogComponent.createObject(window.contentItem, {
+            requestedAction: action,
+            requestedDocuments: window.workspaceDocumentsSnapshot(),
+            requestedSessionId: String(app.activeSessionId),
+            requestedServerId: String(app.serverId),
+            requestedAcceptedServerId: typeof app.acceptedServerId === "string"
+                                       ? app.acceptedServerId : null,
+            requestedGeneration: app.layouts ? Number(app.layouts.generation) : 0
+        });
+        window.workspaceDialog = dialog;
+        dialog.open();
     }
 
     function requestSessionActivation(sessionId) {
@@ -119,38 +165,61 @@ ApplicationWindow {
         });
     }
 
-    AppDialog {
-        id: unsavedWorkspaceDialog
-        objectName: "unsavedWorkspaceDialog"
-        title: qsTr("Leave unsaved changes?")
-        modal: true
-        standardButtons: Dialog.Discard | Dialog.Cancel
-        defaultButton: Dialog.Cancel
-        preferredWidth: 440
-        anchors.centerIn: Overlay.overlay
-        contentItem: Label {
-            text: qsTr("One or more editors have unsaved changes. Continuing will discard those changes. Save them first, or choose Discard to continue.")
-            textFormat: Text.PlainText
-            wrapMode: Text.WordWrap
-            color: Theme.text
-            font.pixelSize: Theme.fontSizeBody
-        }
-        onDiscarded: {
-            const action = window.pendingWorkspaceAction;
-            window.pendingWorkspaceAction = null;
-            unsavedWorkspaceDialog.close();
-            // A remote change can retire the workspace while this modal is up.
-            // Never apply its deferred intent to that replacement workspace.
-            if (String(app.activeSessionId) !== window.pendingWorkspaceSessionId
-                    || (app.layouts ? Number(app.layouts.generation) : 0)
-                       !== window.pendingWorkspaceGeneration) {
-                window.notifyUser(qsTr("The workspace changed. Please repeat the action."));
-                return;
+    Component {
+        id: workspaceDialogComponent
+        AppDialog {
+            id: confirmation
+            objectName: "unsavedWorkspaceDialog"
+            property var requestedAction: null
+            property var requestedDocuments: []
+            property string requestedSessionId: ""
+            property string requestedServerId: ""
+            property var requestedAcceptedServerId: null
+            property double requestedGeneration: 0
+            title: qsTr("Leave unsaved changes?")
+            modal: true
+            standardButtons: Dialog.Discard | Dialog.Cancel
+            defaultButton: Dialog.Cancel
+            preferredWidth: 440
+            anchors.centerIn: Overlay.overlay
+            contentItem: Label {
+                text: qsTr("One or more editors have unsaved changes. Continuing will discard those changes. Save them first, or choose Discard to continue.")
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: Theme.text
+                font.pixelSize: Theme.fontSizeBody
             }
-            if (action)
+            onDiscarded: {
+                const action = confirmation.requestedAction;
+                const current = window.workspaceDialog === confirmation
+                    && confirmation.visible && action
+                    && String(app.activeSessionId) === confirmation.requestedSessionId
+                    && String(app.serverId) === confirmation.requestedServerId
+                    && typeof confirmation.requestedAcceptedServerId === "string"
+                    && typeof app.acceptedServerId === "string"
+                    && app.acceptedServerId === confirmation.requestedAcceptedServerId
+                    && (app.layouts ? Number(app.layouts.generation) : 0)
+                       === confirmation.requestedGeneration
+                    && window.workspaceDocumentsMatch(confirmation.requestedDocuments);
+                confirmation.requestedAction = null;
+                confirmation.close();
+                if (!current) {
+                    window.notifyUser(qsTr("The workspace changed. Please repeat the action."));
+                    return;
+                }
+                // Consent destroys only the validated documents now, not future
+                // edits after an asynchronous action eventually completes.
+                viewerRegion.resetPanesForNewTree(true);
                 action();
+            }
+            onRejected: confirmation.requestedAction = null
+            onClosed: {
+                confirmation.requestedAction = null;
+                if (window.workspaceDialog === confirmation)
+                    window.workspaceDialog = null;
+                confirmation.destroy();
+            }
         }
-        onRejected: window.pendingWorkspaceAction = null
     }
 
     // SPEC 4.5 fallback trees for a region with no server tree yet. Declared as
@@ -213,6 +282,10 @@ ApplicationWindow {
     function tryRestoreFocus() {
         if (!window.focusRestoreArmed)
             return;
+        if (viewerRegion.contextRetired) {
+            window.focusRestoreArmed = false;
+            return;
+        }
         if (!window.focusRestoreStampCurrent()) {
             window.focusRestoreArmed = false;
             return;
@@ -509,10 +582,15 @@ ApplicationWindow {
             // that was closed must clear the selection rather than leave a
             // command pointing at a pane that no longer exists.
             onFocusedPaneIdChanged: if (!viewerRegion.focusResetting
+                                        && !viewerRegion.layoutDeferred
                                         && app.activeSessionId.length > 0)
                                         app.uiState.setSelectedPane(app.activeSessionId,
                                                                     focusedPaneId)
             onMessageRequested: (message) => window.notifyUser(message)
+            onContextRetiredChanged: {
+                if (!contextRetired)
+                    Qt.callLater(window.armFocusRestore);
+            }
             onOpenInNewPaneRequestedForSession: (sessionId, generation,
                                                  paneId, url, kind) =>
                 window.openViewerInNewPaneForSession(sessionId, generation,
@@ -841,6 +919,13 @@ ApplicationWindow {
         return region === "viewer" ? app.layouts.viewerTree : app.layouts.terminalTree;
     }
 
+    function layoutActionAllowed(region) {
+        if (region !== "viewer" || !viewerRegion.layoutDeferred)
+            return true;
+        window.notifyUser(qsTr("Save or close the retained unsaved editors before changing the viewer layout."));
+        return false;
+    }
+
     // The pane a region command targets: the user's selected pane when it is
     // actually a pane OF THIS REGION, else that region's first leaf.
     //
@@ -849,9 +934,11 @@ ApplicationWindow {
     // Viewer Pane" passed a terminal paneId to the viewer tree; splitPane found
     // no such node, emitted an error and split nothing.
     function targetPaneId(region) {
-        const tree = window.regionTree(region);
-        const selected = app.activeSessionId.length > 0
-                       ? app.uiState.selectedPane(app.activeSessionId) : "";
+        const held = region === "viewer" && viewerRegion.layoutDeferred;
+        const tree = held ? viewerRegion.displayNode : window.regionTree(region);
+        const selected = held ? viewerRegion.focusedPaneId
+                       : app.activeSessionId.length > 0
+                         ? app.uiState.selectedPane(app.activeSessionId) : "";
         if (selected && selected.length > 0 && window.treeHasPane(tree, selected))
             return selected;
         return window.firstPaneId(tree, region === "viewer" ? "viewer-1" : "terminal-1");
@@ -863,6 +950,8 @@ ApplicationWindow {
     // freshly published pane so the original pane's content and identity stay
     // untouched.
     function openViewerInNewPane(sourcePaneId, url, kind) {
+        if (!window.layoutActionAllowed("viewer"))
+            return;
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before opening a new pane."));
             return;
@@ -882,6 +971,8 @@ ApplicationWindow {
 
     function openViewerInNewPaneForSession(sessionId, generation, sourcePaneId,
                                            url, kind) {
+        if (!window.layoutActionAllowed("viewer"))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         const tree = window.regionTree("viewer");
@@ -976,14 +1067,13 @@ ApplicationWindow {
     }
 
     // Resolve the pane an op should act on: the one named, when the active
-    // tree really holds it; otherwise the focused/first viewer pane. Answers ""
-    // when a name was given and is not in the tree, so the caller can say
-    // "unknown_pane" instead of quietly acting on a different pane.
+    // tree really holds it; otherwise the focused/first viewer pane. Null means
+    // a requested name is absent; "" is the real empty-region placeholder.
     function viewerCommandTarget(tree, requested) {
         const named = String(requested === undefined || requested === null
                              ? "" : requested).trim();
         if (named.length > 0)
-            return window.treeHasPane(tree, named) ? named : "";
+            return window.treeHasPane(tree, named) ? named : null;
         return window.targetPaneId("viewer");
     }
 
@@ -1017,9 +1107,16 @@ ApplicationWindow {
 
             if (op === "list") {
                 ok({
-                    focusedPaneId: String(viewerRegion.focusedPaneId),
+                    focusedPaneId: viewerRegion.contextRetired
+                        || !window.treeHasPane(tree, String(viewerRegion.focusedPaneId))
+                        ? "" : String(viewerRegion.focusedPaneId),
                     panes: window.viewerInventory(tree, [])
                 });
+                return;
+            }
+            if (viewerRegion.layoutDeferred) {
+                no("unsaved_changes",
+                   qsTr("The remote viewer layout changed. Save or close the retained unsaved editors first."));
                 return;
             }
 
@@ -1037,7 +1134,7 @@ ApplicationWindow {
                     // its own failures as toasts; ask the layout for the new leaf
                     // here so the agent learns which pane it got.
                     const source = window.viewerCommandTarget(tree, params.pane);
-                    if (source.length === 0) {
+                    if (!window.treeHasPane(tree, source)) {
                         no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
                         return;
                     }
@@ -1055,8 +1152,21 @@ ApplicationWindow {
                     return;
                 }
                 const target = window.viewerCommandTarget(tree, params.pane);
-                if (target.length === 0) {
+                if (!window.treeHasPane(tree, target)) {
                     no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
+                    return;
+                }
+                // The empty leaf is a logical placeholder, not an addressable
+                // pane. Opening into an emptied region must mint a real leaf
+                // through the layout owner, just like the pane's address bar.
+                if (target.length === 0) {
+                    const created = app.layouts.splitPane("viewer", target, "horizontal");
+                    if (!created || !viewerRegion.openPaneTarget(created, address, kind)) {
+                        no("failed", qsTr("Could not open that target in a new pane."));
+                        return;
+                    }
+                    viewerRegion.focusPane(created);
+                    ok({ paneId: created, url: address });
                     return;
                 }
                 const pane = viewerRegion.paneCache[target];
@@ -1082,7 +1192,7 @@ ApplicationWindow {
                     return;
                 }
                 const source = window.viewerCommandTarget(tree, params.pane);
-                if (source.length === 0) {
+                if (!window.treeHasPane(tree, source)) {
                     no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
                     return;
                 }
@@ -1096,7 +1206,7 @@ ApplicationWindow {
             }
 
             const target = window.viewerCommandTarget(tree, params.pane);
-            if (target.length === 0) {
+            if (target === null || target.length === 0) {
                 no("unknown_pane", qsTr("No viewer pane named %1.").arg(String(params.pane)));
                 return;
             }
@@ -1104,7 +1214,8 @@ ApplicationWindow {
                 // Deliberately NOT the pane's own unsaved-changes confirmation:
                 // that dialog belongs to a person pressing a button. The viewer
                 // control API intentionally closes without confirmation.
-                app.layouts.closePane("viewer", target);
+                viewerRegion.withConsentedPaneClose(target,
+                    () => app.layouts.closePane("viewer", target));
                 ok({ paneId: target });
                 return;
             }
@@ -1142,6 +1253,8 @@ ApplicationWindow {
     // same-named pane in the newly selected session.
     function splitActivePaneForSession(region, sessionId, generation, orientation,
                                        paneId) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         const target = paneId === undefined
@@ -1151,6 +1264,8 @@ ApplicationWindow {
     }
 
     function closeActivePaneForSession(region, sessionId, generation) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         app.layouts.closePaneForSession(sessionId, generation, region,
@@ -1158,6 +1273,8 @@ ApplicationWindow {
     }
 
     function closeRequestedPaneForSession(region, sessionId, generation, paneId) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         if (paneId.length === 0) {
@@ -1169,6 +1286,8 @@ ApplicationWindow {
 
     function persistSplitRatiosForSession(region, sessionId, generation,
                                           pathIndexes, ratios) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         app.layouts.setRatiosForSession(sessionId, generation, region,
@@ -1176,6 +1295,8 @@ ApplicationWindow {
     }
 
     function persistPaneUrlForSession(sessionId, generation, region, paneId, url) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || String(sessionId).length === 0)
             return;
         app.layouts.setPaneUrlForSession(sessionId, generation, region,
@@ -1187,6 +1308,8 @@ ApplicationWindow {
     // remembered-pane/first-leaf target resolution. Pane headers pass their id
     // explicitly, so no fallback lookup can redirect the request.
     function splitActivePane(region, orientation, paneId) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before splitting a pane."));
             return;
@@ -1223,6 +1346,12 @@ ApplicationWindow {
     // branch and leaves an empty leaf behind if the region ends up bare, so a
     // region is never left with nothing to show.
     function closeActivePane(region) {
+        if (region === "viewer" && viewerRegion.contextRetired) {
+            // This is a local document, not a pane of the current selection.
+            // In particular an archive/delete may leave no active session.
+            window.requestPaneClose("viewer", window.targetPaneId("viewer"));
+            return; // Never fall through to a new owner's same-id layout.
+        }
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
             return;
@@ -1232,6 +1361,8 @@ ApplicationWindow {
         // on, so this is the one close path that has not already passed the
         // pane's own unsaved-changes confirmation.
         if (window.requestPaneClose(region, target))
+            return;
+        if (!window.layoutActionAllowed(region))
             return;
         // Synchronous command: see splitActivePane() above for why the
         // unstamped entry point is the correct one here.
@@ -1248,6 +1379,8 @@ ApplicationWindow {
     // reports; both are served correctly by falling back to the focused/first
     // pane, which for a tree holding only the placeholder IS that placeholder.
     function closeRequestedPane(region, paneId) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || app.activeSessionId.length === 0) {
             window.notifyUser(qsTr("Select a Dev Session before closing a pane."));
             return;
@@ -1265,6 +1398,8 @@ ApplicationWindow {
     // setRatios is deliberately quiet — it does NOT re-publish the tree — so
     // recording a drag cannot rebuild the panes the drag just resized.
     function persistSplitRatios(region, pathIndexes, ratios) {
+        if (!window.layoutActionAllowed(region))
+            return;
         if (!app.layouts || app.activeSessionId.length === 0)
             return;
         // Synchronous: this is called while the drag that produced the ratios

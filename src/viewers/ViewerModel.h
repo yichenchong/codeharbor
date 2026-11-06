@@ -46,8 +46,8 @@ public:
                          InternalUrlMap *map = nullptr,
                          QObject *parent = nullptr);
 
-    // Inject the WebEngine profiles. When unset, ViewerModel lazily creates its
-    // own ViewerProfiles from `client`, so QML always has working profiles.
+    // Inject the WebEngine profiles. If absent/destroyed, lazily recreate them
+    // from `client`, preserving the last injected external storage root.
     void setProfiles(ViewerProfiles *profiles);
 
     // AppSettings lives in ch_app, which cannot be a dependency of this
@@ -108,10 +108,13 @@ public:
     Q_INVOKABLE QQuickWebEngineProfile *externalProfile();
     Q_INVOKABLE QQuickWebEngineProfile *internalProfile();
 
-    // Asynchronously list a remote directory (SPEC 7.5). On success emits
-    // directoryListed with entries sorted (directories first, then by name),
-    // each a {name, kind} map; on failure or without a client, directoryError.
-    Q_INVOKABLE void listDirectory(const QString &path);
+    // Allocate before dispatch: a missing client may answer synchronously.
+    Q_INVOKABLE QString newDirectoryRequestId() const;
+    // Asynchronously list a remote directory (SPEC 7.5). Both result signals
+    // echo the caller's unique requestId, so concurrent panes and reloads of the
+    // same path cannot settle each other's requests. Entries are {name, kind}
+    // maps sorted directories first, then by name.
+    Q_INVOKABLE void listDirectory(const QString &path, const QString &requestId);
 
     // Asynchronously ask where `path` resolves and whether it lands inside
     // `base`, the Dev Session's repository root (SPEC 9). On success emits
@@ -130,8 +133,10 @@ public:
 
 signals:
     void viewKindsRevisionChanged();
-    void directoryListed(const QString &path, const QVariantList &entries);
-    void directoryError(const QString &path, const QString &message);
+    void directoryListed(const QString &path, const QVariantList &entries,
+                         const QString &requestId);
+    void directoryError(const QString &path, const QString &message,
+                        const QString &requestId);
     // `path` and `base` echo what was ASKED for (not the resolved spelling), so
     // a pane can distinguish both a different file and the same file checked
     // against another Dev Session's repository root.
@@ -159,6 +164,7 @@ private:
     QPointer<CodeharbordClient> m_client;
     InternalUrlMap *m_map;
     QPointer<ViewerProfiles> m_profiles;
+    QString m_externalStorageRoot;
     bool m_ownsProfiles = false;
     // The live InternalUrlSchemeHandler::requestFailed forwarding connection,
     // held so re-wiring can drop it without touching the old handler (which may

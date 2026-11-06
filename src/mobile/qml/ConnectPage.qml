@@ -144,11 +144,9 @@ Page {
             root.userText = root.textOf(entry, "user")
             root.nodePathText = root.textOf(entry, "nodePath")
             root.repoRootText = root.textOf(entry, "repoRoot")
-            // The profile's identityFile is a REFERENCE to a key file the user
-            // manages, never key bytes (SPEC 11.2). Re-adopting it makes the
-            // remembered credential selectable again after a relaunch;
-            // registerReference() is idempotent, so re-loading the same profile
-            // does not accumulate duplicates.
+            // identityFile holds either a user-managed reference or the path of
+            // an opt-in app-private saved key. Re-adopting it restores the same
+            // storage kind and name; no second alias or key copy is created.
             //
             // Only when there IS one: a password-only profile stores an empty
             // identityFile, and handing that to registerReference() makes it
@@ -230,7 +228,7 @@ Page {
         return name + " \u2014 " + suffix
     }
 
-    // Empty a field that held a secret WITHOUT leaving the secret recoverable.
+    // Empty a secret field and discard its UI undo history, not secure erasure.
     //
     // TextField.clear() routes through QQuickTextInputPrivate::clear(), which
     // deletes the text as an undoable edit: every character is pushed onto the
@@ -290,9 +288,8 @@ Page {
             "host": EndpointField.trim(root.hostText),
             "port": root.portNumber,
             "user": EndpointField.trim(root.userText),
-            // A REFERENCE to the user's own key file, never key bytes, and empty
-            // for a pasted session-only key, which has nothing durable to record
-            // (SPEC 11.2, docs/SPEC.md:1721 and :1727).
+            // A durable key reference/path, never key bytes; session-only
+            // imports have nothing durable to record.
             "identityFile": root.keys ? root.keys.referenceFor(root.selectedKeyName) : "",
             "nodePath": root.nodePathText.trim(),
             "repoRoot": root.repoRootText.trim()
@@ -319,7 +316,25 @@ Page {
             root.keys.armPassphrase(root.selectedKeyName, passphraseField.text)
             root.wipeSecretField(passphraseField)
         }
-        root.mobileController.connectToServer(root.formProfile())
+        const submitted = root.formProfile()
+        const selectedKey = root.selectedKeyName
+        const id = root.mobileController.connectToServer(submitted)
+        if (id.length === 0)
+            return
+        // Profile/connection signals can run inline and retarget this form.
+        // An old attempt's return value must not relabel the new form.
+        if (root.profileId !== (submitted.id || "")
+                || root.selectedKeyName !== selectedKey)
+            return
+        const current = root.formProfile()
+        for (const field in submitted) {
+            if (current[field] !== submitted[field])
+                return
+        }
+        // Keep the minted id even when authentication fails on this same page.
+        // Do not reload the profile: a session-only key has no durable reference
+        // and reloading would discard the selection used by its live prompt.
+        root.profileId = id
         root.connected()
     }
 

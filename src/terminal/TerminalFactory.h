@@ -116,11 +116,10 @@ public:
                                    const QString& terminalPaneId,
                                    const QString& workingDir);
 
-    // Cache key for one LEGACY layout slot: "<devSessionId>/<layout pane id>".
-    // Public as a test seam: the remembered-target cache is keyed by it, and a
-    // caller that cannot build the key cannot check what was remembered. A pane
-    // resolved by row id is remembered under the bare row id instead, which can
-    // never collide with this shape — a UUID contains no "/".
+    // Length-framed, namespaced cache key for one LEGACY layout slot.
+    // Public as a test seam: both the Dev Session and slot identity matter,
+    // even if either contains delimiter-like characters. Row lookups use a
+    // distinct namespace and retain the same Dev Session scope.
     static QString paneKey(const QString& devSessionId, const QString& paneName);
 
     // The lookup the pane's identity produces: by `terminalPaneId` when the
@@ -513,7 +512,7 @@ private:
         QString devSessionId;  // the row's owner, per the server, not per the request
         QString harness;       // terminal_panes.harness; empty when the row has none
     };
-    // Resolution key -> that answer: the `terminal_panes` row id for a pane
+    // Resolution key -> that answer: a Dev-Session-scoped row key for a pane
     // addressed by id, or paneKey() for one addressed by its legacy slot label.
     // A label-addressed answer is remembered under BOTH, so the backfill that
     // follows it costs no second round trip. Kept across a DISCONNECT on

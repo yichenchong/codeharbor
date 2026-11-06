@@ -1,6 +1,7 @@
 #include <QtTest/QtTest>
 
 #include <QByteArray>
+#include <QPair>
 #include <QSignalSpy>
 #include <QString>
 
@@ -98,6 +99,7 @@ private slots:
     void modernEmojiOccupyTwoCells();
     void deferredWrapDoesNotScrollPrematurely();
     void savedCursorRestoresDeferredWrap();
+    void savedCursorRestoresAutowrap();
     void autowrapOffOverwritesLastColumn();
     void honoursScrollRegionForLineFeedAndEditing();
     void invalidScrollMarginsPreserveRegionAndCursor();
@@ -108,11 +110,13 @@ private slots:
     void historyCapKeepsAbsoluteAddressingConsistent();
     void altScreenLeavesPrimaryAndHistoryIntact();
     void repeatedAltScreenActivationPreservesContent();
+    void repeatedAltScreenActivationPreservesSavedCursor();
     void appliesIndexedAndTruecolourSgr();
     void appliesColonSeparatedSgr();
     void trailingOmittedSgrParameterResetsRendition();
     void underlineSubparameterZeroDisablesUnderline();
     void unsupportedCsiFormsHaveNoSideEffects();
+    void unsupportedEraseModesPreserveDeferredWrap();
     void answersDeviceStatusReports();
     void setsWindowTitleFromOsc();
     void discardsUnknownOscAndDcsPayloads();
@@ -497,6 +501,38 @@ void TstVt::savedCursorRestoresDeferredWrap()
     QCOMPARE(resized.cursorRow(), 0);
 }
 
+void TstVt::savedCursorRestoresAutowrap()
+{
+    const QList<QPair<QByteArray, QByteArray>> saveRestore = {
+        {QByteArrayLiteral("\x1b""7"), QByteArrayLiteral("\x1b""8")},
+        {csi("s"), csi("u")},
+        {csi("?1049h"), csi("?1049l")}
+    };
+    for (const auto &commands : saveRestore) {
+        for (bool wrap : {false, true}) {
+            for (bool split : {false, true}) {
+                VtScreen screen;
+                screen.resize(5, 3);
+                const QByteArray stream = csi(wrap ? "?7h" : "?7l")
+                    + QByteArrayLiteral("abcde") + commands.first
+                    + csi(wrap ? "?7l" : "?7h") + csi("2;1H")
+                    + QByteArrayLiteral("alt") + commands.second + QByteArrayLiteral("X");
+                if (split)
+                    feedByte(screen, stream);
+                else
+                    screen.write(stream);
+                QCOMPARE(screen.autowrap(), wrap);
+                QCOMPARE(lineText(screen, 0), wrap ? QStringLiteral("abcde")
+                                                   : QStringLiteral("abcdX"));
+                QCOMPARE(screen.cursorRow(), wrap ? 1 : 0);
+                QCOMPARE(screen.cursorColumn(), wrap ? 1 : 4);
+                if (wrap)
+                    QCOMPARE(cellAt(screen, 1, 0).text, char32_t('X'));
+            }
+        }
+    }
+}
+
 void TstVt::autowrapOffOverwritesLastColumn()
 {
     VtScreen screen;
@@ -768,6 +804,29 @@ void TstVt::repeatedAltScreenActivationPreservesContent()
     QCOMPARE(lineText(screen, 0), QStringLiteral("primary"));
     QCOMPARE(screen.cursorRow(), 1);
     QCOMPARE(screen.cursorColumn(), 2);
+}
+
+void TstVt::repeatedAltScreenActivationPreservesSavedCursor()
+{
+    for (bool split : {false, true}) {
+        VtScreen screen;
+        screen.resize(10, 4);
+        const QByteArray stream = QByteArrayLiteral("primary") + csi("?1049h")
+            + csi("2;3H") + csi("31m") + QByteArrayLiteral("\x1b""7")
+            + csi("3;5H") + csi("32m") + csi("?1049h")
+            + QByteArrayLiteral("\x1b""8X");
+        if (split)
+            feedByte(screen, stream);
+        else
+            screen.write(stream);
+        QCOMPARE(lineText(screen, 1), QStringLiteral("  X"));
+        QCOMPARE(lineText(screen, 2), QString());
+        QCOMPARE(cellAt(screen, 1, 2).fg, vt::xterm256Color(1));
+        QCOMPARE(screen.cursorRow(), 1);
+        QCOMPARE(screen.cursorColumn(), 3);
+        screen.write(csi("?1049l") + QByteArrayLiteral("!"));
+        QCOMPARE(lineText(screen, 0), QStringLiteral("primary!"));
+    }
 }
 
 // --- rendition --------------------------------------------------------------
@@ -1330,6 +1389,32 @@ void TstVt::unsupportedCsiFormsHaveNoSideEffects()
         screen.write(QByteArrayLiteral("X"));
         QCOMPARE(cellAt(screen, 1, 2).text, char32_t('X'));
         QCOMPARE(cellAt(screen, 1, 2).fg, vt::xterm256Color(1));
+    }
+}
+
+void TstVt::unsupportedEraseModesPreserveDeferredWrap()
+{
+    const QByteArray unsupported[] = {"4J", "999999J", "3K", "999999K"};
+    for (const QByteArray &sequence : unsupported) {
+        for (const QByteArray &text : {QByteArrayLiteral("abcde"),
+                                       QByteArrayLiteral("abc\xe4\xb8\xad")}) {
+            for (bool split : {false, true}) {
+                VtScreen screen;
+                screen.resize(5, 3);
+                screen.write(text);
+                QSignalSpy damageSpy(&screen, &VtScreen::linesChanged);
+                if (split)
+                    feedByte(screen, csi(sequence));
+                else
+                    screen.write(csi(sequence));
+                QCOMPARE(damageSpy.count(), 0);
+                screen.write(QByteArrayLiteral("X"));
+                QCOMPARE(lineText(screen, 0), QString::fromUtf8(text));
+                QCOMPARE(lineText(screen, 1), QStringLiteral("X"));
+                QCOMPARE(screen.cursorRow(), 1);
+                QCOMPARE(screen.cursorColumn(), 1);
+            }
+        }
     }
 }
 

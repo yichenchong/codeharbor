@@ -162,13 +162,10 @@ void MobileTerminalSession::open(const QString &devSessionId,
     m_terminalPaneId = terminalPaneId;
     m_workingDir = workingDir;
 
-    // Record the view's geometry without pushing a window-change: there is no
-    // PTY yet, and the factory reads these when it opens one.
-    if (cols > 0 && rows > 0) {
-        m_columns = qMin(cols, kMaxColumns);
-        m_rows = qMin(rows, kMaxRows);
-        m_screen->resize(m_columns, m_rows);
-    }
+    // open() also serves an already-attached identity. Use the same resize path
+    // as a grid change so the remote PTY cannot stay at the previous size while
+    // the screen has already adopted the new one.
+    resize(cols, rows);
 
     if (!m_factory) {
         setStatusText(tr("No terminal service in this window."));
@@ -374,7 +371,8 @@ void MobileTerminalSession::resize(int cols, int rows)
         return;
     const int columns = qMin(cols, kMaxColumns);
     const int lines = qMin(rows, kMaxRows);
-    if (columns == m_columns && lines == m_rows)
+    if (columns == m_columns && lines == m_rows && m_controller
+        && m_controller->columns() == columns && m_controller->rows() == lines)
         return;
     m_columns = columns;
     m_rows = lines;

@@ -54,7 +54,13 @@ await rm(staging, { recursive: true, force: true });
 await rm(previous, { recursive: true, force: true });
 await mkdir(staging, { recursive: true });
 
+const names = ["index.html", "terminal.js", "terminal.css"];
+if (sourcemap) {
+    names.push("terminal.js.map", "terminal.css.map");
+}
+
 let result;
+let sizes;
 try {
     // index.ts imports @xterm/xterm/css/xterm.css, so esbuild emits the
     // stylesheet as a sibling of the JS outfile — hence the terminal.css the
@@ -77,6 +83,15 @@ try {
     });
 
     await copyFile(join(root, "index.html"), join(staging, "index.html"));
+    // Verify the full resource set before discarding the last good bundle.
+    // esbuild emits CSS only when the entry graph imports a stylesheet.
+    sizes = await Promise.all(names.map(async (name) => {
+        const { size } = await stat(join(staging, name));
+        if (size === 0) {
+            throw new Error(`build produced an empty ${name}`);
+        }
+        return { name, size };
+    }));
 } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;
@@ -104,12 +119,7 @@ try {
 }
 await rm(previous, { recursive: true, force: true });
 
-const names = ["index.html", "terminal.js", "terminal.css"];
-if (sourcemap) {
-    names.push("terminal.js.map", "terminal.css.map");
-}
-for (const name of names) {
-    const { size } = await stat(join(dist, name));
+for (const { name, size } of sizes) {
     console.log(`dist/${name}\t${(size / 1024).toFixed(1)} KiB`);
 }
 if (result.warnings.length > 0) {

@@ -28,7 +28,6 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QProcess>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
@@ -131,6 +130,7 @@ private:
     bool typeUntil(const QByteArray& command, const std::function<bool()>& done,
                    int timeoutMs);
     QByteArray runExec(const QString& command, int timeoutMs);
+    QByteArray runExec(SshConnectionPool& pool, const QString& command, int timeoutMs);
     bool remoteSessionExists();
     // tmux's own session_created for the pane's target, in whole seconds, or an
     // empty string when there is no such session. This is the exact number
@@ -138,11 +138,9 @@ private:
     // hold the verdict without standing up a codeharbord to answer
     // tmux.listSessions.
     QString remoteSessionCreatedAt();
-    // Sever the SSH transport the way a dropped network does: no
-    // disconnectFromHost(), no tmux detach, no orderly channel close. Every
-    // descendant of the FIXTURE sshd is killed, which drops the connection under
-    // libssh while the listener stays up so the client can come back — the
-    // shape of the incident this case exists for.
+    // Sever only this test's authenticated connection through its remote
+    // shell's sshd parent, after validating the generated private fixture.
+    // The listener and independently authenticated connections stay alive.
     bool severTheNetwork();
 
     QTemporaryDir m_knownHostsDirectory;
@@ -313,7 +311,13 @@ bool TstLiveTerminalFactory::typeUntil(const QByteArray& command,
 
 QByteArray TstLiveTerminalFactory::runExec(const QString& command, int timeoutMs)
 {
-    SshChannelDevice device(&m_pool);
+    return runExec(m_pool, command, timeoutMs);
+}
+
+QByteArray TstLiveTerminalFactory::runExec(SshConnectionPool& pool,
+                                         const QString& command, int timeoutMs)
+{
+    SshChannelDevice device(&pool);
     QByteArray out;
     bool finished = false;
     connect(&device, &SshChannelDevice::readyRead, &device,
@@ -359,15 +363,10 @@ QString TstLiveTerminalFactory::remoteSessionCreatedAt()
 
 bool TstLiveTerminalFactory::severTheNetwork()
 {
-    // Every DESCENDANT of the fixture sshd, and deliberately not the listener
-    // itself: the connection dies where the client can see nothing but a
-    // transport that stopped, while the port stays open so the reconnect below
-    // has something to come back to. No disconnectFromHost(), no tmux detach,
-    // no orderly channel close — the client is told nothing, which is the whole
-    // point of the case.
     // Identify the generated fixture, not an arbitrary daemon matching a
     // command-line substring. The generator supports custom directories and
-    // puts its key, config and listener PID beside one another.
+    // puts its key, config and listener PID beside one another. Validation is
+    // still required even though the signal below only targets our connection.
     const QString identity = env("CH_LIVE_IDENTITY");
     QString fixtureDir;
     if (!identity.isEmpty()) {
@@ -407,23 +406,21 @@ bool TstLiveTerminalFactory::severTheNetwork()
         || !fixtureListenerCommandMatches(QString::fromLocal8Bit(command.readAll()), configPath))
         return false;
 
-    // Only the validated listener's descendants are signalled; the listener
-    // itself stays alive for reconnect. No filesystem path enters the shell.
-    const QString script =
-        QStringLiteral("set -e\n"
-                       "children=$(pgrep -P \"$1\" || true)\n"
-                       "[ -n \"$children\" ] || exit 1\n"
-                       "for c in $children; do\n"
-                       "  for g in $(pgrep -P \"$c\" || true); do kill -9 \"$g\" || true; done\n"
-                       "  kill -9 \"$c\" || true\n"
-                       "done\n");
-    QProcess sh;
-    sh.start(QStringLiteral("/bin/sh"),
-             {QStringLiteral("-c"), script, QStringLiteral("fixture-disconnect"),
-              QString::number(listener)});
-    if (!sh.waitForFinished(10000))
+    // Run on OUR authenticated transport, not in a local process scanning the
+    // listener's descendants. As in tst_livereconnect, the exec shell's parent
+    // is this connection's sshd; killing it leaves the listener and peers alone.
+    SshChannelDevice drop(&m_pool);
+    if (!drop.startExec(QStringLiteral(
+            "pp=$(ps -o ppid= -p $$ | tr -d ' '); "
+            "case \"$(ps -o args= -p $pp)\" in "
+            "*sshd*) kill -9 \"$pp\";; *) exit 9;; esac")))
         return false;
-    return sh.exitStatus() == QProcess::NormalExit && sh.exitCode() == 0;
+    QElapsedTimer clock;
+    clock.start();
+    while (TerminalController::isLiveState(m_controller->state())
+           && clock.elapsed() < kAttachTimeoutMs)
+        QTest::qWait(50);
+    return !TerminalController::isLiveState(m_controller->state());
 }
 
 void TstLiveTerminalFactory::fixtureListenerMatchingPinsTheGeneratedConfig_data()
@@ -652,10 +649,21 @@ void TstLiveTerminalFactory::anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNo
 
     QSignalSpy recreated(m_factory, &TerminalFactory::sessionRecreated);
 
+    // TTC5: a distinct authenticated connection to the SAME listener must not
+    // be collateral damage. Never reconnect this pool: executing a fresh
+    // command after the drop must use the connection established here.
+    SshConnectionPool unrelated;
+    unrelated.setKnownHosts(m_pool.knownHosts());
+    QVERIFY2(unrelated.connectToHost(m_host, m_port, m_user),
+             "could not authenticate the independent connection");
+    QCOMPARE(runExec(unrelated, QStringLiteral("printf CH_UNRELATED_BEFORE"),
+                     kExecTimeoutMs),
+             QByteArrayLiteral("CH_UNRELATED_BEFORE"));
+
     // ---- the network goes away -------------------------------------------
     QVERIFY2(severTheNetwork(),
-             "could not find the fixture sshd to sever; this case needs the local "
-             "fixture from tests/live/generate-fixture.sh");
+             "could not validate the generated local fixture and drop this "
+             "test's SSH connection");
 
     // The pane must NOTICE. A channel that stops delivering while the pane still
     // reports Ready is its own bug: the user would type into a dead terminal.
@@ -663,6 +671,11 @@ void TstLiveTerminalFactory::anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNo
                              kAttachTimeoutMs);
     qInfo().noquote() << "after the drop: pane state" << ch::toString(m_controller->state())
                       << "pool state" << static_cast<int>(m_pool.state());
+
+    QCOMPARE(unrelated.state(), SshConnectionPool::State::Connected);
+    QCOMPARE(runExec(unrelated, QStringLiteral("printf CH_UNRELATED_AFTER_DROP"),
+                     kExecTimeoutMs),
+             QByteArrayLiteral("CH_UNRELATED_AFTER_DROP"));
 
     // The pool may still believe it holds a session: libssh learns of a dead
     // socket when it next uses it. ch::SessionBootstrap::handleConnectionLost
@@ -679,6 +692,10 @@ void TstLiveTerminalFactory::anUncleanNetworkDropKeepsTheSessionItsWorkAndSaysNo
     QVERIFY2(m_factory->attach(m_controller, m_target, m_repo, 100, 30),
              qPrintable(m_factoryErrors));
     QTRY_VERIFY_WITH_TIMEOUT(!m_rendered.isEmpty(), kAttachTimeoutMs);
+    QCOMPARE(unrelated.state(), SshConnectionPool::State::Connected);
+    QCOMPARE(runExec(unrelated, QStringLiteral("printf CH_UNRELATED_AFTER_RECONNECT"),
+                     kExecTimeoutMs),
+             QByteArrayLiteral("CH_UNRELATED_AFTER_RECONNECT"));
 
     // 1. The session SURVIVED, and this attach found it rather than creating a
     // replacement. tmux never changes a session's creation time, so an unchanged

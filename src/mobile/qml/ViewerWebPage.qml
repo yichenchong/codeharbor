@@ -55,7 +55,13 @@ Item {
         if (root.schemeAllowed)
             policy.attach(web);
     }
-    Component.onDestruction: web.stop()
+    function deactivate() {
+        root.started = false;
+        // Keep the native policy installed until QObject teardown; never
+        // restore an external-opening default while retiring this document.
+        web.stop();
+    }
+    Component.onDestruction: root.deactivate()
 
     MobileWebViewPolicy {
         id: policy

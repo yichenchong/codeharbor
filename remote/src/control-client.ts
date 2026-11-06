@@ -13,6 +13,7 @@
 // rule here.
 
 import net from "node:net";
+import path from "node:path";
 
 import {
     CH_CONTROL_VERSION,
@@ -160,6 +161,15 @@ export function sendControlRequest(
     // misrouting the per-window socket exists to remove.
     if (socketPath === null || socketPath.trim().length === 0) {
         return Promise.resolve(refusal("bad_request", MISSING_SOCKET_MESSAGE));
+    }
+    // An advertised endpoint is an absolute route, never a path relative to
+    // an agent's repository. Accepting a relative value could reach a different
+    // window's socket after the agent changes its working directory.
+    if (!path.isAbsolute(socketPath) || socketPath.includes("\0")) {
+        return Promise.resolve(refusal(
+            "bad_request",
+            `${CONTROL_SOCKET_ENV} must name an absolute socket path without NUL bytes`,
+        ));
     }
     let payload: string;
     try {

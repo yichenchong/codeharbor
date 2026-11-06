@@ -21,7 +21,7 @@ They come from the `codeharbor` MCP server: `viewer_list`, `viewer_open`,
 | --- | --- |
 | `viewer_list` | pane ids, what each shows, which has focus |
 | `viewer_open` | show a file / directory / URL in a pane, optionally a new one |
-| `viewer_split` | split a pane, leaving both halves as they were |
+| `viewer_split` | keep the existing pane and add an empty pane; return the new pane id |
 | `viewer_focus` | make a pane the active one |
 | `viewer_close` | close a pane |
 | `viewer_reload` | re-fetch what a pane is showing |
@@ -53,10 +53,18 @@ They come from the `codeharbor` MCP server: `viewer_list`, `viewer_open`,
 
 ## Refusal codes
 
-`not_active_session` (the user is on a different Dev Session — say so, do not
-retry), `unknown_pane` (re-list), `bad_request` (the message says what was
-wrong), `unsaved_changes` (save the editor or open a separate new pane; do not
-close it to bypass the refusal), `timeout` / `failed` (CodeHarbor is not reachable).
+`not_active_session` (a different Dev Session is active — say so, do not retry),
+`unknown_pane` (re-list), `bad_request` (the message says what was wrong),
+`unsaved_changes` (save the active editor or use a new pane when the layout is not
+held; do not close it to bypass the refusal), `timeout` / `failed` (unreachable).
+
+If a remote-layout warning holds unsaved work, resolve that hold before trying
+another layout mutation. A **previous-workspace** warning is stricter: those old
+editors are visible/copyable but permanently detached, so Save and Reload cannot
+work. Ask the user to copy and locally close the retained documents; do not retry
+mutations or use `viewer_close` to bypass the hold. During that retention,
+`viewer_list` reports current authoritative panes with no focused pane, not the
+old visible editors.
 
 ## One-time setup
 
@@ -112,5 +120,6 @@ CodeHarbor creates: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` (which pane) and
 `CODEHARBOR_CONTROL_SOCKET` (which CodeHarbor window owns it). A shell that was
 already running before CodeHarbor attached has none of them. Check with
 `echo "$CODEHARBOR_CONTROL_SOCKET"`; if empty, ask the user to start the agent in
-a fresh CodeHarbor terminal pane. The socket is never guessed — without it a
-command could drive a different window — so a missing one is refused.
+a fresh CodeHarbor terminal pane. The socket must be an absolute path with no NUL
+bytes and is never guessed — without it a command could drive a different window,
+so a missing or malformed one is refused.

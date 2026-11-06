@@ -3,6 +3,7 @@
 #include "InternalUrlSchemeHandler.h"
 
 #include <QByteArray>
+#include <QDir>
 #include <QWebEngineUrlScheme>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 
@@ -15,9 +16,12 @@ QByteArray internalSchemeName()
 }
 } // namespace
 
-ViewerProfiles::ViewerProfiles(CodeharbordClient *client, QObject *parent)
+ViewerProfiles::ViewerProfiles(CodeharbordClient *client,
+                               const QString &externalStorageRoot,
+                               QObject *parent)
     : QObject(parent)
     , m_client(client)
+    , m_externalStorageRoot(externalStorageRoot)
 {
 }
 
@@ -71,8 +75,20 @@ QQuickWebEngineProfile *ViewerProfiles::externalProfile()
         // disk. It deliberately gets NO internal scheme handler and NO
         // WebChannel bridge — arbitrary sites stay sandboxed (SPEC 7.3, the
         // separate-profiles requirement; 7.2 is what those sites ARE).
-        m_external =
-            new QQuickWebEngineProfile(QStringLiteral("codeharbor-external"), this);
+        if (m_externalStorageRoot.isEmpty()) {
+            m_external = new QQuickWebEngineProfile(
+                QStringLiteral("codeharbor-external"), this);
+        } else {
+            // The named constructor initializes persistent preferences before
+            // returning. Start off-record so no default profile state is read
+            // before both private paths are installed, then enable persistence.
+            m_external = new QQuickWebEngineProfile(QString(), this);
+            const QDir root(m_externalStorageRoot);
+            m_external->setPersistentStoragePath(root.filePath(QStringLiteral("data")));
+            m_external->setCachePath(root.filePath(QStringLiteral("cache")));
+            m_external->setStorageName(QStringLiteral("codeharbor-external"));
+            m_external->setOffTheRecord(false);
+        }
         m_external->setPersistentCookiesPolicy(
             QQuickWebEngineProfile::ForcePersistentCookies);
         m_external->setHttpCacheType(QQuickWebEngineProfile::DiskHttpCache);

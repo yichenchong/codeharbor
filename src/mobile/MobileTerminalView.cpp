@@ -467,18 +467,21 @@ void MobileTerminalView::paint(QPainter *painter)
             // A zero-width cell is the covered half of a double-width character:
             // it carries no glyph of its own and is skipped outright. A run is cut
             // at any cell that is not a plain single-width one, so the single
-            // drawText() per run below can rely on the font's advance matching the
-            // grid; wide glyphs are drawn one at a time, at their exact column.
+            // drawText() per ASCII run below can rely on the font's advance
+            // matching the grid. Non-ASCII glyphs are positioned individually:
+            // bidi shaping must not reorder terminal cells, and a fallback font
+            // must not shift every cell after a glyph with a different advance.
             if (first.width == 0) {
                 ++index;
                 continue;
             }
 
             int end = index + 1;
-            if (first.width == 1) {
+            if (first.width == 1 && first.text < 0x80) {
                 while (end < cells) {
                     const VtCell &cell = line.at(end);
-                    if (cell.width != 1 || cell.fg != first.fg || cell.bg != first.bg
+                    if (cell.width != 1 || cell.text >= 0x80
+                        || cell.fg != first.fg || cell.bg != first.bg
                         || cell.attrs != first.attrs) {
                         break;
                     }

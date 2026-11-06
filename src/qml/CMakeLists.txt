@@ -147,6 +147,7 @@ function(codeharbor_embed_web_bundle)
          ${_chb_src}/build.mjs
          ${_chb_src}/index.html
          ${_chb_src}/package.json
+         ${_chb_src}/tsconfig.json
          ${CMAKE_SOURCE_DIR}/package.json
          ${CMAKE_SOURCE_DIR}/package-lock.json)
 
@@ -201,21 +202,28 @@ function(codeharbor_embed_web_bundle)
         # error string.
         find_program(CODEHARBOR_NPM NAMES npm.cmd npm)
         if(CODEHARBOR_NPM)
-            if(NOT EXISTS ${CMAKE_SOURCE_DIR}/node_modules)
-                message(STATUS "CodeHarbor: installing npm workspaces (first configure)")
-                # `npm ci`, NOT `npm install`. A plain install is allowed to
-                # REWRITE package-lock.json (and a workspace package.json's own
-                # version field), and that lock file is one of the files
-                # .bumpversion.json polices — .github/scripts/check-versions.mjs
-                # fails the release when the listed files disagree, which is why
-                # both CI workflows run the version check BEFORE installing
-                # anything. Merely configuring the project locally must not
-                # leave the developer with a modified lock file they did not ask
-                # for. `npm ci` installs exactly what the lock file records and
-                # refuses rather than editing it; it also requires an absent
-                # node_modules, which is precisely the branch we are in. Run
-                # from the repository root because that is where the npm
-                # workspaces (and the single lock file) live.
+            # npm's hidden lock is refreshed by npm ci/install and describes the
+            # installed tree. A directory alone does not prove it matches a
+            # changed lockfile: rebuilding with old dependencies can silently
+            # embed the previous package versions under the new lock.
+            set(_chb_installed_lock "${CMAKE_SOURCE_DIR}/node_modules/.package-lock.json")
+            set(_chb_install FALSE)
+            if(NOT EXISTS "${_chb_installed_lock}")
+                set(_chb_install TRUE)
+            else()
+                foreach(_chb_manifest IN ITEMS
+                        "${CMAKE_SOURCE_DIR}/package-lock.json"
+                        "${CMAKE_SOURCE_DIR}/package.json"
+                        "${_chb_src}/package.json")
+                    if("${_chb_manifest}" IS_NEWER_THAN "${_chb_installed_lock}")
+                        set(_chb_install TRUE)
+                    endif()
+                endforeach()
+            endif()
+            if(_chb_install)
+                message(STATUS "CodeHarbor: installing npm workspaces (missing or stale dependencies)")
+                # ci installs the lock exactly and refuses inconsistent
+                # manifests instead of rewriting the tracked lockfile.
                 execute_process(COMMAND ${CODEHARBOR_NPM} ci
                                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                                 RESULT_VARIABLE _chb_install_rc

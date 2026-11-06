@@ -148,3 +148,39 @@ for (const inherited of [false, true]) {
         assert.equal(view.devicePixelRatio, 3.5);
     });
 }
+
+for (const inherited of [false, true]) {
+    test(`native resize reapplies the preference for an ${inherited ? "inherited" : "own"} browser accessor`, () => {
+        let screenRatio = 3;
+        const view = new EventTarget() as EventTarget & { devicePixelRatio: number };
+        const source = inherited ? Object.create(Object.getPrototypeOf(view)) : view;
+        if (inherited)
+            Object.setPrototypeOf(view, source);
+        Object.defineProperty(source, "devicePixelRatio", {
+            configurable: true,
+            get: () => screenRatio,
+        });
+        const controller = createDevicePixelRatioController(view);
+        controller.set(2);
+
+        screenRatio = 1.25;
+        view.dispatchEvent(new Event("resize"));
+        assert.equal(view.devicePixelRatio, 1.25);
+        assert.deepEqual(controller.state, {
+            actual: 1.25, effective: 1.25, overridden: false,
+        });
+
+        screenRatio = 4;
+        view.dispatchEvent(new Event("resize"));
+        assert.equal(view.devicePixelRatio, 2,
+            "the saved preference applies again without a settings write");
+        assert.equal(controller.state.actual, 4);
+
+        controller.restore();
+        screenRatio = 3;
+        view.dispatchEvent(new Event("resize"));
+        assert.equal(view.devicePixelRatio, 3);
+        assert.equal(controller.state.actual, 4,
+            "restoring the browser property also disconnects screen observation");
+    });
+}

@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
 import CodeHarbor.Mobile
 // MobileAppController.Servers and friends: the C++ type module.
 import CodeHarbor.Mobile.Core
@@ -29,6 +30,19 @@ ApplicationWindow {
     // than `undefined`, so the `typeof` half of each guard is load bearing.
     readonly property var ctl: (typeof mobile !== "undefined") ? mobile : null
 
+    function requestBack() {
+        if (!window.ctl)
+            return
+        // The loaded editor may hold dirty RAM. Let its host offer the existing
+        // discard decision before a user Back gesture destroys that page.
+        if (window.ctl.navStage === MobileAppController.Pane && stack.currentItem
+                && typeof stack.currentItem.requestBack === "function") {
+            stack.currentItem.requestBack()
+            return
+        }
+        window.ctl.back()
+    }
+
     visible: true
     // A size only a desktop host ever honours: on Android and iOS the window
     // fills the screen and these are ignored. They are the phone-shaped default
@@ -38,6 +52,8 @@ ApplicationWindow {
     height: 880
     title: qsTr("CodeHarbor")
     color: MobileTheme.surface
+    // Native controls inherit the same live preference as our custom panels.
+    Material.theme: MobileTheme.themeName === "light" ? Material.Light : Material.Dark
 
     // The system-bar insets, read HERE and published.
     //
@@ -65,7 +81,7 @@ ApplicationWindow {
     onClosing: function(close) {
         if (window.ctl && window.ctl.navStage !== MobileAppController.Servers) {
             close.accepted = false;
-            window.ctl.back();
+            window.requestBack();
         }
     }
 
@@ -90,7 +106,7 @@ ApplicationWindow {
         sequences: ["Back", "Alt+Left"]
         enabled: window.ctl !== null
                  && window.ctl.navStage !== MobileAppController.Servers
-        onActivated: window.ctl.back()
+        onActivated: window.requestBack()
     }
 
     Column {

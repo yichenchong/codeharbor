@@ -210,6 +210,9 @@ An empty viewer region may show a placeholder without a persisted pane identity.
 Entering an address or using its "Open as" action materializes a real viewer leaf
 with a nonempty persisted pane id before saving its target, so the file reopens
 after a session switch or relaunch rather than existing only in the placeholder.
+Agent `open` (including `newPane`) and `split` can also materialize that empty
+region and return the real minted pane id. The placeholder itself is never an
+addressable pane in the agent inventory.
 
 ### 3.4 Terminal Pane
 
@@ -463,7 +466,7 @@ creates initial terminal rows and their layout in one transaction, and returns a
 already-stored region unchanged if another client initialized it first. An
 explicitly stored empty or null tree is still an existing layout, not permission
 to reseed it. Clients adopt the returned authoritative tree and identities. This
-operation is part of the current required RPC schema 10 (§10.3); the workspace database remains schema 5.
+operation is part of the current required RPC schema 10 (§10.3); the workspace database is schema 6.
 
 **The pane the user was last working in is remembered per Dev Session**, and
 restored when that session is opened again, so reopening a session puts the
@@ -566,11 +569,22 @@ it for the extra detail to occupy, and a canvas larger than its box on screen ca
 pixels by the compositor, which draws the whole terminal magnified by the ratio — the two preferences must stay
 independent, and this is what keeps them so.
 
+The lowered override is distinct from the browser's native ratio. Screen/zoom
+changes that resize the page re-read that native value and reapply the retained
+preference, rather than treating the old lowered override as the display's new
+maximum. Disposing the controller removes its resize listener and restores the
+original ratio property.
+
 A WebGL context is capped per renderer process, so opening panes can take one away from a pane that already has
 it, and a WebGL renderer that loses its context never paints again while its buffer, its bridge and its remote
 shell all stay healthy. A pane that loses its context therefore reloads its page once with WebGL disabled: the
 mount handshake replays the controller's retained output, and one window-change request makes the remote shell
 repaint the screen.
+
+The page owns the asynchronous WebChannel mount handshake from its start:
+`pagehide` retires a pending mount before its callback can create a host or touch
+a replacement page's DOM. An established host disconnects its signals and disposes
+its renderer on teardown; a late callback does not remount it.
 
 **Clipboard.** The pane's tmux session runs with mouse reporting on, so an ordinary drag inside the grid belongs
 to the program in the terminal rather than to the browser. Selecting text is nonetheless the PLAIN left drag
@@ -626,6 +640,12 @@ tmux new-session -A \
 
 Stable IDs should be used for tmux names rather than user-facing display names.
 
+Client terminal-row resolution caches and in-flight requests are scoped to the
+Dev Session as well as the opaque row identity. Legacy layout labels and row ids
+occupy separate namespaces; a cached target from one session cannot attach a
+different session that supplies the same row id. Same-context cached reconnect
+remains supported.
+
 PANE IDENTITY IN THE ENVIRONMENT. The two `OMP_*` variables are how an agent hook
 says which pane it is in: `remote/src/hooks/oh-my-pi-hook.ts` reads exactly these
 two names, and an event that arrives without them names no pane and is dropped.
@@ -655,9 +675,11 @@ inside that same old shell is not a repair. Already-running agents are unchanged
 The server owns the target string. Terminal targets supplied through the
 workspace RPC are accepted only when they are 1–200 characters from
 `[A-Za-z0-9_-]`. In particular, `:` and `.` are rejected rather than rewritten,
-because tmux interprets them as session/window/pane separators. The tmux
-`killSession` operation applies the same separator and control-character
-rejection before it builds its exact-match target.
+because tmux interprets them as session/window/pane separators. The separate tmux
+`killSession` operation treats its argument as a literal session name: it looks up
+an exact name in a marked session listing, then kills only that entry's tmux-issued
+`$id`. It never gives the caller's name to tmux's target parser, whose client/tty
+fallback can select another session even with an `=` prefix.
 
 ### 5.3 Connection Model
 
@@ -671,6 +693,13 @@ SSH Connection
 ├── CodeHarbor RPC Channel
 └── Agent Status Channel
 ```
+
+An ordinary command's channel EOF does not disconnect the shared connection.
+When channel I/O discovers that the underlying SSH transport has closed, the pool
+reports `Disconnected` rather than retaining a stale `Connected` state. Final
+buffered channel bytes remain readable; normal disconnect or reconnect performs
+the eventual session/channel cleanup. State observers may reconnect immediately,
+and an old channel completion must not alter the replacement connection.
 
 ### 5.4 Background Connections
 
@@ -935,6 +964,9 @@ owner. The relay is independent of that first window's SSH channel. Closing or
 losing one proxy does not close another reader, its producer connections, or the
 shared socket. After its last reader leaves, the relay shuts down after a bounded
 idle timeout; producer traffic alone does not keep a readerless relay alive.
+Stale relay ownership locks are removed only if their device/inode still match
+the ownership record that was inspected; a concurrent starter's replacement lock
+must not be unlinked.
 
 Every reader receives subsequent validated events and applies its existing
 workspace filtering. There is no event history or replay guarantee. Reader queues
@@ -1258,7 +1290,15 @@ an implementation detail of the privileged handlers (7.4). `kind` is the "Open a
 vocabulary (4.3); omitted, the handler registry chooses.
 
 Refusals are named so an agent can act on them: `bad_request`, `busy`, `timeout`,
-`not_active_session`, `unknown_pane`, `failed`.
+`not_active_session`, `unknown_pane`, `unsaved_changes`, `failed`. An `open` that
+would replace unsaved editor work, or an agent `reload` of that editor, is refused;
+save it or use a new pane instead of closing the editor to bypass the refusal.
+Layout-changing agent commands are also refused while unsaved editors retain a
+superseded visible layout (§8.2); they cannot write that stale layout back.
+During whole-context retirement retention, `list` describes the current
+authoritative tree and returns an empty `focusedPaneId`, not an old visible
+editor's identity. Viewer-control mutations remain paused until the retained
+local documents are closed.
 
 Five rules bound what an agent can do:
 
@@ -1266,9 +1306,11 @@ Five rules bound what an agent can do:
   CodeHarbor windows connected at once, each with its own `codeharbord`. Each mints a socket
   whose name carries a RANDOM token, reports it through `server.info.controlSocket`, and the
   client exports it into every terminal pane it attaches as `$CODEHARBOR_CONTROL_SOCKET`. A
-  producer uses that variable and nothing else: a pane without it is refused, because a
-  derived or shared path reaches whichever daemon bound it first — with a different Dev
-  Session active there the agent is told its own plainly-open session is not active, and with
+  producer uses that variable and nothing else. The value must be a nonempty
+  absolute path without NUL bytes; a missing or malformed value is refused before
+  connection, because a derived or shared path reaches whichever daemon bound it
+  first — with a different Dev Session active there the agent is told its own
+  plainly-open session is not active, and with
   the same one active it silently rearranges the wrong window. The token is random rather
   than a pid because the path outlives the process (tmux cannot retrofit a live agent's
   environment) and a reused pid would hand a later daemon an earlier agent's commands. A path
@@ -1287,6 +1329,8 @@ Five rules bound what an agent can do:
   keeping the read side open for the asynchronous answer. Oversized results
   produce a bounded failure that warns the operation may already have completed;
   inspect the current viewer state before retrying.
+  An unsupported request version is refused without serializing or echoing the
+  supplied value, so deeply nested malformed metadata cannot crash the listener.
 - **Identified.** A command carries the asking pane's `devSessionId` and `terminalId`, taken
   from the `OMP_DEV_SESSION_ID`/`OMP_TERMINAL_ID` the client exports into every terminal
   pane it creates (5.2). A process without them is refused with an explanation.
@@ -1416,6 +1460,13 @@ Initial handlers:
 | Directory | remote directories |
 | Binary | metadata and a download action |
 
+Directory replies carry a host-local opaque request identity in addition to their
+path. Only the current listing or directory-kind probe may consume its reply;
+same-path reloads and another pane's requests must not publish stale results.
+Remote HTML links to a fragment of the currently displayed internal document
+navigate inside that document without publishing the opaque internal URL as a
+new pane address.
+
 **Markdown renders; it does not open in the editor.** A `.md` file resolves to a
 rendered document, and its SOURCE is reached by "Open as -> Editor" (§4.3), which
 is also how it is changed. The renderer is a web document like the terminal and
@@ -1526,16 +1577,59 @@ the current workspace — session switching or retry, archiving the active sessi
 server connect/disconnect/update and window close — ask before discarding modified,
 saving or conflicted editor buffers. The dialog offers Discard and Cancel, with
 Cancel as the default; saving remains an explicit action the user can take first.
-The deferred action is bound to the original session and layout generation, so
-accepting an old dialog cannot act on a replacement workspace. This is distinct
-from automatic reconnect and from the direct agent viewer-close operation (§6.8).
+Each request owns a fresh modal and captures the exact dirty pane, handler,
+controller, opened URL, server/session/layout context and explicit retirement state.
+It separately captures the application's **current accepted peer identity**, not
+just the document's frozen server id. Both accepted identities must be present
+strings and equal, and both retirement states must be explicit booleans and equal.
+A peer change, revalidation gap or newly retired document invalidates the question
+even when profile/session/layout generation did not change.
+
+Discard validates the complete document set, rejects stale/replacement/additional
+documents or an old modal, and discards only those validated buffers immediately
+before starting the possibly asynchronous action. Consent cannot carry forward to
+replacement documents or another workspace. This is not an online-only rule: a
+fresh question with an unchanged empty accepted identity may close or quit already
+retired local documents while offline. Automatic reconnect and direct agent close
+remain distinct paths (§6.8).
 
 Automatic reconnect to the same server and Dev Session refreshes layout requests
-without resetting pane ownership. When the authoritative trees are unchanged,
-the existing editor pane and its dirty RAM buffer remain alive. This does not
-promise to preserve a pane removed by an authoritative remote layout, or buffers
-when the server/session actually changes. An explicit, consented same-session
-load still performs its normal pane reset.
+without resetting pane ownership. Unchanged authoritative leaves retain their
+editor and dirty RAM buffer. If a same-context remote layout removes a dirty
+editor or changes its URL, the desktop retains the last visible tree as a local
+display snapshot and shows a warning; the authoritative tree is already current.
+Layout-changing palette/agent actions and stale URL/split/ratio/selected-pane
+reports are blocked while that snapshot is held, rather than persisting it over
+the server's newer tree.
+
+Saving a conflicting editor until clean, or explicitly consenting to close its
+retained local document, reconciles against the current authoritative tree.
+Closing that old document never closes a same-id remote replacement. Other dirty
+documents may still retain the remaining snapshot until they are resolved.
+
+**Whole-context retirement.** An authoritative server/session or document-generation
+change may retire the current desktop workspace without a user Discard. Before
+changing the old pane's identity or recovery tags, the desktop permanently detaches
+its dirty editor from native server access and retains the existing page/controller
+with its original path, baseline, revision and dirty state. Clean old panes are
+retired and pruned. The old text stays visible, copyable and locally editable with
+a previous-workspace warning; it is not relabelled as a draft for the new workspace.
+Save and Reload are unavailable, and no future document read/stat/write, recovery
+operation, new watch or reconnect may use that detached controller.
+
+The server/session selection, readiness and authoritative layout continue to advance;
+only presentation of those old documents is retained. No new-owner pane is minted
+or restamped into the retained cache. Confirmed local close removes only the old
+retained document, never a same-id pane in the current authoritative tree. Closing
+the last retained document reveals current authority. This is RAM retention, not
+durable history, and does not extend the native mobile contract.
+
+The sole remaining native I/O capability is resource cleanup: one owned active or
+late-returning pending watch id may be unwatched through the captured old client,
+only while its original issuing transport binding is still current and writable.
+It must never cancel a same-looking subscription on a replacement peer. A fresh,
+validated user Discard follows the immediate-reset rule above before its action;
+there is no deferred permission to discard future documents.
 
 Unsaved-file state should appear both in the pane header and in the Dev Session row.
 
@@ -1565,6 +1659,13 @@ padding grammar, and group length before it is decoded. Malformed base64 is
 reported as an **Invalid params** RPC error, not as an internal server error.
 `mode` is an optional POSIX mode used, among other things, for private recovery
 snapshots.
+
+`readFile` replies include a required boolean `truncated`; a missing flag is not
+evidence of a complete document. Successful `writeFile` replies carry a nonempty
+revision usable by the next guarded save. An empty revision is reserved for a
+create-only request, not a successful save result. The native mobile service
+refuses these malformed replies instead of displaying potentially incomplete
+bytes or turning a later save into an unintended create-only operation.
 
 The server refuses a full read or requested range over 16 MiB, and refuses a
 serialized `readFile` response (regardless of content encoding) over 15 MiB. A
@@ -1603,6 +1704,9 @@ existed for a while and was never called by anything; it has been removed.
 ### 8.4 Revision Tokens
 
 Every read should return a revision token. Every save includes the revision originally loaded. The server rejects the save if the remote file changed.
+Tokens are opaque metadata revisions, not content hashes: the implementation
+includes device and inode identity as well as timestamps and size, so matching
+inode numbers on distinct filesystems do not alias.
 
 ### 8.5 Atomic Saves
 
@@ -1627,6 +1731,9 @@ with a same-directory hard link and then removes the temporary name. A competing
 creation produces a revision mismatch rather than being overwritten. This requires
 a filesystem that supports hard links; unsupported filesystems fail visibly rather
 than falling back to a clobbering rename.
+A dangling-symlink create may resolve a missing final destination, but must not
+collapse `..` across a missing intermediate component and report success at an
+unrelated sibling while the requested path remains unresolved.
 
 Existing-file replacement still uses a final revision check followed by rename.
 Those two operations are not an atomic compare-and-replace against unrelated
@@ -1897,6 +2004,40 @@ the daemon, and in the client's `WorkspaceDb::kSchemaVersion`, and those must mo
 migrates, and the client's copy records what it expects to find. Note this is NOT the version that gates
 compatibility — that is the separate RPC schema version (§10.3).
 
+The current workspace schema is **6**. Its ordered repair reaches databases that
+an earlier build already stamped as version 5: correcting the historical v3/v4
+functions alone cannot repair a file whose upgrade fast path skips those steps.
+Version 6 first drops removable named obsolete display-name uniqueness rules
+(including partial, reversed-column and redundant variants), so a rule filtered
+on NULL targets cannot reject the temporary vacating needed by target repair.
+It then repairs targets and installs global `tmux_target` uniqueness only when
+that full rule is missing, before performing any required table rebuild to remove
+a table-level obsolete label constraint. It does not rerun v3's display-name
+deduplication or add a new label constraint. Valid duplicate labels, pane ids,
+layouts, metadata and legacy orphan rows are preserved.
+
+The upgrade runs under `BEGIN IMMEDIATE`, rereads the version while locked and
+records version 6 in the same transaction as the repairs. A failure rolls back
+target/schema/version changes, with foreign-key enforcement restored afterwards.
+Already-current opens use the existing no-migration-write-lock fast path, and
+repeated opens do not repeat the repair.
+
+Historical v4 and current v6 terminal-table rebuilds also preserve unrelated
+same-table named index and trigger DDL, replaying indexes then triggers only after
+row copy and table swap. The copy itself therefore produces no new audit-trigger
+events; genuine target-repair UPDATEs may still invoke existing UPDATE triggers.
+A named full target-uniqueness rule is retained rather than duplicated by an
+implicit one. Replay or final version-record failure rolls the whole migration
+back. This is not a compatibility promise for arbitrary extra custom columns or
+unrelated table-level constraints.
+
+Persisted migration levels must be nonnegative safe integers; malformed metadata
+is refused before migration rather than relabelled as current (version 0 remains
+supported). Historical terminal-identity migrations require full uniqueness of
+`tmux_target`, not a partial unique index, and remove all obsolete uniqueness
+constraints on the pair of Dev Session and display name, including partial or
+reversed-column indexes. Display names are not terminal identities.
+
 ### 11.2 Local State
 
 The client may store only:
@@ -1928,6 +2069,18 @@ never stores a password, passphrase, repository, or project file. Private-key
 bytes are stored only by the per-key copy the list above permits, under all of
 that entry's limits, and never as a side effect of saving a profile.
 
+For an isolated **desktop** GUI run, `CH_SETTINGS_PATH` selects one absolute local
+INI file shared by profiles, preferences (`AppSettings`) and UI state. Unset
+preserves the normal native settings backend; explicitly setting an empty or
+relative value is a startup error before any of these stores are constructed.
+With that override, the external WebEngine profile's persistent data and disk
+cache use `<CH_SETTINGS_PATH>.webengine/data` and `.../cache`, installed before
+the profile enables persistence or serves a page; unset retains normal native
+browser storage. The privileged internal profile remains off-the-record.
+Use a fresh private file/root, not an existing user store or an untrusted path:
+these configuration paths are not a symlink/ownership-validation sandbox.
+This does not redirect SSH trust files, saved key files or all other local data.
+
 If profile persistence fails, the client reports the failure rather than claiming
 the edit was saved. The in-memory edit remains available for connecting and retrying;
 it is not confirmed durable until a later save succeeds. A successful write made
@@ -1942,6 +2095,10 @@ permissions are checked as owner-only (0700); files are atomically published wit
 checked owner-only permissions (0600) before any document bytes are written.
 The complete bytes are needed while the PDF pane is open for on-demand rendering;
 they are not a durable project copy, export, or file passed to an OS handler.
+The native decoder is closed before its rendering file is removed, including
+peer retirement and deferred page destruction. QtQuick PDF's empty `source`
+assignment is not sufficient to close it. The service's native source bridge
+loads only its own current rendering files and supports reopening the same URL.
 Retarget/pane teardown removes that pane's file; peer change/loss and client or
 service destruction remove only the service's owned directory. There is no global
 startup sweep or orphan reclamation. A crash, forced termination or failed removal
@@ -1954,9 +2111,11 @@ in memory for the session, referenced where the user keeps it, or — if the use
 asks for that one key — copied into app-private storage under the limits above.
 See the mobile note in §12.1. The native PDF rendering cache is the separate,
 narrow project-byte exception described above.
-The identity-file entry a mobile profile records is the reference case, which is
-the "SSH-agent or credential-store reference" this section already allows and not
-key material.
+The identity-file entry a mobile profile records is either the user-managed key
+reference or the app-private path of a key explicitly saved on this device; a
+session-only import has no durable reference and records an empty value. Neither
+case stores key bytes in the profile. App-private absolute paths are tied to that
+device and app container, not portable credentials or a container-migration scheme.
 
 ### 11.3 Unsaved Recovery
 
@@ -2014,6 +2173,9 @@ bound document or discarding its RAM; restoration of the same tuple re-enables i
 A genuinely different complete tuple leaves the old document recovery-unavailable
 until an explicit open binds the new document. It does not automatically reopen,
 discard, or snapshot the old buffer into that other scope.
+These transient rebinding rules do not reauthorize a desktop controller permanently
+detached by whole-context retirement (§8.2). Its original tags remain frozen and
+recovery I/O stays disabled even if a matching tuple becomes active again.
 
 A recovery offer must still belong to the untouched buffer that started its
 probe. Editing or saving while the probe is in flight prevents an old snapshot
@@ -2083,11 +2245,13 @@ Requirements:
 > these three credential paths and no fourth:
 >
 > 1. **In memory for the session** — the default, and what an import does unless
->    the user asks for more. A key pasted or picked is held in memory, handed to
->    libssh through `SshConnectionPool::setInMemoryIdentity()`, and wiped;
->    nothing is written, not even temporarily: an unasked-for temporary file is
->    exactly the copy §11.2 does not permit, since it is neither something the
->    user chose to keep nor something the UI can offer to delete.
+>    the user asks for more. A key pasted or picked is retained in session memory
+>    and handed to libssh through `SshConnectionPool::setInMemoryIdentity()`.
+>    Disconnect/`forgetSession()` clears the store's memory and installed identity;
+>    retaining that identity while connected permits reconnect. Overwriting owned
+>    buffers is best effort, not a guarantee that QML, libssh or allocator copies
+>    are erased. Nothing is written, not even temporarily, unless the user opts
+>    into the per-key on-device copy below.
 > 2. **A reference to the key where the user keeps it** — the key stays in the
 >    user's OWN storage and the client persists only a REFERENCE to it (an
 >    Android persistable document-URI grant, an Apple security-scoped bookmark,
@@ -2102,6 +2266,10 @@ Requirements:
 >    If deletion fails, the saved entry remains visible so the user can retry;
 >    the in-memory key and installed SSH identity are still cleared. A copy
 >    already removed outside the app is treated as deleted.
+>    Its app-private path can be saved in a profile and re-adopted on reopening;
+>    this does not turn it into an external reference or change its deletion policy.
+>    The imported RAM copy may remain until session cleanup. Deleting the saved
+>    file is not a promise of secure flash erasure or removal of other copies.
 >
 > The copy lives in `QStandardPaths::AppDataLocation` + `/keys`, a directory
 > created owner-accessible only, one file per key, written with `QSaveFile` so a
@@ -2110,8 +2278,9 @@ Requirements:
 > ends: Android sets `android:allowBackup="false"`
 > (`packaging/android/AndroidManifest.xml:111`), and on iOS the file gets
 > `NSURLIsExcludedFromBackupKey`, so a saved key does not ride an iCloud or
-> adb backup off the device. Nothing about it reaches QSettings, a log line, or
-> a `Q_PROPERTY` QML can read — QML sees names and the `saved` flag, never bytes.
+> adb backup off the device. Key bytes do not reach QSettings or logs and are not
+> exposed as a QML property. QML can read key names, status and durable references,
+> including the app-private saved-key path; those references are not key material.
 >
 > A saved key deliberately outlives the session: `forgetSession()` still wipes
 > in-memory keys, any armed passphrase and the pool's installed identity —
@@ -2121,16 +2290,13 @@ Requirements:
 > alongside the session's, so a key kept on a previous launch is there to select
 > without importing it again.
 >
-> **What this costs.** For a saved key the strong property above is gone: there
-> IS now a secret on disk. The sandbox is the whole of the protection, so an
-> attacker holding the unlocked, and on Android an unlocked-and-rooted, device
-> gets that key; the storage rules — app-private, 0600, no backup, delete from
-> the UI — bound the exposure, and encryption would not change the answer here,
-> since a key usable without retyping anything must be decryptable without the
-> user, which means the decryption material sits in the same sandbox as the
-> ciphertext. No keychain or Keystore integration is faked to suggest otherwise.
-> Passphrases are still never persisted, so an encrypted key saved on the device
-> is only as usable as the passphrase the user retypes.
+> **What this costs.** For a saved key there is now private-key text on disk,
+> protected by the app sandbox, owner-only permissions and backup exclusion, not
+> a keychain or Keystore. CodeHarbor adds no encryption, but saving preserves any
+> encryption already present in the imported OpenSSH/PEM key. Someone able to read
+> the app's files can obtain that stored text: an unencrypted key needs no further
+> secret, while an encrypted key still needs its passphrase. Passphrases are never
+> persisted, so saving an encrypted key does not remove the need to retype one.
 >
 > **The alternative that needs no relaxation** stays available and is the
 > recommended one for a pasted key: export it, on the user's action, to a

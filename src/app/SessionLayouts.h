@@ -345,6 +345,8 @@ private:
         // Edits received before the current tree arrived. They are local user
         // intent, not server replies, so they may be replayed only for this
         // generation and only after their pane/path still exists.
+        // Continuous reports coalesce only after the latest structural action:
+        // a split/close can change the node addressed by the same index path.
         QVector<PendingWrite> pendingWrites;
         // A local edit has already replaced this region's tree since the
         // in-flight load for it was issued, so that load's reply is history and
@@ -356,7 +358,9 @@ private:
         // region the unusable-layout treatment, blanking a layout the user just
         // built and the server has already accepted. The error is still
         // reported; only the region is left alone.
-        // Cleared by load() (a deliberate reload must adopt the server's tree).
+        // Set before publishing an edit, since a synchronous tree observer can
+        // dispatch an outstanding reply before persist() is reached. Cleared by
+        // load() (a deliberate reload must adopt the server's tree).
         bool superseded = false;
     };
     // Return Drop for a stale session/generation stamp, Queue for a current

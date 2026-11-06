@@ -23,6 +23,7 @@
 #include <QMetaProperty>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QPointer>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QQmlContext>
@@ -345,6 +346,8 @@ private slots:
     void blankHostOrUserRowsAreNotProfilesAndAreDroppedOnLoad();
     void hostAndUserWithEmbeddedWhitespaceAreNotProfiles();
     void aSaveDegradedHandlerMayMutateTheStore();
+    void aSaveFailureHandlerMayDestroyTheStore();
+    void aProfileObserverMayDestroyTheStore();
 
     // ---- SettingsWindow.qml server pane / ConnectSheet prompts ----
     void sheetLoadsSilentlyAndExposesItsApi();
@@ -1807,6 +1810,67 @@ void TstServerProfiles::aSaveDegradedHandlerMayMutateTheStore()
     QCOMPARE(namesOf(reader.profiles()),
              QStringList({QStringLiteral("outer"),
                           QStringLiteral("from the handler")}));
+}
+
+void TstServerProfiles::aSaveFailureHandlerMayDestroyTheStore()
+{
+    for (int mutation = 0; mutation < 4; ++mutation) {
+        const QString path = iniPath(QStringLiteral("destroy-failed-%1.ini").arg(mutation));
+        QVERIFY(QDir().mkdir(path));
+        QPointer<ServerProfiles> store = new ServerProfiles(path);
+        const QVariantMap fields = profileFields(
+            QStringLiteral("first"), QStringLiteral("host"), 22, QStringLiteral("user"));
+        const QString id = store->addProfile(fields);
+        QVERIFY(!id.isEmpty());
+        int failures = 0;
+        connect(store, &ServerProfiles::saveFailed, this, [&](const QString&) {
+            ++failures;
+            delete store.data();
+        });
+
+        switch (mutation) {
+        case 0:
+            QVERIFY(!store->addProfile(fields).isEmpty());
+            break;
+        case 1:
+            store->updateProfile(id, {{QStringLiteral("name"), QStringLiteral("renamed")}});
+            break;
+        case 2:
+            store->removeProfile(id);
+            break;
+        case 3:
+            store->setActiveId({});
+            break;
+        }
+
+        QCOMPARE(failures, 1);
+        QVERIFY(store.isNull());
+    }
+}
+
+void TstServerProfiles::aProfileObserverMayDestroyTheStore()
+{
+    for (bool removing : {false, true}) {
+        const QString path = iniPath(QStringLiteral("destroy-observer-%1.ini").arg(removing));
+        QPointer<ServerProfiles> store = new ServerProfiles(path);
+        const QVariantMap fields = profileFields(
+            QStringLiteral("first"), QStringLiteral("host"), 22, QStringLiteral("user"));
+        QString id;
+        if (removing)
+            id = store->addProfile(fields);
+        connect(store, &ServerProfiles::profilesChanged, this,
+                [&] { delete store.data(); });
+
+        if (removing)
+            store->removeProfile(id);
+        else
+            id = store->addProfile(fields);
+
+        QVERIFY(store.isNull());
+        ServerProfiles reopened(path);
+        QCOMPARE(reopened.profiles().size(), removing ? 0 : 1);
+        QCOMPARE(reopened.activeId(), removing ? QString() : id);
+    }
 }
 
 // ---------------------------------------------------------------------------

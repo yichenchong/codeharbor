@@ -41,11 +41,16 @@ class ViewerStub : public QObject
 public:
     explicit ViewerStub(QObject *parent = nullptr) : QObject(parent) {}
 
-    Q_INVOKABLE void listDirectory(const QString &path)
+    Q_INVOKABLE QString newDirectoryRequestId()
+    {
+        return QString::number(++m_requestSerial);
+    }
+
+    Q_INVOKABLE void listDirectory(const QString &path, const QString &requestId)
     {
         QMetaObject::invokeMethod(
             this,
-            [this, path] { emit directoryListed(path, m_entries); },
+            [this, path, requestId] { emit directoryListed(path, m_entries, requestId); },
             Qt::QueuedConnection);
     }
 
@@ -75,11 +80,12 @@ public:
     void setEntries(const QVariantList &entries) { m_entries = entries; }
 
 signals:
-    void directoryListed(const QString &path, const QVariantList &entries);
-    void directoryError(const QString &path, const QString &message);
+    void directoryListed(const QString &path, const QVariantList &entries, const QString &requestId);
+    void directoryError(const QString &path, const QString &message, const QString &requestId);
 
 private:
     QVariantList m_entries;
+    int m_requestSerial = 0;
 };
 
 QObject *findText(QObject *root, const QString &text)

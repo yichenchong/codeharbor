@@ -55,23 +55,10 @@ Rectangle {
         return RemotePath.fileUrlToPath(u.toString());
     }
 
-    // The listing this view has outstanding, and nothing else. Empty when there
-    // is none.
-    //
-    // Held as STATE, set when the request goes out and cleared the moment a
-    // reply settles it, rather than recomputed from `url` at reply time and
-    // matched against anything that happens to fit. ONE ViewerModel is shared
-    // by every viewer pane and they all listen on this one signal pair, so the
-    // loose form let ANOTHER pane's listing of this same directory land here:
-    // its answer silently replaced the rows under the user, and a
-    // directoryError raised for its request painted an error over a listing
-    // that had loaded perfectly well.
-    //
-    // The key is the path because ch::ViewerModel documents listDirectory as
-    // pane-INDEPENDENT (ViewerModel.h) — the answer for a path is the same for
-    // whoever asked — but a reply is still matched against what THIS view asked
-    // for, once.
+    // Path plus per-dispatch identity: another pane or an earlier reload may
+    // have the same path outstanding, but must not publish into this listing.
     property string requestedPath: ""
+    property string requestedRequestId: ""
 
     // The directory being listed, WITHOUT the trailing slash that marked the URL
     // as a directory — the form child paths are built from. "/" keeps its slash
@@ -211,12 +198,11 @@ Rectangle {
         return true;
     }
 
-    // Start listing the current URL, abandoning any listing still outstanding
-    // for the previous one. There is nothing to cancel model-side — unlike a
-    // text read, ch::ViewerModel keeps no per-listing bookkeeping to retire —
-    // so dropping the key is exactly what abandoning one means here.
+    // Retire the old identity before issuing a reload, including for the same
+    // path. Late replies are ignored rather than replacing the current rows.
     function reload() {
         root.requestedPath = "";
+        root.requestedRequestId = "";
         root.entries = [];
         root.errorText = "";
         root.loading = false;
@@ -224,7 +210,8 @@ Rectangle {
             return;
         root.loading = true;
         root.requestedPath = root.remotePath(root.url);
-        root.viewerModel.listDirectory(root.requestedPath);
+        root.requestedRequestId = root.viewerModel.newDirectoryRequestId();
+        root.viewerModel.listDirectory(root.requestedPath, root.requestedRequestId);
     }
 
     onUrlChanged: {
@@ -254,6 +241,7 @@ Rectangle {
             if (root.requestedPath.length === 0)
                 return;
             root.requestedPath = "";
+            root.requestedRequestId = "";
             root.loading = false;
             root.errorText = qsTr("The server did not answer with this directory's contents.");
         }
@@ -268,12 +256,10 @@ Rectangle {
             listingWatchdog.stop();
     }
 
-    // This reply belongs to the listing THIS view issued. Settling clears the
-    // key, so a later answer about the same directory — another pane's request,
-    // or this pane's own probe in ViewerPane — cannot disturb what is already
-    // on screen.
-    function ownsReply(path) {
-        return root.requestedPath.length > 0 && path === root.requestedPath;
+    function ownsReply(path, requestId) {
+        return root.requestedPath.length > 0 && path === root.requestedPath
+               && root.requestedRequestId.length > 0
+               && requestId === root.requestedRequestId;
     }
 
     Connections {
@@ -281,16 +267,18 @@ Rectangle {
         // The listing is named `listing`, not `list`: `list` is the id of the
         // ListView below, and a parameter of that name shadows it for the whole
         // body — a trap for the next edit that needs to touch the view here.
-        function onDirectoryListed(path, listing) {
-            if (root.ownsReply(path)) {
+        function onDirectoryListed(path, listing, requestId) {
+            if (root.ownsReply(path, requestId)) {
                 root.requestedPath = "";
+                root.requestedRequestId = "";
                 root.entries = listing;
                 root.loading = false;
             }
         }
-        function onDirectoryError(path, message) {
-            if (root.ownsReply(path)) {
+        function onDirectoryError(path, message, requestId) {
+            if (root.ownsReply(path, requestId)) {
                 root.requestedPath = "";
+                root.requestedRequestId = "";
                 root.errorText = message;
                 root.loading = false;
             }

@@ -31,11 +31,10 @@ import QtQuick.Layouts
 //             pre-ticked box and no implicit path into this: a user who never
 //             taps the button is in exactly the pre-amendment situation.
 //
-// THE SAVE WARNING IS NOT SOFTENED. The file is NOT encrypted - the store has no
-// passphrase of its own to encrypt it with, and inventing one would be a lock
-// whose key sits next to it. Anyone holding the unlocked phone can read it. The
-// sheet says that, in those words, next to the button, because a user cannot
-// weigh "survives a relaunch" against a risk nobody named.
+// Saving adds no encryption: the armour is preserved, including any existing
+// key encryption. An unencrypted input remains unencrypted on disk, readable
+// to anyone who can access the app's files. The warning keeps that risk visible
+// without claiming an encrypted input has been decrypted.
 //
 // THE PASTED TEXT IS NEVER ECHOED BACK. On a successful import the text area is
 // cleared and the sheet shows the FINGERPRINT instead — a digest of the public
@@ -209,7 +208,7 @@ Dialog {
         root.revealKeyCursor()
     }
 
-    // Empty the paste box WITHOUT leaving the key recoverable.
+    // Empty the paste box and discard its UI undo history, not secure erasure.
     //
     // TextArea.clear() reaches QQuickTextControl::clear(), which selects the whole
     // document and deletes the selection as an UNDOABLE edit: the key text stays
@@ -339,7 +338,7 @@ Dialog {
         // answer, and the only remaining action on it is deleting the file.
         root.savableName = ""
         root.keyInfoRevision += 1
-        root.message = qsTr("Saved \"%1\" on this device. The file is not encrypted; anyone who can unlock this phone can read it.").arg(name)
+        root.message = qsTr("Saved \"%1\" on this device. CodeHarbor adds no encryption; protect access to this phone and this app's files. Any existing key encryption is preserved.").arg(name)
     }
 
     Connections {
@@ -467,7 +466,7 @@ Dialog {
                            + "it only until the app closes, point it at a key file you "
                            + "keep yourself so only the location is remembered, or - "
                            + "after pasting - save the key on this device, which "
-                           + "writes it to storage unencrypted.")
+                           + "adds no encryption to the stored key.")
             }
 
             // ---- keys currently available ------------------------------------
@@ -566,9 +565,8 @@ Dialog {
             }
 
             // Removal confirmation, inline so the row it refers to is still visible.
-            // Never a one-tap action: a pasted key cannot be recovered from here at
-            // all, a reference has to be re-picked through the system dialog, and a
-            // saved key's file is gone for good once the file is unlinked.
+            // Never a one-tap action: CodeHarbor cannot undo removal of a pasted
+            // key or deletion of a saved file. Unlinking is not secure erasure.
             Frame {
                 Layout.fillWidth: true
                 visible: root.pendingDeleteName.length > 0
@@ -581,8 +579,7 @@ Dialog {
                         wrapMode: Text.WordWrap
                         textFormat: Text.PlainText
                         text: root.pendingDeleteFile
-                              ? qsTr("Delete the saved key file for \"%1\"? The copy CodeHarbor wrote to this device is erased and cannot be recovered here.")
-                                .arg(root.pendingDeleteName)
+                              ? qsTr("Delete the saved key file for \"%1\"? CodeHarbor cannot undo this deletion.").arg(root.pendingDeleteName)
                               : qsTr("Remove the key \"%1\"? Your own key file is not deleted, but CodeHarbor will forget it.")
                                 .arg(root.pendingDeleteName)
                     }
@@ -821,11 +818,11 @@ Dialog {
                         // included because otherwise saving looks like it removes
                         // the per-launch prompt, and it does not.
                         text: qsTr("The key is written to this app's private storage. "
-                                   + "It is not encrypted: anyone who can unlock this "
-                                   + "phone can read it, and so can anyone who can read "
-                                   + "this app's files. A passphrase, if the key has one, "
-                                   + "is still never stored and is still asked for every "
-                                   + "time you connect.")
+                                   + "CodeHarbor adds no encryption: an unencrypted key "
+                                   + "can be read by anyone who can access this app's "
+                                   + "files. Existing key encryption is preserved. "
+                                   + "A key passphrase is never saved; you still enter "
+                                   + "it when needed to connect.")
                     }
                     Button {
                         objectName: "saveKeyOnDeviceButton"

@@ -42,7 +42,13 @@ const common = {
     legalComments: "eof",
 };
 
+const names = ["index.html", "markdown.js", "markdown.css"];
+if (sourcemap) {
+    names.push("markdown.js.map", "markdown.css.map");
+}
+
 let result;
+let sizes;
 try {
     result = await build({
         ...common,
@@ -54,6 +60,15 @@ try {
         loader: { ".css": "css" },
     });
     await copyFile(join(root, "index.html"), join(staging, "index.html"));
+    // A successful esbuild call need not emit CSS. Validate every resource,
+    // including the copied page, before replacing a working bundle.
+    sizes = await Promise.all(names.map(async (name) => {
+        const { size } = await stat(join(staging, name));
+        if (size === 0) {
+            throw new Error(`build produced an empty ${name}`);
+        }
+        return { name, size };
+    }));
 } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;
@@ -75,12 +90,7 @@ try {
 }
 await rm(previous, { recursive: true, force: true });
 
-const names = ["index.html", "markdown.js", "markdown.css"];
-if (sourcemap) {
-    names.push("markdown.js.map", "markdown.css.map");
-}
-for (const name of names) {
-    const { size } = await stat(join(dist, name));
+for (const { name, size } of sizes) {
     console.log(`dist/${name}\t${(size / 1024).toFixed(1)} KiB`);
 }
 if (result.warnings.length > 0) {

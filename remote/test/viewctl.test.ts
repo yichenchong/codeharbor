@@ -74,6 +74,39 @@ test("valid CLI commands retain applied and refused exit statuses", async () => 
     }
 });
 
+test("invalid advertised control endpoints are refused instead of dialled (TIN1)", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ch-viewctl-route-"));
+    const socketPath = path.join(dir, "control.sock");
+    let relayed = 0;
+    const listener = await startControlListener((command) => {
+        relayed += 1;
+        queueMicrotask(() => listener.settle({ commandId: command.commandId, ok: true }));
+        return true;
+    }, socketPath);
+    try {
+        // The relative spelling reaches a real, answering socket before the
+        // fix, so success would prove a route dependent on the agent's CWD.
+        for (const endpoint of [
+            path.relative(process.cwd(), socketPath),
+            `${socketPath}\0`,
+        ]) {
+            const out = capture();
+            const err = capture();
+            assert.equal(await main(["list"], {
+                OMP_DEV_SESSION_ID: "d",
+                OMP_TERMINAL_ID: "t",
+                CODEHARBOR_CONTROL_SOCKET: endpoint,
+            }, out.stream, err.stream), 1);
+            assert.equal(JSON.parse(out.text()).code, "bad_request");
+            assert.match(err.text(), /absolute socket path/);
+        }
+        assert.equal(relayed, 0);
+    } finally {
+        listener.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("a symlinked viewer CLI still runs and reports refusals (RI2)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "ch-viewctl-link-"));
     try {

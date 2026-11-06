@@ -5,6 +5,7 @@
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -16,9 +17,11 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QString>
+#include <QSignalSpy>
 #include <QtTest/QtTest>
 
 #include <optional>
+#include <memory>
 
 using ch::CodeharbordClient;
 using ch::KnownHosts;
@@ -40,6 +43,7 @@ QString env(const char* key)
 
 // Accumulates one channel's observable surface so assertions can be made on the
 // read stream and the out-of-band error stream independently.
+// Declare the sink before its device so captured state survives channel teardown.
 struct ChannelSink {
     QByteArray out;
     QString err;
@@ -86,6 +90,9 @@ private slots:
     void windowsNamedPipeAgentFallsBackToIdentityFile();
     void trustedHostMismatchIsCheckedAfterKex();
     void poolDestructorEmitsOnlySessionClosing();
+    void fatalTransportEofUpdatesPoolStateAndAllowsReconnect_data();
+    void fatalTransportEofUpdatesPoolStateAndAllowsReconnect();
+    void failedChannelOpenPreservesAReentrantReplacement();
     void deviceOutlivingItsSessionStopsCleanly();
 private:
     void ensureConnected();
@@ -185,8 +192,8 @@ void TstLiveSsh::execChannelDeliversStdout()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
+    SshChannelDevice device(&m_pool);
     sink.attach(&device);
 
     QVERIFY(device.startExec(QStringLiteral("echo LIVE_EXEC_OK")));
@@ -203,9 +210,9 @@ void TstLiveSsh::execChannelReportsBufferedLines()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool);
     QByteArray line;
     bool finished = false;
+    SshChannelDevice device(&m_pool);
     QObject::connect(&device, &SshChannelDevice::readyRead, &device,
                      [&device, &line] {
                          if (device.canReadLine())
@@ -234,8 +241,8 @@ void TstLiveSsh::manyShortLivedChannelsReuseTheirSlots()
 
     constexpr int kChannelCount = 25;
     for (int i = 0; i < kChannelCount; ++i) {
-        SshChannelDevice device(&m_pool);
         ChannelSink sink;
+        SshChannelDevice device(&m_pool);
         sink.attach(&device);
 
         QVERIFY2(device.startExec(QStringLiteral("echo SLOT_%1").arg(i)),
@@ -266,8 +273,8 @@ void TstLiveSsh::ptyChannelRunsWithTheRequestedTerminalType()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
+    SshChannelDevice device(&m_pool);
     sink.attach(&device);
 
     // printf, not echo: no trailing newline to be rewritten by the tty's
@@ -304,8 +311,13 @@ void TstLiveSsh::rpcServerInfoOverSshChannel()
                        "'%2/remote/src/codeharbord.ts' rpc --stdio")
             .arg(m_node, m_repo);
 
-    SshChannelDevice device(&m_pool);
     QString stderrText;
+    // TSH5: a timeout returns with the RPC pending; client destruction then
+    // invokes its callback, so callback state must outlive the client too.
+    QJsonValue result;
+    std::optional<RpcError> rpcError;
+    bool answered = false;
+    SshChannelDevice device(&m_pool);
     QObject::connect(&device, &SshChannelDevice::channelError, &device,
                      [&stderrText](const QString& text) { stderrText += text; });
     QVERIFY2(device.startExec(command), qPrintable(command));
@@ -314,9 +326,6 @@ void TstLiveSsh::rpcServerInfoOverSshChannel()
     CodeharbordClient client;
     client.setTransport(&device);
 
-    QJsonValue result;
-    std::optional<RpcError> rpcError;
-    bool answered = false;
     client.call(QStringLiteral("server.info"), QJsonValue(),
                 [&](QJsonValue value, std::optional<RpcError> err) {
                     result = value;
@@ -367,8 +376,8 @@ void TstLiveSsh::stderrStaysOutOfReadStream()
 
     // Exec (not Pty): a PTY would merge stderr into stdout at the kernel level
     // and the separation could not be observed at all.
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
+    SshChannelDevice device(&m_pool);
     sink.attach(&device);
 
     QVERIFY(device.startExec(
@@ -388,8 +397,8 @@ void TstLiveSsh::execChannelDrainsLargeStdoutBeforeReportingEof()
 {
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
+    SshChannelDevice device(&m_pool);
     sink.attach(&device);
 
     QVERIFY2(device.startExec(
@@ -404,10 +413,10 @@ void TstLiveSsh::stderrDecoderPreservesACharacterAcrossPumpPasses()
 {
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
-    sink.attach(&device);
     bool acknowledged = false;
+    SshChannelDevice device(&m_pool);
+    sink.attach(&device);
     connect(&device, &SshChannelDevice::readyRead, &device, [&] {
         if (!acknowledged)
             acknowledged = device.write("\n", 1) == 1;
@@ -470,6 +479,9 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
             qputenv("SSH_AUTH_SOCK", oldAgent);
     });
 
+    int passphraseRequests = 0;
+    bool passwordRequested = false;
+    QString failure;
     SshConnectionPool pool;
     KnownHosts hosts;
     pool.setKnownHosts(hosts);
@@ -478,8 +490,6 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
         return SshConnectionPool::HostKeyDecision::Accept;
     });
 
-    int passphraseRequests = 0;
-    bool passwordRequested = false;
     pool.setCredentialCallback(
         [&passphraseRequests, &passwordRequested](const QString&,
                                                    SshConnectionPool::CredentialKind kind) {
@@ -490,7 +500,6 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
             passwordRequested = true;
             return SshConnectionPool::CredentialReply{};
         });
-    QString failure;
     QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
                      [&failure](const QString& message) { failure = message; });
 
@@ -530,13 +539,13 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
     config.write("\n");
     config.close();
 
+    int configPassphraseRequests = 0;
     SshConnectionPool configuredPool;
     configuredPool.setKnownHosts(KnownHosts{});
     configuredPool.setHostKeyCallback([](const QString&, const QString&,
                                          const QByteArray&, KnownHosts::Verdict) {
         return SshConnectionPool::HostKeyDecision::Accept;
     });
-    int configPassphraseRequests = 0;
     configuredPool.setCredentialCallback(
         [&configPassphraseRequests](const QString&,
                                     SshConnectionPool::CredentialKind kind) {
@@ -555,13 +564,13 @@ void TstLiveSsh::encryptedIdentityUsesPassphraseFromCallback()
     // Profile paths are allowed to use the shell spelling people type in the
     // connect sheet. SSH_OPTIONS_IDENTITY does not expand `~` itself, so this
     // verifies CodeHarbor resolves it before handing the value to libssh.
+    int tildePassphraseRequests = 0;
     SshConnectionPool tildePool;
     tildePool.setKnownHosts(KnownHosts{});
     tildePool.setHostKeyCallback([](const QString&, const QString&,
                                     const QByteArray&, KnownHosts::Verdict) {
         return SshConnectionPool::HostKeyDecision::Accept;
     });
-    int tildePassphraseRequests = 0;
     tildePool.setCredentialCallback(
         [&tildePassphraseRequests](const QString&,
                                    SshConnectionPool::CredentialKind kind) {
@@ -602,13 +611,13 @@ void TstLiveSsh::windowsNamedPipeAgentFallsBackToIdentityFile()
             qputenv("SSH_AUTH_SOCK", oldAgent);
     });
 
+    QString failure;
     SshConnectionPool pool;
     pool.setKnownHosts(KnownHosts{});
     pool.setHostKeyCallback([](const QString&, const QString&,
                                const QByteArray&, KnownHosts::Verdict) {
         return SshConnectionPool::HostKeyDecision::Accept;
     });
-    QString failure;
     QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
                      [&failure](const QString& message) { failure = message; });
 
@@ -666,12 +675,12 @@ void TstLiveSsh::encryptedPemIdentityNeverPromptsOnTheControllingTerminal()
     if (env("CH_LIVE_PEM_PROMPT_CHILD") == QLatin1String("1")) {
         const QString key = env("CH_LIVE_PEM_PROMPT_KEY");
         QVERIFY(!key.isEmpty());
+        int passphraseRequests = 0;
         SshConnectionPool pool;
         pool.setHostKeyCallback([](const QString&, const QString&,
                                    const QByteArray&, KnownHosts::Verdict) {
             return SshConnectionPool::HostKeyDecision::Accept;
         });
-        int passphraseRequests = 0;
         pool.setCredentialCallback(
             [&](const QString&, SshConnectionPool::CredentialKind kind) {
                 if (kind == SshConnectionPool::CredentialKind::KeyPassphrase) {
@@ -760,13 +769,13 @@ void TstLiveSsh::missingAgentAndKeyExplainAuthenticationFailure()
     QVERIFY(missingKeyDir.isValid());
     const QString missingKey = missingKeyDir.filePath(QStringLiteral("id"));
 
+    QString failure;
     SshConnectionPool pool;
     pool.setKnownHosts(KnownHosts{});
     pool.setHostKeyCallback([](const QString&, const QString&,
                                const QByteArray&, KnownHosts::Verdict) {
         return SshConnectionPool::HostKeyDecision::Accept;
     });
-    QString failure;
     QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
                      [&failure](const QString& message) { failure = message; });
 
@@ -799,6 +808,7 @@ void TstLiveSsh::multiStepServerAcceptsKeyThenPassword()
               "provide");
     }
 
+    QList<SshConnectionPool::CredentialKind> asked;
     SshConnectionPool pool;
     KnownHosts hosts;
     QFile store(m_knownHostsPath);
@@ -814,7 +824,6 @@ void TstLiveSsh::multiStepServerAcceptsKeyThenPassword()
     // Stand where AppController stands on the LAST attempt of a credential
     // chain, with the secret already gathered: the pool has to satisfy the key
     // method and the password method inside ONE handshake.
-    QList<SshConnectionPool::CredentialKind> asked;
     pool.setCredentialCallback(
         [&asked, &password](const QString&,
                             SshConnectionPool::CredentialKind kind) {
@@ -861,6 +870,7 @@ void TstLiveSsh::keyboardInteractiveOnlyServerAuthenticatesWithPassword()
               "which the unprivileged fixture sshd cannot provide");
     }
 
+    QList<SshConnectionPool::CredentialKind> asked;
     SshConnectionPool pool;
     KnownHosts hosts;
     QFile store(m_knownHostsPath);
@@ -875,7 +885,6 @@ void TstLiveSsh::keyboardInteractiveOnlyServerAuthenticatesWithPassword()
 
     // The prompt seam AppController drives: keyboard-interactive maps each of
     // the server's prompts onto this ONE password request.
-    QList<SshConnectionPool::CredentialKind> asked;
     pool.setCredentialCallback(
         [&asked, &password](const QString&,
                             SshConnectionPool::CredentialKind kind) {
@@ -911,6 +920,7 @@ void TstLiveSsh::keyboardInteractiveOnlyServerAuthenticatesWithPassword()
 // found in known_hosts.
 void TstLiveSsh::trustedHostMismatchIsCheckedAfterKex()
 {
+    QString failure;
     SshConnectionPool pool;
     KnownHosts hosts;
     hosts.add(SshConnectionPool::lookupHostFor(m_host, m_port),
@@ -918,7 +928,6 @@ void TstLiveSsh::trustedHostMismatchIsCheckedAfterKex()
     pool.setKnownHosts(hosts);
 
     QSignalSpy mismatch(&pool, &SshConnectionPool::hostKeyMismatch);
-    QString failure;
     QObject::connect(&pool, &SshConnectionPool::errorOccurred, &pool,
                      [&failure](const QString& message) { failure = message; });
 
@@ -985,14 +994,15 @@ void TstLiveSsh::deviceOutlivingItsSessionStopsCleanly()
     ensureConnected();
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
 
-    SshChannelDevice device(&m_pool);
     ChannelSink sink;
+    SshChannelDevice device(&m_pool);
     sink.attach(&device);
 
     // `cat` copies the channel's own stdin, which nothing ever closes here, so
     // the remote end sends no EOF of its own: the channel is still live when the
     // session is torn down below.
-    QVERIFY2(device.startExec(QStringLiteral("cat")), qPrintable(sink.err));
+    QVERIFY2(device.startExec(QStringLiteral("cat")),
+             qPrintable(sink.err + QLatin1Char('\n') + m_pool.diagnosticLog()));
     QVERIFY(device.isOpen());
     QVERIFY(!sink.finished);
 
@@ -1010,6 +1020,152 @@ void TstLiveSsh::deviceOutlivingItsSessionStopsCleanly()
     QTest::qWait(100);
     QVERIFY(!device.isOpen());
     QCOMPARE(m_pool.state(), SshConnectionPool::State::Disconnected);
+}
+
+void TstLiveSsh::fatalTransportEofUpdatesPoolStateAndAllowsReconnect_data()
+{
+    QTest::addColumn<QString>("action");
+    QTest::newRow("retain-buffer-until-reconnect") << QStringLiteral("keep");
+    QTest::newRow("reconnect-in-state-observer") << QStringLiteral("reconnect");
+    QTest::newRow("close-in-error-observer") << QStringLiteral("close");
+    QTest::newRow("delete-in-finished-observer") << QStringLiteral("delete");
+}
+
+void TstLiveSsh::fatalTransportEofUpdatesPoolStateAndAllowsReconnect()
+{
+    QFETCH(QString, action);
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    SshConnectionPool pool;
+    pool.setKnownHosts(m_pool.knownHosts());
+    QVERIFY(pool.connectToHost(m_host, m_port, m_user, m_identityFile));
+    {
+        SshChannelDevice normal(&pool);
+        QSignalSpy finished(&normal, &QIODevice::readChannelFinished);
+        QVERIFY(normal.startExec(QStringLiteral("printf normal")));
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, kExecTimeoutMs);
+        QCOMPARE(normal.readAll(), QByteArrayLiteral("normal"));
+        QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+    }
+
+    auto device = std::make_unique<SshChannelDevice>(&pool);
+    QByteArray retained;
+    int finished = 0;
+    int disconnected = 0;
+    bool reconnected = false;
+    bool replacementStarted = false;
+    QObject observerLifetime;
+    const auto observeDevice = [&] {
+        connect(device.get(), &QIODevice::readChannelFinished, &observerLifetime, [&] {
+            ++finished;
+            if (action == QStringLiteral("delete") && finished == 1) {
+                retained = device->readAll();
+                device.reset();
+            }
+        });
+    };
+    observeDevice();
+    connect(device.get(), &SshChannelDevice::channelError, &observerLifetime,
+            [&](const QString&) {
+        if (action == QStringLiteral("close")) {
+            retained = device->readAll();
+            device->closeChannel();
+        }
+    });
+    connect(&pool, &SshConnectionPool::stateChanged, &observerLifetime,
+            [&](SshConnectionPool::State state) {
+        if (state != SshConnectionPool::State::Disconnected)
+            return;
+        ++disconnected;
+        if (action == QStringLiteral("reconnect") && disconnected == 1) {
+            retained = device->readAll();
+            reconnected = pool.connectToHost(m_host, m_port, m_user, m_identityFile);
+            if (reconnected)
+                replacementStarted = device->startExec(QStringLiteral("printf replacement"));
+        }
+    });
+
+    // Wait for real payload before allowing the remote shell to kill only its
+    // own per-connection sshd parent. The unread bytes must survive discovery
+    // of transport EOF, not just an ordinary command's channel EOF.
+    QVERIFY(device->startExec(QStringLiteral(
+        "printf retained; IFS= read -r ack || exit 9; "
+        "[ \"$ack\" = drop ] || exit 9; "
+        "pp=$(ps -o ppid= -p $$ | tr -d ' '); "
+        "case \"$(ps -o args= -p $pp)\" in "
+        "*sshd*) kill -9 \"$pp\";; *) exit 9;; esac")));
+    QTRY_COMPARE_WITH_TIMEOUT(device->bytesAvailable(), qint64(8), kExecTimeoutMs);
+    QCOMPARE(device->write(QByteArrayLiteral("drop\n")), qint64(5));
+    QTRY_COMPARE_WITH_TIMEOUT(disconnected, 1, kExecTimeoutMs);
+
+    if (action == QStringLiteral("reconnect")) {
+        QVERIFY(reconnected);
+        QVERIFY(replacementStarted);
+    } else {
+        QCOMPARE(pool.state(), SshConnectionPool::State::Disconnected);
+        QCOMPARE(finished, 1);
+        if (retained.isEmpty() && device)
+            retained = device->readAll();
+        QVERIFY(pool.connectToHost(m_host, m_port, m_user, m_identityFile));
+        if (!device) {
+            device = std::make_unique<SshChannelDevice>(&pool);
+            observeDevice();
+        }
+        QVERIFY(device->startExec(QStringLiteral("printf replacement")));
+    }
+    QCOMPARE(retained, QByteArrayLiteral("retained"));
+    QTRY_COMPARE_WITH_TIMEOUT(finished, 2, kExecTimeoutMs);
+    QCOMPARE(device->readAll(), QByteArrayLiteral("replacement"));
+    QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+    QCOMPARE(disconnected, 1);
+}
+
+void TstLiveSsh::failedChannelOpenPreservesAReentrantReplacement()
+{
+#if CH_HAVE_LIBSSH
+    ensureConnected();
+    QCOMPARE(m_pool.state(), SshConnectionPool::State::Connected);
+    SshConnectionPool pool;
+    pool.setKnownHosts(m_pool.knownHosts());
+    QVERIFY(pool.connectToHost(m_host, m_port, m_user, m_identityFile));
+    ssh_channel raw = pool.openChannel();
+    QVERIFY(raw);
+    const char command[] =
+        "pp=$(ps -o ppid= -p $$ | tr -d ' '); "
+        "case \"$(ps -o args= -p $pp)\" in "
+        "*sshd*) kill -9 \"$pp\";; *) exit 9;; esac";
+    QCOMPARE(ssh_channel_request_exec(raw, command), SSH_OK);
+    char buffer[16];
+    QElapsedTimer deadline;
+    deadline.start();
+    while (ssh_is_connected(ssh_channel_get_session(raw))
+           && deadline.elapsed() < kExecTimeoutMs) {
+        ssh_channel_read_nonblocking(raw, buffer, sizeof(buffer), 0);
+        QTest::qWait(5);
+    }
+    QVERIFY(!ssh_is_connected(ssh_channel_get_session(raw)));
+
+    SshChannelDevice device(&pool);
+    bool handled = false;
+    bool replacementStarted = false;
+    QObject observerLifetime;
+    connect(&pool, &SshConnectionPool::stateChanged, &observerLifetime,
+            [&](SshConnectionPool::State state) {
+        if (state != SshConnectionPool::State::Disconnected || handled)
+            return;
+        handled = true;
+        if (pool.connectToHost(m_host, m_port, m_user, m_identityFile))
+            replacementStarted = device.startExec(QStringLiteral("printf replacement"));
+    });
+    QVERIFY(!device.startExec(QStringLiteral("printf obsolete")));
+    QVERIFY(handled);
+    QVERIFY(replacementStarted);
+    QTRY_COMPARE_WITH_TIMEOUT(device.bytesAvailable(), qint64(11), kExecTimeoutMs);
+    QCOMPARE(device.readAll(), QByteArrayLiteral("replacement"));
+    QCOMPARE(pool.state(), SshConnectionPool::State::Connected);
+#else
+    QSKIP("built without libssh");
+#endif
 }
 
 QTEST_GUILESS_MAIN(TstLiveSsh)

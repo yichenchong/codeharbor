@@ -64,6 +64,13 @@ Item {
         root.service.readFile(root.remotePath);
     }
 
+    function deactivate() {
+        root.started = false;
+        root.requestedPath = "";
+        root.loading = false;
+        root.lines = [];
+    }
+
     // ONE read for the first target, not two. A page is built by assigning its
     // initial properties and only then running Component.onCompleted, so
     // `remotePath` arriving from the host fires onRemotePathChanged BEFORE the

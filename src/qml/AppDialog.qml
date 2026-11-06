@@ -57,16 +57,26 @@ Dialog {
     // binding loop on implicitHeight for every dialog that sizes to its content.
     property real preferredWidth: 0
     readonly property real _windowWidth: Overlay.overlay ? Overlay.overlay.width : 0
+    readonly property real _clampedPreferredWidth: control._windowWidth > 0
+        ? Math.min(control.preferredWidth, control._windowWidth - 16) : control.preferredWidth
 
     Binding {
         target: control
         property: "width"
         when: control.preferredWidth > 0
         restoreMode: Binding.RestoreBindingOrValue
-        value: control._windowWidth > 0
-               ? Math.min(control.preferredWidth, control._windowWidth - 16)
-               : control.preferredWidth
+        value: control._clampedPreferredWidth
     }
+
+    // Popup's contentHeight is the stored natural content metric (including
+    // an explicitly supplied one). Read it instead of Basic Dialog's
+    // implicitContentHeight getter while calculating this very implicitHeight:
+    // Qt's safe-area bookkeeping in that getter can re-enter implicitHeight.
+    // Preserve Basic's background, padding, header and footer contributions.
+    implicitHeight: Math.max(implicitBackgroundHeight + topInset + bottomInset,
+                             contentHeight + topPadding + bottomPadding
+                             + (implicitHeaderHeight > 0 ? implicitHeaderHeight + spacing : 0)
+                             + (implicitFooterHeight > 0 ? implicitFooterHeight + spacing : 0))
 
     palette.window: Theme.surface
     palette.windowText: Theme.text

@@ -82,6 +82,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QJSValue>
+#include <QPair>
 #include <QMetaObject>
 #include <QModelIndex>
 #include <QPoint>
@@ -294,7 +295,9 @@ QStringList objectNamesOf(QObject* root)
 // One JSON-RPC round trip driven to completion on the caller's event loop, used
 // only for out-of-band bookkeeping (cleanup) — never to produce a result the
 // walkthrough then asserts on.
-struct RawRpc {
+// Client requests survive this helper's local wait deadline; late callbacks are
+// guarded by its QObject lifetime rather than writing through a dead stack.
+struct RawRpc : QObject {
     QJsonValue result;
     std::optional<ch::RpcError> error;
     bool done = false;
@@ -302,11 +305,14 @@ struct RawRpc {
     bool call(ch::CodeharbordClient& client, const QString& method,
               const QJsonObject& params, int timeoutMs = kOpTimeoutMs)
     {
+        const QPointer<RawRpc> self(this);
         client.call(method, params,
-                    [this](QJsonValue value, std::optional<ch::RpcError> err) {
-                        result = value;
-                        error = err;
-                        done = true;
+                    [self](QJsonValue value, std::optional<ch::RpcError> err) {
+                        if (!self)
+                            return;
+                        self->result = value;
+                        self->error = err;
+                        self->done = true;
                     });
         if (!QTest::qWaitFor([this] { return done; }, timeoutMs))
             return false;
@@ -318,6 +324,11 @@ struct RawRpc {
 // order (so destruction order matches too), same wiring, same context property
 // names, and the real Main.qml on top.
 struct AppGraph {
+    // Observers below may fire during engine/bootstrap teardown. Keep their
+    // captured storage alive until all signal senders have been destroyed.
+    QStringList qmlWarnings;
+    QStringList appErrors;
+    QStringList bootstrapErrors;
     ch::CodeharbordClient client;
     ch::AgentStatusMonitor monitor;
     ch::SshConnectionPool pool;
@@ -334,9 +345,6 @@ struct AppGraph {
     ch::GroupPaletteService groupPalette;
     QQmlApplicationEngine engine;
 
-    QStringList qmlWarnings;
-    QStringList appErrors;
-    QStringList bootstrapErrors;
     // True if connectAndWireFromEnvironment() did anything, which with the
     // CH_LIVE_* variables removed would mean the app still reaches the
     // environment behind the user's back.
@@ -345,7 +353,7 @@ struct AppGraph {
     AppGraph()
         : bootstrap(&pool, &client, &monitor)
         , app(&client, nullptr, g_settingsPath)
-        , viewerProfiles(&client)
+        , viewerProfiles(&client, QDir(g_configHome).filePath(QStringLiteral("webengine")))
         , viewers(&client)
         , serverProfiles(g_settingsPath)
         , layouts(app.workspaceDb(), app.uiState())
@@ -599,11 +607,10 @@ void TstColdStart::cleanupTestCase()
                                .arg(m_sessionId))
                        .trimmed();
         }
-        if (!m_remoteFile.isEmpty()) {
-            runExec(QStringLiteral("rm -f '%1'; "
-                                   "rm -rf \"${XDG_DATA_HOME:-$HOME/.local/share}/codeharbor/recovery\"")
-                        .arg(m_remoteFile));
-        }
+        // Only this uniquely named file belongs to the walkthrough. Recovery
+        // storage is daemon-owned and may contain another window's dirty data.
+        if (!m_remoteFile.isEmpty())
+            runExec(QStringLiteral("rm -f '%1'").arg(m_remoteFile));
         if (!m_groupId.isEmpty()) {
             RawRpc removed;
             if (!removed.call(m_graph->client, QStringLiteral("workspace.deleteGroup"),
@@ -681,9 +688,9 @@ QString TstColdStart::ladder(const QString& rung) const
 
 QByteArray TstColdStart::runExec(const QString& command, int timeoutMs)
 {
-    ch::SshChannelDevice device(&m_graph->pool);
     QByteArray out;
     bool finished = false;
+    ch::SshChannelDevice device(&m_graph->pool);
     connect(&device, &ch::SshChannelDevice::readyRead, &device,
             [&out, &device] { out += device.readAll(); });
     connect(&device, &ch::SshChannelDevice::readChannelFinished, &device,
@@ -1672,6 +1679,16 @@ int main(int argc, char* argv[])
     g_configHome = configRoot.filePath(QStringLiteral("config"));
     QDir().mkpath(g_configHome);
     qputenv("XDG_CONFIG_HOME", QFile::encodeName(g_configHome));
+    // Named WebEngine profiles persist beyond settings. Keep their data and
+    // cache away from the developer's normal CodeHarbor browser profile.
+    for (const auto& entry : {
+             qMakePair("XDG_DATA_HOME", QStringLiteral("data")),
+             qMakePair("XDG_CACHE_HOME", QStringLiteral("cache"))}) {
+        const QString path = configRoot.filePath(entry.second);
+        if (!QDir().mkpath(path))
+            return 2;
+        qputenv(entry.first, QFile::encodeName(path));
+    }
 #else
     g_configHome = configRoot.filePath(QStringLiteral("config"));
     QDir().mkpath(g_configHome);

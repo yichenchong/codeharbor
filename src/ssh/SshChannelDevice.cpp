@@ -220,6 +220,7 @@ void SshChannelDevice::failWith(const QString& reason)
 void SshChannelDevice::abortStart(const QString& reason)
 {
 #if CH_HAVE_LIBSSH
+    const QPointer<SshConnectionPool> pool(m_pool);
     if (m_channel) {
         // A start that failed halfway must not keep the channel: every failed
         // attempt would otherwise burn one of the connection's channel slots
@@ -232,6 +233,10 @@ void SshChannelDevice::abortStart(const QString& reason)
     m_hasPty = false;
 #endif
     failWith(reason);
+#if CH_HAVE_LIBSSH
+    if (pool)
+        pool->refreshConnectionState();
+#endif
 }
 
 #if !CH_HAVE_LIBSSH
@@ -297,7 +302,16 @@ bool SshChannelDevice::acquireChannel()
         failWith(QStringLiteral("no SSH connection pool"));
         return false;
     }
-    m_channel = m_pool->openChannel();
+    const QPointer<SshChannelDevice> self(this);
+    const QPointer<SshConnectionPool> pool(m_pool);
+    const quint64 generation = m_channelGeneration;
+    const ssh_channel channel = pool->openChannel();
+    if (!self || m_channelGeneration != generation || m_channel) {
+        if (channel && pool)
+            pool->releaseChannel(channel);
+        return false;
+    }
+    m_channel = channel;
     if (!m_channel) {
         failWith(QStringLiteral("could not open SSH channel"));
         return false;
@@ -388,8 +402,11 @@ bool SshChannelDevice::resizePty(int cols, int rows)
         return false;
 
     // Same floor as startPty(): never push a zero-sized window to the remote.
-    return ssh_channel_change_pty_size(m_channel, qMax(1, cols), qMax(1, rows))
-           == SSH_OK;
+    const bool resized =
+        ssh_channel_change_pty_size(m_channel, qMax(1, cols), qMax(1, rows)) == SSH_OK;
+    if (!resized && m_pool)
+        m_pool->refreshConnectionState();
+    return resized;
 }
 
 
@@ -420,7 +437,10 @@ qint64 SshChannelDevice::writeData(const char* data, qint64 maxSize)
             // prefix that was already accepted: returning -1 after a partial
             // write invites a caller to retry the entire frame and duplicate
             // those bytes on the remote side.
+            const QPointer<SshConnectionPool> pool(m_pool);
             failWith(lastError());
+            if (pool)
+                pool->refreshConnectionState();
             return written > 0 ? written : -1;
         }
         if (n <= 0)
@@ -533,6 +553,7 @@ void SshChannelDevice::pump()
     // this function writing to freed memory. Watch for it instead of trusting
     // every present and future consumer to get that right.
     const QPointer<SshChannelDevice> self(this);
+    const QPointer<SshConnectionPool> pool(m_pool);
 
     // Decode with the device's own stateful decoder, not QString::fromUtf8():
     // stderr is a byte stream cut at arbitrary 16 KiB boundaries, and a
@@ -574,6 +595,11 @@ void SshChannelDevice::pump()
     // line-framing consumer could see its chunks interleaved.
     if (self)
         m_pumping = false;
+    // A consumer may have closed or destroyed this device after consuming its
+    // last bytes. The surviving pool must still observe its current transport;
+    // a healthy replacement session is ignored by refreshConnectionState().
+    if (pool && (eof || !failure.isEmpty()))
+        pool->refreshConnectionState();
 }
 
 #endif // CH_HAVE_LIBSSH

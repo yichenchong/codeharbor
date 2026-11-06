@@ -125,7 +125,9 @@ function acquireBridgeLock(socketPath: string): () => void {
             }
         }
         let ownerPid: number;
+        let ownerIdentity: fs.Stats;
         try {
+            ownerIdentity = fs.lstatSync(lockPath);
             const ownerText = fs.readFileSync(lockPath, "utf8").trim();
             ownerPid = Number.parseInt(ownerText, 10);
         } catch {
@@ -152,6 +154,10 @@ function acquireBridgeLock(socketPath: string): () => void {
             throw new Error(`codeharbor-bridge: address already in use: ${socketPath}`);
         }
         try {
+            // Another starter may already have reclaimed the stale record and
+            // published its own live lock while we checked the old PID.
+            const current = fs.lstatSync(lockPath);
+            if (current.dev !== ownerIdentity.dev || current.ino !== ownerIdentity.ino) continue;
             fs.unlinkSync(lockPath);
         } catch (unlinkError) {
             if (

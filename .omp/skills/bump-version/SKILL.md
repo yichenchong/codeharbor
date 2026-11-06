@@ -121,9 +121,11 @@ What it does, in order:
 7. Re-checks that every file now agrees, then commits **only** those files.
 8. Verifies that the commit about to be tagged really carries the new version —
    see Safety.
-9. With `--push`, runs the configured preflight commands. They run **before**
-   the tag is created, so a failed build cannot consume another public version
-   number.
+9. With `--push`, requires a clean working tree before and after running the
+   configured preflight commands (ignored build outputs are allowed). Uncommitted
+   repairs cannot make a broken release commit pass its checks. Commands run
+   **before** the tag is created, so a failed build cannot consume another public
+   version number.
 10. Creates the annotated tag, and with `--push` atomically pushes the commit and
     the tag. A rejected branch update cannot publish the tag on its own.
 
@@ -138,7 +140,7 @@ usually what actually starts a release build.
 | `--push` | Run the configured preflight commands, then push the release commit and tag to the configured remote. |
 | `--no-commit` | Tag the current HEAD as-is, with no release commit and no file edits. HEAD must already carry the version. |
 | `--dry-run` | Print the planned actions; change nothing. |
-| `--allow-dirty` | Proceed even if the configured files have uncommitted edits. |
+| `--allow-dirty` | Allow configured edits to be included in the release commit; `--push` still requires a clean tree before and after preflight. |
 
 ### Safety
 
@@ -147,7 +149,9 @@ usually what actually starts a release build.
   `.bumpversion.json`, has uncommitted changes — unless `--allow-dirty` — so
   in-progress version edits are never clobbered.
 * Stages and commits only the configured version files; unrelated working-tree
-  or already-staged changes are left untouched.
+  or already-staged changes are left untouched. Local tagging permits those
+  changes, but `--push` refuses them before preflight, including non-ignored
+  untracked files, and checks again afterwards. Commit or stash them first.
 * Pushes the branch and tag with `git push --atomic`. If the remote rejects
   either update or does not support atomic pushes, neither is published; the
   local release commit and tag remain available for retry.
@@ -170,7 +174,8 @@ usually what actually starts a release build.
   directly or through symlinks being rejected, ordinary dotted filenames being
   accepted, a wildcard workspace pattern being refused rather than guessed at,
   a rewritten file keeping its mode, a rejected branch push leaving no
-  remote release tag, preflight changing HEAD leaving no local or remote tag,
+  remote release tag, dirty source or new files and preflight source edits leaving
+  no local tag, preflight changing HEAD leaving no local or remote tag,
   a pre-existing staging-path symlink leaving outside data untouched, and a
   partial rename failure restoring original bytes and modes without data writes.
 

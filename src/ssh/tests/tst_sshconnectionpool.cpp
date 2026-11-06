@@ -11,6 +11,11 @@
 
 #include <memory>
 
+#if CH_HAVE_LIBSSH && defined(Q_OS_UNIX)
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 using ch::KnownHosts;
 using ch::SshConnectionPool;
 
@@ -24,9 +29,43 @@ const QByteArray kOtherKeyBlob =
 
 } // namespace
 
-// The two halves of SshConnectionPool that need no SSH server: what its
-// destructor is allowed to announce, and the known-hosts policy it applies to a
-// key the handshake has already read off the wire.
+#if CH_HAVE_LIBSSH
+namespace ch {
+
+// Keep the authentication error path server-free without exposing libssh
+// session ownership through the production API.
+class SshConnectionPoolTestAccess {
+public:
+    static ssh_session allocateSession(SshConnectionPool& pool)
+    {
+        pool.m_session = ssh_new();
+        return pool.m_session;
+    }
+
+    static bool authenticate(SshConnectionPool& pool)
+    {
+        return pool.authenticate(QStringLiteral("unused"), QString());
+    }
+
+    static QString failure(const SshConnectionPool& pool)
+    {
+        return pool.authenticationFailure();
+    }
+
+    static QString failureForServerOffer(int methods)
+    {
+        SshConnectionPool pool;
+        pool.m_authMethodsKnown = true;
+        pool.m_authMethodsOffered = SshConnectionPool::methodsFromMask(methods);
+        return pool.authenticationFailure();
+    }
+};
+
+} // namespace ch
+#endif
+
+// Server-free pool behavior: lifecycle notifications, authentication failure
+// explanations, and the trust policy applied to keys already read from the wire.
 class TstSshConnectionPool : public QObject {
     Q_OBJECT
 private slots:
@@ -40,6 +79,9 @@ private slots:
     void aRevokedKeyIsRefusedWithoutAsking();
     void anAcceptedKeyThatCannotBeStoredSaysSo();
 #if CH_HAVE_LIBSSH
+    void aFailedAuthenticationExchangeDoesNotInventServerMethods();
+    void anUnsupportedOnlyServerIsNotDescribedAsPasswordOnly();
+    void keyboardInteractiveOnlyAdviceNamesTheActualMethod();
     void aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns();
     void aDisconnectFromTheFailureStateIsHonoured();
     void aNestedConnectDuringHandshakeIsRefusedWithAReason();
@@ -267,6 +309,129 @@ void TstSshConnectionPool::anAcceptedKeyThatCannotBeStoredSaysSo()
 }
 
 #if CH_HAVE_LIBSSH
+void TstSshConnectionPool::
+    aFailedAuthenticationExchangeDoesNotInventServerMethods()
+{
+#ifndef Q_OS_UNIX
+    QSKIP("The isolated failed-transport fixture requires Unix socketpair");
+#else
+    int sockets[2] = {-1, -1};
+    QVERIFY(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    // Since libssh 0.10 a supplied fd remains caller-owned. The pool is
+    // destroyed before this guard closes the two private descriptors.
+    const auto closeSockets = qScopeGuard([&sockets] {
+        ::close(sockets[0]);
+        ::close(sockets[1]);
+    });
+
+    QTemporaryDir privateConfig;
+    QVERIFY(privateConfig.isValid());
+    QFile emptyConfig(privateConfig.filePath(QStringLiteral("config")));
+    QVERIFY(emptyConfig.open(QIODevice::WriteOnly));
+    emptyConfig.close();
+
+    SshConnectionPool pool;
+    const ssh_session session =
+        ch::SshConnectionPoolTestAccess::allocateSession(pool);
+    QVERIFY(session);
+    const long timeoutSeconds = 1;
+    QCOMPARE(ssh_options_set(session, SSH_OPTIONS_HOST, "unit.invalid"), SSH_OK);
+    const QByteArray configPath = QFile::encodeName(emptyConfig.fileName());
+    QCOMPARE(ssh_options_parse_config(session, configPath.constData()), SSH_OK);
+    QCOMPARE(ssh_options_set(session, SSH_OPTIONS_USER, "unused"), SSH_OK);
+    QCOMPARE(ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds),
+             SSH_OK);
+    QCOMPARE(ssh_options_set(session, SSH_OPTIONS_FD, &sockets[0]), SSH_OK);
+
+    // A private transport, not a listener or SSH fixture: an overlong server
+    // banner makes libssh enter its actual ERROR state. EOF is queued as well,
+    // so no missing input can leave it waiting indefinitely. Keep the peer's
+    // read half open while libssh sends its own banner (no SIGPIPE).
+    const QByteArray invalidBanner(300, 'x');
+    QCOMPARE(::write(sockets[1], invalidBanner.constData(), invalidBanner.size()),
+             static_cast<ssize_t>(invalidBanner.size()));
+    QCOMPARE(::shutdown(sockets[1], SHUT_WR), 0);
+    const int connectResult = ssh_connect(session);
+    QCOMPARE(connectResult, SSH_ERROR);
+    // Some supported libssh versions report AGAIN even though this session is
+    // already in ERROR. Neither result completed the initial exchange or
+    // established an authoritative server method offer.
+    const int initialAuth = ssh_userauth_none(session, nullptr);
+    QVERIFY(initialAuth == SSH_AUTH_ERROR || initialAuth == SSH_AUTH_AGAIN);
+    int prompts = 0;
+    pool.setCredentialCallback(
+        [&prompts](const QString&, SshConnectionPool::CredentialKind) {
+            ++prompts;
+            return SshConnectionPool::CredentialReply{};
+        });
+
+    // The genuine failed session must stop before credential callbacks. Neither
+    // connection establishment nor authentication consults user SSH config,
+    // identities or trust stores.
+    QVERIFY(!ch::SshConnectionPoolTestAccess::authenticate(pool));
+    QCOMPARE(prompts, 0);
+    const QString error = QString::fromUtf8(ssh_get_error(session)).trimmed();
+    QVERIFY(!error.isEmpty());
+    const QString failure = ch::SshConnectionPoolTestAccess::failure(pool);
+    QVERIFY2(failure.contains(error), qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("does not accept public-key")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("only its password")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("SSH_AUTH_SOCK")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("private key file"),
+                              Qt::CaseInsensitive),
+             qPrintable(failure));
+#endif
+}
+
+void TstSshConnectionPool::
+    anUnsupportedOnlyServerIsNotDescribedAsPasswordOnly()
+{
+    // The ladder has no rung for host-based authentication. Telling the user
+    // this server allowed password authentication sends them looking for a
+    // credential that cannot help.
+    const QString failure =
+        ch::SshConnectionPoolTestAccess::failureForServerOffer(
+            SSH_AUTH_METHOD_HOSTBASED);
+    QVERIFY2(failure.contains(QStringLiteral("supported authentication method")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("only its password")),
+             qPrintable(failure));
+    QVERIFY2(!failure.contains(QStringLiteral("SSH_AUTH_SOCK")),
+             qPrintable(failure));
+}
+
+void TstSshConnectionPool::
+    keyboardInteractiveOnlyAdviceNamesTheActualMethod()
+{
+    const QString interactive =
+        ch::SshConnectionPoolTestAccess::failureForServerOffer(
+            SSH_AUTH_METHOD_INTERACTIVE);
+    QVERIFY2(interactive.contains(QStringLiteral("keyboard-interactive")),
+             qPrintable(interactive));
+    QVERIFY2(!interactive.contains(QStringLiteral("only its password")),
+             qPrintable(interactive));
+    QVERIFY2(!interactive.contains(QStringLiteral("SSH_AUTH_SOCK")),
+             qPrintable(interactive));
+
+    // Plain password and PAM are distinct SSH methods even though the GUI
+    // currently supplies the same credential kind for both.
+    const QString password =
+        ch::SshConnectionPoolTestAccess::failureForServerOffer(
+            SSH_AUTH_METHOD_PASSWORD);
+    QVERIFY2(password.contains(QStringLiteral("password")), qPrintable(password));
+    QVERIFY2(!password.contains(QStringLiteral("keyboard-interactive")),
+             qPrintable(password));
+    const QString both =
+        ch::SshConnectionPoolTestAccess::failureForServerOffer(
+            SSH_AUTH_METHOD_PASSWORD | SSH_AUTH_METHOD_INTERACTIVE);
+    QVERIFY2(both.contains(QStringLiteral("password")), qPrintable(both));
+    QVERIFY2(both.contains(QStringLiteral("keyboard-interactive")),
+             qPrintable(both));
+}
+
 void TstSshConnectionPool::
     aDisconnectDuringHandshakeIsDeferredUntilTheCallReturns()
 {

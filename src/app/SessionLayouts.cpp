@@ -736,6 +736,17 @@ SessionLayouts::WriteDecision SessionLayouts::prepareWrite(
         return WriteDecision::Drop;
     if (!canEdit())
         return WriteDecision::Reject;
+    // A same-session refresh keeps the cache but retires its outstanding
+    // mints. Do not let an edit supersede the read while that cache still holds
+    // an unpersisted leaf whose old-generation mint can no longer bind it.
+    // Replay against the authoritative tree instead, or the pending leaf would
+    // permanently block persistence with no request left to settle it.
+    // A local edit already superseding this read owns its new pending leaves;
+    // publication can reenter before their current-generation mints register.
+    if (index == kTerminal && m_regions[index].loading
+        && !m_regions[index].superseded && m_pendingTerminalMints.isEmpty()
+        && hasPendingTerminalLeaf())
+        return WriteDecision::Queue;
     if (!m_regions[index].valid) {
         if (m_regions[index].loading)
             return WriteDecision::Queue;
@@ -759,6 +770,12 @@ void SessionLayouts::queueWrite(int index, PendingWrite write)
         || write.kind == PendingWriteKind::Ratios) {
         for (auto it = state.pendingWrites.rbegin();
              it != state.pendingWrites.rend(); ++it) {
+            // A structural gesture changes what a path addresses. Never move
+            // a later continuous report ahead of that gesture by coalescing it
+            // into an earlier report, even when the textual target matches.
+            if (it->kind == PendingWriteKind::Split
+                || it->kind == PendingWriteKind::Close)
+                break;
             const bool sameTarget =
                 ((write.kind == PendingWriteKind::PaneUrl
                   || write.kind == PendingWriteKind::PaneTitle)
@@ -911,6 +928,7 @@ void SessionLayouts::saveTreeStamped(const QString& devSessionId,
     // Replaying those older writes after this replacement would apply history
     // to the newly authored tree and undo the user's latest snapshot.
     m_regions[index].pendingWrites.clear();
+    m_regions[index].superseded = true;
     setTreeQuietly(index, std::move(*parsed));
     // An authored tree is not derived from the server, so the terminal region's
     // per-leaf bookkeeping has to be brought back in step with it before the
@@ -1164,6 +1182,7 @@ QString SessionLayouts::splitPaneStamped(const QString& devSessionId,
     // Published straight away: the split has to feel instant, and the new pane
     // has real chrome to show while its identity is on the wire.
     QPointer<SessionLayouts> self(this);
+    state.superseded = true;
     publishTree(index);
     if (!self || generation != m_generation)
         return {};
@@ -1199,6 +1218,7 @@ void SessionLayouts::abandonTerminalMint(const QString& paneId,
     // remove a same-labelled leaf from a tree it just loaded.
     const bool removed = dropLeaf(kTerminal, paneId);
     if (removed) {
+        m_regions[kTerminal].superseded = true;
         publishTree(kTerminal);
         if (!self || generation != m_generation)
             return;
@@ -1273,6 +1293,7 @@ void SessionLayouts::mintTerminalPaneRow(quint64 generation, const QString& pane
                 return;
             }
             leaf->terminalPaneId = pane->id.value;
+            self->m_regions[kTerminal].superseded = true;
             // Republished, not quiet: the pane is waiting for exactly this
             // field before it may resolve anything, and it reads it off the
             // tree. The regions re-home their panes rather than rebuild them,
@@ -1475,6 +1496,7 @@ void SessionLayouts::closePaneStamped(const QString& devSessionId,
     }
 
     QPointer<SessionLayouts> self(this);
+    m_regions[index].superseded = true;
     publishTree(index);
     if (!self || generation != m_generation)
         return;

@@ -33,12 +33,12 @@ namespace ch {
 //   * stable  — a live file URL always maps back to the same id (until evicted);
 //   * injective — distinct file URLs map to distinct ids;
 //   * invertible — fileUrlFor(internalUrlFor(u)) == u while u is retained.
-// The map is LRU-bounded (maxEntries): minting past the cap evicts the
-// least-recently-used entry so it never grows without bound. It holds no
-// WebEngine state, so it is unit-testable on its own.
+// The unpinned cache is LRU-bounded (maxEntries); pinned live resources remain
+// mapped until their owners release them. It holds no WebEngine state, so it
+// is unit-testable on its own.
 class InternalUrlMap {
 public:
-    // Default upper bound on retained entries before LRU eviction kicks in.
+    // Default upper bound on unpinned entries before LRU eviction kicks in.
     static constexpr int kDefaultMaxEntries = 1024;
 
     // Scheme name and the fixed "codeharbor-internal://file/" URL prefix.
@@ -50,8 +50,8 @@ public:
     // URLs) agree on the same id space without explicit wiring.
     static InternalUrlMap &shared();
 
-    // `maxEntries` bounds the number of retained mappings (LRU-evicted beyond
-    // it). Values < 1 are clamped to 1.
+    // `maxEntries` bounds the unpinned mappings; live retained resources are
+    // excluded from that cap. Values < 1 are clamped to 1.
     explicit InternalUrlMap(int maxEntries = kDefaultMaxEntries);
 
     // Mint (or reuse) the opaque internal URL for a remote file URL. Minting a
@@ -88,9 +88,9 @@ public:
     // Pinned entries are neither evicted nor counted against the cap, which
     // governs the unpinned remainder. Counting them would be worse than
     // useless: with every entry pinned, a fresh mint would be evicted the
-    // instant it was handed out. The number of pins is bounded by the number of
-    // live panes, orders of magnitude below maxEntries, so a caller that leaks
-    // a retain costs one entry, not the bound.
+    // instant it was handed out. Pins follow live resources, including Markdown
+    // images, not just panes; their owners must release them on retarget or
+    // destruction.
     bool retain(const QString &internalUrl);
 
     // Undo one retain(). Releasing an entry that is not pinned does nothing;

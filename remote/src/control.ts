@@ -341,7 +341,7 @@ export function parseControlRequest(line: string): ControlRequest | ControlRespo
     if (version !== undefined && version !== CH_CONTROL_VERSION) {
         return refusal(
             "bad_request",
-            `unsupported request version ${JSON.stringify(version)}; this server speaks ${CH_CONTROL_VERSION}`,
+            `unsupported request version; this server speaks ${CH_CONTROL_VERSION}`,
         );
     }
 

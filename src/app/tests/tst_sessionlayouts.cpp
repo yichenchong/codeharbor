@@ -190,6 +190,9 @@ private slots:
     void structuralPublicationMaySwitchSessions_data();
     void structuralPublicationMaySwitchSessions();
     void queuedReplayMaySwitchSessions();
+    void queuedRatiosKeepTheirOrderAcrossStructuralGestures();
+    void structuralPublicationRetiresOlderRepliesBeforeNotifying_data();
+    void structuralPublicationRetiresOlderRepliesBeforeNotifying();
     void defaultPublicationMaySwitchSessions();
     void editDuringAnInFlightLoadIsNotReverted();
     void aSeedingLoadReplyNeverOverwritesASavedTree();
@@ -197,6 +200,9 @@ private slots:
     void fullTreeSaveSupersedesQueuedEdits();
     void staleLayoutWriteErrorsAreDropped();
     void reconnectRefreshRetiresRequestsWithoutResettingPaneIdentity();
+    void refreshQueuesEditsUntilRetiredTerminalMintsAreReconciled();
+    void refreshKeepsReentrantEditsOfNewTerminalMints_data();
+    void refreshKeepsReentrantEditsOfNewTerminalMints();
     void sameSessionReloadFailureClearsTheStaleRegion();
     void aFailedReloadNeverBlanksARegionTheUserJustEdited();
     void invalidSavedTreeIsRejected();
@@ -1001,53 +1007,57 @@ void TstSessionLayouts::rapidSwitchQueuesCurrentWritesAndDropsStaleWrites()
               {1, 1});
     respondResult(freshViewer.value(QStringLiteral("id")).toInt(),
                   layoutRow(freshViewerTree));
-    // URL, split, and close are replayed in order against s2, not against the
-    // stale leaf returned above. Read and acknowledge each persistence write.
-    const QJsonObject urlWrite = nextRequest();
-    QCOMPARE(urlWrite.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
-    const QJsonObject urlTree = urlWrite.value(QStringLiteral("params"))
-                                    .toObject().value(QStringLiteral("tree"))
-                                    .toObject();
-    QCOMPARE(urlTree.value(QStringLiteral("url")).toString(),
-             QStringLiteral("queued-url-final"));
-    respondResult(urlWrite.value(QStringLiteral("id")).toInt(), layoutRow(urlTree));
-
-    const QJsonObject splitWrite = nextRequest();
-    const QJsonObject splitTree = splitWrite.value(QStringLiteral("params"))
-                                      .toObject().value(QStringLiteral("tree"))
-                                      .toObject();
-    QCOMPARE(splitTree.value(QStringLiteral("children")).toArray().size(), 2);
-    QCOMPARE(splitTree.value(QStringLiteral("children")).toArray().at(0)
-                 .toObject().value(QStringLiteral("paneId")).toString(),
-             QStringLiteral("viewer-1"));
-    respondResult(splitWrite.value(QStringLiteral("id")).toInt(),
-                  layoutRow(splitTree));
-
-    const QJsonObject closeWrite = nextRequest();
-    const QJsonObject closeTree = closeWrite.value(QStringLiteral("params"))
-                                      .toObject().value(QStringLiteral("tree"))
-                                      .toObject();
-    QCOMPARE(closeTree.value(QStringLiteral("paneId")).toString(),
-             QStringLiteral("viewer-2"));
-    respondResult(closeWrite.value(QStringLiteral("id")).toInt(),
-                  layoutRow(closeTree));
-
     respondResult(freshTerminal.value(QStringLiteral("id")).toInt(),
                   layoutRow(freshTerminalTree));
-    const QJsonObject ratiosWrite = nextRequest();
-    QCOMPARE(ratiosWrite.value(QStringLiteral("method")).toString(),
-             QStringLiteral("workspace.setLayout"));
-    const QJsonObject ratiosTree = ratiosWrite.value(QStringLiteral("params"))
-                                       .toObject().value(QStringLiteral("tree"))
-                                       .toObject();
-    const QJsonArray expectedRatios{2.0, 3.0};
-    QCOMPARE(ratiosTree.value(QStringLiteral("ratios")).toArray(),
-             expectedRatios);
-    respondResult(ratiosWrite.value(QStringLiteral("id")).toInt(),
-                  layoutRow(ratiosTree));
-
     QTRY_COMPARE(loadedSpy.count(), 1);
+    // Observe all writes, not an incidental count or the first URL snapshot:
+    // continuous reports cannot move across the queued split/close boundary.
+    // The final URL targets a now-closed pane and must not resurrect it.
+    QJsonObject lastViewerTree;
+    QJsonObject lastTerminalTree;
+    bool splitPersisted = false;
+    bool closePersisted = false;
+    while (!noMoreRequests()) {
+        const auto write = nextRequest();
+        QCOMPARE(write.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        const auto params = write.value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("devSessionId")).toString(),
+                 QStringLiteral("s2"));
+        QCOMPARE(params.value(QStringLiteral("serverId")).toString(),
+                 QStringLiteral("srv-1"));
+        const auto tree = params.value(QStringLiteral("tree")).toObject();
+        const QString region = params.value(QStringLiteral("region")).toString();
+        if (region == QLatin1String("viewer")) {
+            lastViewerTree = tree;
+            const auto children = tree.value(QStringLiteral("children")).toArray();
+            if (children.size() == 2) {
+                QCOMPARE(children.at(0).toObject()
+                             .value(QStringLiteral("paneId")).toString(),
+                         QStringLiteral("viewer-1"));
+                QCOMPARE(children.at(1).toObject()
+                             .value(QStringLiteral("paneId")).toString(),
+                         QStringLiteral("viewer-2"));
+                QVERIFY(!closePersisted);
+                splitPersisted = true;
+            } else if (tree.value(QStringLiteral("paneId")).toString()
+                       == QLatin1String("viewer-2")) {
+                QVERIFY(splitPersisted);
+                closePersisted = true;
+            }
+        } else {
+            QCOMPARE(region, QStringLiteral("terminal"));
+            lastTerminalTree = tree;
+        }
+        respondResult(write.value(QStringLiteral("id")).toInt(), layoutRow(tree));
+    }
+    QVERIFY(splitPersisted);
+    QVERIFY(closePersisted);
+    QCOMPARE(lastViewerTree, leaf(QStringLiteral("viewer-2")));
+    auto expectedTerminalWire = freshTerminalTree;
+    expectedTerminalWire.insert(QStringLiteral("ratios"), QJsonArray{2.0, 3.0});
+    QCOMPARE(lastTerminalTree, expectedTerminalWire);
+
     QCOMPARE(compact(asObject(layouts.viewerTree())),
              compact(leaf(QStringLiteral("viewer-2"))));
     // As PUBLISHED: leaves loaded without a row id wear the pre-migration
@@ -1110,6 +1120,126 @@ void TstSessionLayouts::structuralPublicationMaySwitchSessions()
                  QStringLiteral("s2"));
     }
     // In particular, do not persist s1's edit or mint its terminal under s2.
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::queuedRatiosKeepTheirOrderAcrossStructuralGestures()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    layouts.load(QStringLiteral("s1"));
+    const auto viewer = nextRequest();
+    const auto terminal = nextRequest();
+    const quint64 generation = layouts.generation();
+    layouts.setRatiosForSession(QStringLiteral("s1"), generation,
+                                 QStringLiteral("viewer"), {}, {2, 1, 1});
+    layouts.closePaneForSession(QStringLiteral("s1"), generation,
+                                QStringLiteral("viewer"), QStringLiteral("viewer-1"));
+    layouts.setRatiosForSession(QStringLiteral("s1"), generation,
+                                 QStringLiteral("viewer"), {}, {3, 1});
+
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    respondResult(viewer.value(QStringLiteral("id")).toInt(),
+                  layoutRow(split(QStringLiteral("horizontal"),
+                                  {leaf(QStringLiteral("viewer-1")),
+                                   leaf(QStringLiteral("viewer-2")),
+                                   leaf(QStringLiteral("viewer-3"))}, {1, 1, 1})));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(),
+                  layoutRow(terminalLeaf(QStringLiteral("terminal-1"),
+                                         QStringLiteral("row-one"))));
+    QTRY_COMPARE(loaded.count(), 1);
+    const auto expected = split(QStringLiteral("horizontal"),
+                                {leaf(QStringLiteral("viewer-2")),
+                                 leaf(QStringLiteral("viewer-3"))}, {3, 1});
+    QCOMPARE(asObject(layouts.viewerTree()), expected);
+    // Every queued intent persists in order, including the final ratio report
+    // against the branch after its first child has been removed.
+    QJsonObject lastWrite;
+    for (int i = 0; i < 3; ++i) {
+        lastWrite = nextRequest();
+        QCOMPARE(lastWrite.value(QStringLiteral("method")).toString(),
+                 QStringLiteral("workspace.setLayout"));
+        respondResult(lastWrite.value(QStringLiteral("id")).toInt(),
+                      layoutRow(lastWrite.value(QStringLiteral("params")).toObject()
+                                    .value(QStringLiteral("tree")).toObject()));
+    }
+    QCOMPARE(lastWrite.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject(), expected);
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::structuralPublicationRetiresOlderRepliesBeforeNotifying_data()
+{
+    QTest::addColumn<QString>("region");
+    QTest::addColumn<bool>("close");
+    QTest::newRow("viewer-split") << QStringLiteral("viewer") << false;
+    QTest::newRow("viewer-close") << QStringLiteral("viewer") << true;
+    QTest::newRow("terminal-split") << QStringLiteral("terminal") << false;
+    QTest::newRow("terminal-close") << QStringLiteral("terminal") << true;
+}
+
+void TstSessionLayouts::structuralPublicationRetiresOlderRepliesBeforeNotifying()
+{
+    QFETCH(QString, region);
+    QFETCH(bool, close);
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const auto viewerTree = leaf(QStringLiteral("viewer-1"));
+    const auto terminalTree = terminalLeaf(QStringLiteral("terminal-1"),
+                                           QStringLiteral("row-one"));
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerTree),
+                 layoutRow(terminalTree));
+    layouts.refresh();
+    const auto viewer = nextRequest();
+    const auto terminal = nextRequest();
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    bool delivered = false;
+    const auto deliverOldReplies = [&] {
+        if (delivered)
+            return;
+        delivered = true;
+        respondResult(viewer.value(QStringLiteral("id")).toInt(), layoutRow(viewerTree));
+        respondResult(terminal.value(QStringLiteral("id")).toInt(), layoutRow(terminalTree));
+        // Model a synchronous subscriber that dispatches socket events during
+        // publication, before the editing method reaches its persistence tail.
+        QTRY_COMPARE(loaded.count(), 1);
+    };
+    connect(&layouts, &SessionLayouts::viewerTreeChanged, this, deliverOldReplies);
+    connect(&layouts, &SessionLayouts::terminalTreeChanged, this, deliverOldReplies);
+    const QString paneId = region + QStringLiteral("-1");
+    if (close) {
+        layouts.closePane(region, paneId);
+    } else {
+        QCOMPARE(layouts.splitPane(region, paneId, QStringLiteral("horizontal")),
+                 region + QStringLiteral("-2"));
+        if (region == QStringLiteral("terminal")) {
+            const auto mint = nextRequest();
+            QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+                     QStringLiteral("workspace.createTerminalPane"));
+            respondResult(mint.value(QStringLiteral("id")).toInt(),
+                          terminalPaneRow(QStringLiteral("terminal-2")));
+        }
+    }
+    QVERIFY(delivered);
+    const auto write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    const QJsonObject saved = write.value(QStringLiteral("params")).toObject()
+                                  .value(QStringLiteral("tree")).toObject();
+    if (close) {
+        QCOMPARE(saved, leaf(QString()));
+    } else {
+        const auto children = saved.value(QStringLiteral("children")).toArray();
+        QCOMPARE(children.size(), 2);
+        QCOMPARE(children.at(0).toObject().value(QStringLiteral("paneId")).toString(), paneId);
+        QCOMPARE(children.at(1).toObject().value(QStringLiteral("paneId")).toString(),
+                 region + QStringLiteral("-2"));
+    }
+    QCOMPARE(asObject(region == QStringLiteral("viewer") ? layouts.viewerTree()
+                                                         : layouts.terminalTree()), saved);
+    respondResult(write.value(QStringLiteral("id")).toInt(), layoutRow(saved));
     QVERIFY(noMoreRequests());
 }
 
@@ -1558,6 +1688,115 @@ void TstSessionLayouts::reconnectRefreshRetiresRequestsWithoutResettingPaneIdent
                  layoutRow(terminalTree));
     QVERIFY(layouts.paneGeneration() > paneGeneration);
     QCOMPARE(panes.count(), 1);
+}
+
+void TstSessionLayouts::refreshQueuesEditsUntilRetiredTerminalMintsAreReconciled()
+{
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const auto viewerTree = leaf(QStringLiteral("viewer-1"));
+    const auto terminalTree = split(
+        QStringLiteral("vertical"),
+        {terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one")),
+         terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-two"))}, {1, 1});
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerTree),
+                 layoutRow(terminalTree));
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")), QStringLiteral("terminal-3"));
+    const auto mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    layouts.refresh();
+    const auto viewer = nextRequest();
+    const auto terminal = nextRequest();
+    layouts.setRatios(QStringLiteral("terminal"), {}, {3, 1});
+    QVERIFY(noMoreRequests());
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-3")));
+    respondResult(viewer.value(QStringLiteral("id")).toInt(), layoutRow(viewerTree));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(), layoutRow(terminalTree));
+    QTRY_COMPARE(loaded.count(), 1);
+    auto expected = terminalTree;
+    expected.insert(QStringLiteral("ratios"), QJsonArray{3, 1});
+    QCOMPARE(asObject(layouts.terminalTree()), expected);
+    const auto write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    QCOMPARE(write.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject(), expected);
+    respondResult(write.value(QStringLiteral("id")).toInt(), layoutRow(expected));
+    QVERIFY(noMoreRequests());
+}
+
+void TstSessionLayouts::refreshKeepsReentrantEditsOfNewTerminalMints_data()
+{
+    QTest::addColumn<bool>("title");
+    QTest::newRow("new-mint-ratio") << false;
+    QTest::newRow("new-mint-title") << true;
+}
+
+void TstSessionLayouts::refreshKeepsReentrantEditsOfNewTerminalMints()
+{
+    QFETCH(bool, title);
+    makePair();
+    SessionLayouts layouts(m_db, m_uiState);
+    layouts.setServerId(QStringLiteral("srv-1"));
+    const auto viewerTree = leaf(QStringLiteral("viewer-1"));
+    const auto first = terminalLeaf(QStringLiteral("terminal-1"), QStringLiteral("row-one"));
+    const auto second = terminalLeaf(QStringLiteral("terminal-2"), QStringLiteral("row-two"));
+    const auto stored = split(QStringLiteral("vertical"), {first, second}, {1, 1});
+    completeLoad(layouts, QStringLiteral("s1"), layoutRow(viewerTree), layoutRow(stored));
+    layouts.refresh();
+    const auto viewer = nextRequest();
+    const auto terminal = nextRequest();
+    bool edited = false;
+    connect(&layouts, &SessionLayouts::terminalTreeChanged, this, [&] {
+        if (edited)
+            return;
+        edited = true;
+        // The new leaf is already published, but its current mint has not yet
+        // registered. This is not the old-mint cache retained by refresh.
+        if (title) {
+            QCOMPARE(layouts.setPaneTitleForSession(
+                         QStringLiteral("s1"), layouts.generation(),
+                         QStringLiteral("terminal"), QStringLiteral("terminal-3"),
+                         QStringLiteral("Work")), QStringLiteral("Work"));
+        } else {
+            layouts.setRatiosForSession(QStringLiteral("s1"), layouts.generation(),
+                                         QStringLiteral("terminal"), {}, {3, 1});
+        }
+    });
+    QCOMPARE(layouts.splitPane(QStringLiteral("terminal"), QStringLiteral("terminal-1"),
+                               QStringLiteral("horizontal")), QStringLiteral("terminal-3"));
+    QVERIFY(edited);
+    const auto mint = nextRequest();
+    QCOMPARE(mint.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.createTerminalPane"));
+    QVERIFY(noMoreRequests());
+    respondResult(mint.value(QStringLiteral("id")).toInt(),
+                  terminalPaneRow(QStringLiteral("terminal-3")));
+    const auto write = nextRequest();
+    QCOMPARE(write.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.setLayout"));
+    auto third = terminalLeaf(QStringLiteral("terminal-3"),
+                              rowIdFor(QStringLiteral("terminal-3")));
+    if (title)
+        third.insert(QStringLiteral("customTitle"), QStringLiteral("Work"));
+    const auto expected = split(
+        QStringLiteral("vertical"),
+        {split(QStringLiteral("horizontal"), {first, third}, {1, 1}), second},
+        title ? QJsonArray{1, 1} : QJsonArray{3, 1});
+    QCOMPARE(write.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("tree")).toObject(), expected);
+    QSignalSpy loaded(&layouts, &SessionLayouts::loaded);
+    respondResult(viewer.value(QStringLiteral("id")).toInt(), layoutRow(viewerTree));
+    respondResult(terminal.value(QStringLiteral("id")).toInt(), layoutRow(stored));
+    respondResult(write.value(QStringLiteral("id")).toInt(), layoutRow(expected));
+    QTRY_COMPARE(loaded.count(), 1);
+    QCOMPARE(asObject(layouts.terminalTree()), expected);
+    QVERIFY(noMoreRequests());
 }
 
 void TstSessionLayouts::sameSessionReloadFailureClearsTheStaleRegion()

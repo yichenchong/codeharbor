@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <QString>
 
 // Full definition (not a forward declaration): m_client is a QPointer, whose
 // QObject static_cast needs the complete CodeharbordClient (a QObject) type.
@@ -32,9 +33,14 @@ class ViewerProfiles : public QObject {
 public:
     // `client` is injected into the internal profile's scheme handler for remote
     // reads; not owned. May be null in tests that only assert isolation.
-    explicit ViewerProfiles(CodeharbordClient *client = nullptr,
+    // A nonempty root isolates persistent browser data under root/data and
+    // cache under root/cache. Empty keeps Qt's normal platform locations.
+    explicit ViewerProfiles(CodeharbordClient *client,
+                            const QString &externalStorageRoot,
                             QObject *parent = nullptr);
     ~ViewerProfiles() override;
+
+    const QString &externalStorageRoot() const { return m_externalStorageRoot; }
 
     // Register the codeharbor-internal scheme before QtWebEngine init.
     // Subsequent calls are no-ops; a first call after init is too late.
@@ -69,6 +75,7 @@ private:
     // would dangle and be adopted by the handler; QPointer self-clears, and the
     // handler is simply constructed clientless and fails its reads honestly.
     QPointer<CodeharbordClient> m_client;
+    QString m_externalStorageRoot;
     InternalUrlSchemeHandler *m_handler = nullptr;
     QQuickWebEngineProfile *m_external = nullptr;
     QQuickWebEngineProfile *m_internal = nullptr;

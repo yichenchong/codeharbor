@@ -84,6 +84,13 @@ constexpr int kSettleMs = 400;
 constexpr int kPageLoadTimeoutMs = 60000;
 constexpr int kProbeTimeoutMs = 20000;
 
+QString checkedTemporaryRoot(const QTemporaryDir &directory)
+{
+    if (!directory.isValid() || directory.path().isEmpty())
+        qFatal("Cannot allocate private QML profile root: %s", qPrintable(directory.errorString()));
+    return directory.path();
+}
+
 // Host window. The region under test is the REAL qrc component, sourced through
 // a Loader with its `node` supplied up front — the region types are inert until
 // they have one, so a declarative `source` would complete the tree first.
@@ -113,6 +120,11 @@ Window {
 
     function regionItem() { return regionLoader.item }
     function setNode(n) { if (regionLoader.item) regionLoader.item.node = n }
+    function bindCloseNode(n) {
+        regionLoader.item.closePaneRequested.connect(function(id) {
+            regionLoader.item.node = n;
+        });
+    }
 
     function bindViewerLayouts(facade) {
         const region = regionLoader.item;
@@ -776,14 +788,24 @@ class EditorControllerStub : public QObject
     Q_OBJECT
     Q_PROPERTY(QString fileState READ fileState NOTIFY fileStateChanged)
     Q_PROPERTY(bool dirty READ dirty NOTIFY dirtyChanged)
-    Q_PROPERTY(bool recoveryEnabled READ recoveryEnabled CONSTANT)
-    Q_PROPERTY(quint64 recoveryContextRevision READ recoveryContextRevision CONSTANT)
+    Q_PROPERTY(bool recoveryEnabled READ recoveryEnabled NOTIFY recoveryEnabledChanged)
+    Q_PROPERTY(quint64 recoveryContextRevision READ recoveryContextRevision
+               NOTIFY recoveryContextRevisionChanged)
 
 public:
     QString fileState() const { return m_fileState; }
     bool dirty() const { return m_dirty; }
-    bool recoveryEnabled() const { return true; }
-    quint64 recoveryContextRevision() const { return 0; }
+    bool recoveryEnabled() const { return !m_detached; }
+    quint64 recoveryContextRevision() const { return m_recoveryContextRevision; }
+    bool detached() const { return m_detached; }
+    Q_INVOKABLE void detachFromServer()
+    {
+        if (m_detached)
+            return;
+        m_detached = true;
+        setFileState(QStringLiteral("disconnected"));
+        emit recoveryEnabledChanged();
+    }
     void setDirty(bool dirty)
     {
         if (m_dirty == dirty)
@@ -803,7 +825,7 @@ public:
         emit fileStateChanged(m_fileState);
     }
 
-    Q_INVOKABLE void open(const QString &path) { m_opened.append(path); }
+    Q_INVOKABLE void open(const QString &path) { if (!m_detached) m_opened.append(path); }
     Q_INVOKABLE QObject *createPageBridge()
     {
         auto *bridge = new EditorPageBridgeStub(this);
@@ -822,7 +844,28 @@ public:
     Q_INVOKABLE void reportDirty(bool dirty, const QString &) { setDirty(dirty); }
     Q_INVOKABLE void requestReload() { }
     Q_INVOKABLE void ready() { }
-    Q_INVOKABLE void setRecoveryScope(const QString &, const QString &, const QString &) { }
+    Q_INVOKABLE void setRecoveryScope(const QString &server, const QString &session,
+                                      const QString &pane)
+    {
+        if (m_detached)
+            return;
+        const QStringList scope{server, session, pane};
+        if (m_recoveryScope == scope)
+            return;
+        m_recoveryScope = scope;
+        ++m_recoveryContextRevision;
+        emit recoveryContextRevisionChanged();
+    }
+    Q_INVOKABLE bool restoreRecovery(const QString &content, quint64 expectedContext,
+                                     const QString &expectedRevision)
+    {
+        if (m_detached || expectedContext != m_recoveryContextRevision)
+            return false;
+        m_reported.append(content);
+        setDirty(true);
+        emit contentLoaded(content, expectedRevision);
+        return true;
+    }
 
     const QStringList &opened() const { return m_opened; }
     const QStringList &reported() const { return m_reported; }
@@ -830,6 +873,8 @@ public:
 signals:
     void contentLoaded(const QString &content, const QString &revision);
     void dirtyChanged();
+    void recoveryContextRevisionChanged();
+    void recoveryEnabledChanged();
     void fileStateChanged(const QString &state);
     void readOnlyChanged(bool readOnly);
     void saved(const QString &revision);
@@ -840,9 +885,12 @@ signals:
 private:
     QString m_fileState = QStringLiteral("clean");
     bool m_dirty = false;
+    bool m_detached = false;
     QStringList m_opened;
     QStringList m_reported;
     int m_bridgeSerial = 0;
+    QStringList m_recoveryScope;
+    quint64 m_recoveryContextRevision = 0;
 };
 } // namespace
 
@@ -922,6 +970,8 @@ private slots:
     void reloadKeepsTheEditorHandlerAlive();
     void editorReloadPreservesDirtyBufferAndRejectsStaleCapture();
     void remoteWebReloadRecoversAfterAReadFailure();
+    void remoteWebFragmentNavigationStaysInTheDocument();
+    void navigationDismissesAnOlderEditorClosePrompt_data();
     void navigationDismissesAnOlderEditorClosePrompt();
     void dirtyEditorRejectsNavigation();
     void narrowViewerKeepsItsAddressUsable_data();
@@ -986,6 +1036,8 @@ private slots:
     // dialog and leave the file exactly as it was read from disk, rather than
     // quietly marking it edited.
     void discardingARecoveredBufferLeavesTheEditorShowingTheFile();
+    void recoveryOffersRetireWithTheirContext_data();
+    void recoveryOffersRetireWithTheirContext();
 
     // THE PATH PROBE IS BOUNDED. A path typed with no trailing slash makes the
     // pane ask the server "is this a directory?" and draw its header busy until
@@ -1021,6 +1073,13 @@ private slots:
     // right pane ids still in the layout and nothing at all on screen.
     void aLayoutReloadRebuildsEveryPaneInTheTree();
     void reconnectRefreshPreservesDirtyEditorAndRetiresOldIntents();
+    void remoteLayoutChangesKeepDirtyDocumentsAccessible_data();
+    void remoteLayoutChangesKeepDirtyDocumentsAccessible();
+    void closingOneRetainedDocumentKeepsOtherDirtyDocumentsVisible();
+    void consentedDirtyCloseDoesNotBecomeARemoteLayoutHold();
+    void retiredWorkspaceKeepsDetachedEditorsUntilLocalDiscard_data();
+    void retiredWorkspaceKeepsDetachedEditorsUntilLocalDiscard();
+    void retiredWorkspaceCloseDoesNotMixNewOwnerWithOtherRetainedEditors();
     void editorRecoveryUsesScopedContextAndWarnsWhenUnavailable_data();
     void editorRecoveryUsesScopedContextAndWarnsWhenUnavailable();
 
@@ -1132,8 +1191,10 @@ private:
     // QAccessible::Role number the attached property carries.
     int accessibleRoleOf(QObject *item);
 
+    QTemporaryDir m_profileDir;
+    const QString m_profileRoot = checkedTemporaryRoot(m_profileDir);
     ch::CodeharbordClient m_client;
-    ch::ViewerProfiles m_profiles{&m_client};
+    ch::ViewerProfiles m_profiles{&m_client, m_profileRoot};
     ch::ViewerModel m_viewers{&m_client};
     // The `app` context property. Empty by default, so every OTHER test sees a
     // pane with no Dev Session behind it, exactly as before this existed.
@@ -2566,8 +2627,53 @@ void TstPaneIdentity::remoteWebReloadRecoversAfterAReadFailure()
     QVERIFY(browser->property("visible").toBool());
 }
 
+void TstPaneIdentity::remoteWebFragmentNavigationStaysInTheDocument()
+{
+    ReadFileServer server;
+    QVERIFY(server.bind(&m_client));
+    const QString path = QStringLiteral("/repo/anchors.html");
+    server.setFile(path, QStringLiteral(
+        "<!doctype html><style>body{margin:0}a{display:block;width:100px;height:40px}</style>"
+        "<a href='#section'>Jump</a>"
+        "<div style='height:2000px'></div><h2 id='section'>Destination</h2>"));
+    QObject *const handler = openInShell(
+        QStringLiteral("ViewerWebView.qml"),
+        {{QStringLiteral("url"), QUrl(QStringLiteral("file:///repo/anchors.html"))},
+         {QStringLiteral("remoteFile"), true}});
+    QVERIFY(handler);
+    QObject *const browser = webViewIn(handler);
+    QVERIFY(browser);
+    QTRY_VERIFY_WITH_TIMEOUT(server.readCount(path) > 0, kPageLoadTimeoutMs);
+    QTRY_VERIFY_WITH_TIMEOUT(!handler->property("loading").toBool(), kPageLoadTimeoutMs);
+    QCOMPARE(handler->property("errorText").toString(), QString());
+    QSignalSpy navigated(handler, SIGNAL(navigated(QUrl)));
+    QVERIFY(navigated.isValid());
+    const int reads = server.readCount(path);
+    auto *window = qobject_cast<QQuickWindow *>(m_shell.get());
+    auto *browserItem = qobject_cast<QQuickItem *>(browser);
+    QVERIFY(window && browserItem);
+    // Remote HTML disables scripting. Drive the real link with a pointer,
+    // rather than weakening that boundary to invoke a page script.
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                      browserItem->mapToScene(QPointF(20, 20)).toPoint());
+    QTRY_COMPARE(browser->property("url").toUrl().fragment(), QStringLiteral("section"));
+    QCOMPARE(navigated.size(), 0);
+    QCOMPARE(handler->property("url").toUrl(), QUrl(QStringLiteral("file:///repo/anchors.html")));
+    QCOMPARE(server.readCount(path), reads);
+}
+
+void TstPaneIdentity::navigationDismissesAnOlderEditorClosePrompt_data()
+{
+    QTest::addColumn<bool>("sameAddress");
+    QTest::newRow("new-address") << false;
+    QTest::newRow("same-address-new-handler") << true;
+}
+
 void TstPaneIdentity::navigationDismissesAnOlderEditorClosePrompt()
 {
+    QFETCH(bool, sameAddress);
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
     EditorControllerStub controller;
     QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
                        leafNode(QStringLiteral("viewer-1"),
@@ -2580,12 +2686,24 @@ void TstPaneIdentity::navigationDismissesAnOlderEditorClosePrompt()
     editor->setProperty("controller", QVariant::fromValue<QObject *>(&controller));
     QSignalSpy closed(pane, SIGNAL(closeRequested(QString)));
     QVERIFY(closed.isValid());
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY(window);
+    window->resize(360, 640);
+    QTRY_COMPARE(window->contentItem()->width(), 360.0);
     controller.setDirty(true);
     QTRY_VERIFY(pane->property("contentDirty").toBool());
     QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
     QObject *const dialog = childNamed(pane, QStringLiteral("viewerCloseUnsavedDialog"));
     QVERIFY(dialog);
     QTRY_VERIFY(dialog->property("visible").toBool());
+    QTRY_VERIFY(dialog->property("width").toReal() <= window->width() - 16);
+    QVERIFY(dialog->property("width").toReal() > 0);
+    auto *content = qobject_cast<QQuickItem *>(asObject(dialog->property("contentItem")));
+    QVERIFY(content);
+    QVERIFY(content->width() > 0);
+    QVERIFY(content->width() <= dialog->property("width").toReal());
+    QVERIFY(content->height() >= content->implicitHeight() - 1);
+    QVERIFY(content->implicitHeight() > 0);
     QCOMPARE(closed.size(), 0);
 
     // A save already in flight can complete while the dialog is open. A newer
@@ -2593,16 +2711,20 @@ void TstPaneIdentity::navigationDismissesAnOlderEditorClosePrompt()
     controller.setDirty(false);
     QTRY_VERIFY(!pane->property("contentDirty").toBool());
     QVariant accepted;
+    const QString target = sameAddress ? QStringLiteral("file:///repo/original.txt")
+                                       : QStringLiteral("file:///repo/new.txt");
     QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
-                                      Q_ARG(QVariant, QStringLiteral("file:///repo/new.txt")),
-                                      Q_ARG(QVariant, QString())));
+                                      Q_ARG(QVariant, target),
+                                      Q_ARG(QVariant, sameAddress ? QStringLiteral("binary")
+                                                                 : QString())));
     QVERIFY(accepted.toBool());
     QTRY_VERIFY(!dialog->property("visible").toBool());
-    QCOMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///repo/new.txt")));
+    QCOMPARE(pane->property("url").toUrl(), QUrl(target));
     QCOMPARE(closed.size(), 0);
 
     QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
     QCOMPARE(closed.size(), 1);
+    QVERIFY2(warnings.isEmpty(), "viewer close confirmation emitted QML warnings");
 }
 
 void TstPaneIdentity::dirtyEditorRejectsNavigation()
@@ -2684,6 +2806,369 @@ void TstPaneIdentity::dirtyEditorRejectsNavigation()
     QVERIFY2(warnings.isEmpty(), "dirty-editor replacement emitted QML warnings");
 }
 
+void TstPaneIdentity::remoteLayoutChangesKeepDirtyDocumentsAccessible_data()
+{
+    QTest::addColumn<bool>("removed");
+    QTest::addColumn<bool>("discard");
+    QTest::newRow("replace-save") << false << false;
+    QTest::newRow("replace-discard") << false << true;
+    QTest::newRow("remove-save") << true << false;
+    QTest::newRow("remove-discard") << true << true;
+}
+
+void TstPaneIdentity::remoteLayoutChangesKeepDirtyDocumentsAccessible()
+{
+    QFETCH(bool, removed);
+    QFETCH(bool, discard);
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
+    EditorControllerStub controller;
+    const QString original = QStringLiteral("file:///repo/local.txt");
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"), original), false));
+    auto *const paneItem = qobject_cast<QQuickItem *>(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QVERIFY(paneItem);
+    QTRY_VERIFY(paneItem->width() > 0 && paneItem->height() > 0);
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const pane = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QVERIFY(pane);
+    QObject *const editor = collect(m_region, isEditorPane).constFirst();
+    editor->setProperty("controller", QVariant::fromValue<QObject *>(&controller));
+    controller.setDirty(true);
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    QPointer<QObject> originalPane(pane);
+    QPointer<QObject> originalEditor(editor);
+    QSignalSpy urls(m_region, SIGNAL(paneUrlReported(QString,QString)));
+    QSignalSpy split(m_region, SIGNAL(splitRequested(QString,QString)));
+    QSignalSpy closed(m_region, SIGNAL(closePaneRequested(QString)));
+    QSignalSpy ratios(m_region, SIGNAL(splitRatiosAdjusted(QVariant,QVariant)));
+    QVERIFY(urls.isValid() && split.isValid() && closed.isValid() && ratios.isValid());
+    const QString latestId = removed ? QStringLiteral("viewer-2") : QStringLiteral("viewer-1");
+    setNode(leafNode(latestId, QStringLiteral("file:///repo/remote-old.bin")));
+    QTRY_VERIFY(m_region->property("layoutDeferred").toBool());
+    const QVariantMap latest = leafNode(latestId, QStringLiteral("file:///repo/remote-latest.bin"));
+    setNode(latest);
+    QCOMPARE(asMap(m_region->property("node")), latest);
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-1")), pane);
+    QCOMPARE(collect(m_region, isEditorPane).constFirst(), editor);
+    QCOMPARE(pane->property("url").toUrl(), QUrl(original));
+    QVERIFY(pane->property("layoutConflict").toBool());
+    QObject *const warning = childNamed(m_region, QStringLiteral("viewerLayoutDeferredWarning"));
+    QVERIFY(warning);
+    QVERIFY(warning->property("visible").toBool());
+    QVERIFY(qobject_cast<QQuickItem *>(pane)->isVisible());
+    QTRY_VERIFY(paneItem->height() > 0);
+    QVERIFY(warning->property("height").toReal() > 16);
+    QVERIFY(warning->property("height").toReal() < m_region->property("height").toReal());
+    auto *const window = qobject_cast<QQuickWindow *>(m_shell.get());
+    QVERIFY(window);
+    window->resize(360, 640);
+    QTRY_COMPARE(paneItem->width(), 360.0);
+    QTRY_VERIFY(paneItem->height() > 0);
+    QVERIFY(warning->property("height").toReal() > 16);
+    window->resize(960, 640);
+    QTRY_COMPARE(paneItem->width(), 960.0);
+    QTRY_VERIFY(paneItem->height() > 0);
+    QVERIFY(QMetaObject::invokeMethod(pane, "splitRequested",
+                                      Q_ARG(QString, QStringLiteral("viewer-1")),
+                                      Q_ARG(QString, QStringLiteral("horizontal"))));
+    QVERIFY(QMetaObject::invokeMethod(m_region, "reportRatiosForSession",
+                                      Q_ARG(QVariant, QString()), Q_ARG(QVariant, 0),
+                                      Q_ARG(QVariant, QVariantList{}),
+                                      Q_ARG(QVariant, QVariant(QVariantList{0.5, 0.5}))));
+    QVariant accepted;
+    QVERIFY(QMetaObject::invokeMethod(pane, "openTarget", Q_RETURN_ARG(QVariant, accepted),
+                                      Q_ARG(QVariant, QStringLiteral("file:///ignored.bin")),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(!accepted.toBool());
+    QCOMPARE(split.size(), 0);
+    QCOMPARE(ratios.size(), 0);
+    QCOMPARE(urls.size(), 0);
+    QVERIFY(controller.dirty());
+
+    if (discard) {
+        QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+        QObject *const dialog = childNamed(pane, QStringLiteral("viewerCloseUnsavedDialog"));
+        QVERIFY(dialog);
+        QTRY_VERIFY(dialog->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+        QTRY_VERIFY(originalPane.isNull());
+        QTRY_VERIFY(originalEditor.isNull());
+    } else {
+        controller.setDirty(false);
+    }
+    QTRY_VERIFY(!m_region->property("layoutDeferred").toBool());
+    QTRY_VERIFY(paneWithId(m_region, latestId));
+    QObject *const current = paneWithId(m_region, latestId);
+    QTRY_COMPARE(current->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///repo/remote-latest.bin")));
+    QCOMPARE(asMap(m_region->property("node")), latest);
+    QCOMPARE(asMap(m_region->property("displayNode")), latest);
+    QCOMPARE(closed.size(), 0); // Local discard never closes the remote replacement.
+    QVERIFY(!warning->property("visible").toBool());
+    for (const auto &report : urls)
+        QVERIFY(report.at(1).toString() != original);
+    QVERIFY2(warnings.isEmpty(), "retained editor layout emitted QML warnings");
+}
+
+void TstPaneIdentity::consentedDirtyCloseDoesNotBecomeARemoteLayoutHold()
+{
+    EditorControllerStub controller;
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+                       leafNode(QStringLiteral("viewer-1"),
+                                QStringLiteral("file:///repo/local.txt")), false));
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const pane = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QVERIFY(pane);
+    collect(pane, isEditorPane).constFirst()->setProperty(
+        "controller", QVariant::fromValue<QObject *>(&controller));
+    controller.setDirty(true);
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    const QVariantMap replacement = leafNode(QString());
+    QVERIFY(QMetaObject::invokeMethod(m_shell.get(), "bindCloseNode",
+                                      Q_ARG(QVariant, replacement)));
+    QPointer<QObject> retired(pane);
+    QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+    QObject *const dialog = childNamed(pane, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_VERIFY(retired.isNull());
+    QVERIFY(!m_region->property("layoutDeferred").toBool());
+    QCOMPARE(asMap(m_region->property("node")), replacement);
+    QTRY_VERIFY(paneWithId(m_region, QString()));
+}
+
+void TstPaneIdentity::closingOneRetainedDocumentKeepsOtherDirtyDocumentsVisible()
+{
+    EditorControllerStub firstController;
+    EditorControllerStub secondController;
+    QVERIFY(openRegion(QStringLiteral("ViewerRegion.qml"),
+        branchNode(QStringLiteral("horizontal"),
+                   {leafNode(QStringLiteral("viewer-1"), QStringLiteral("file:///repo/first.txt")),
+                    leafNode(QStringLiteral("viewer-2"), QStringLiteral("file:///repo/second.txt"))}),
+        false));
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 2);
+    QObject *const first = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QObject *const second = paneWithId(m_region, QStringLiteral("viewer-2"));
+    QVERIFY(first && second);
+    QObject *const firstEditor = collect(first, isEditorPane).constFirst();
+    QObject *const secondEditor = collect(second, isEditorPane).constFirst();
+    firstEditor->setProperty("controller", QVariant::fromValue<QObject *>(&firstController));
+    secondEditor->setProperty("controller", QVariant::fromValue<QObject *>(&secondController));
+    // URL reports normally persist without a tree republish. Becoming dirty
+    // after local navigation is not by itself a remote layout divergence.
+    QVariant navigated;
+    QVERIFY(QMetaObject::invokeMethod(second, "openTarget", Q_RETURN_ARG(QVariant, navigated),
+                                      Q_ARG(QVariant, QStringLiteral("file:///repo/local-second.txt")),
+                                      Q_ARG(QVariant, QString())));
+    QVERIFY(navigated.toBool());
+    firstController.setDirty(true);
+    secondController.setDirty(true);
+    QTRY_VERIFY(first->property("contentDirty").toBool());
+    QTRY_VERIFY(second->property("contentDirty").toBool());
+    QTest::qWait(20);
+    QVERIFY(!m_region->property("layoutDeferred").toBool());
+    setNode(branchNode(QStringLiteral("vertical"),
+                       {leafNode(QStringLiteral("viewer-1"), QStringLiteral("file:///repo/first-new.bin")),
+                        leafNode(QStringLiteral("viewer-2"), QStringLiteral("file:///repo/second-new.bin"))}));
+    QTRY_VERIFY(m_region->property("layoutDeferred").toBool());
+    QSignalSpy closed(m_region, SIGNAL(closePaneRequested(QString)));
+    QVERIFY(closed.isValid());
+    QPointer<QObject> retired(first);
+    QVERIFY(QMetaObject::invokeMethod(first, "requestClose"));
+    QObject *const dialog = childNamed(first, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_VERIFY(retired.isNull());
+    QTRY_VERIFY(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QObject *const replacement = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QTRY_COMPARE(replacement->property("url").toUrl(),
+                 QUrl(QStringLiteral("file:///repo/first-new.bin")));
+    QVERIFY(m_region->property("layoutDeferred").toBool());
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-2")), second);
+    QCOMPARE(collect(second, isEditorPane).constFirst(), secondEditor);
+    QVERIFY(secondController.dirty());
+    QCOMPARE(second->property("url").toUrl(), QUrl(QStringLiteral("file:///repo/local-second.txt")));
+    QVERIFY(qobject_cast<QQuickItem *>(second)->isVisible());
+    const QVariantMap newest = leafNode(QStringLiteral("viewer-3"),
+                                        QStringLiteral("file:///repo/newest.bin"));
+    setNode(newest);
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-2")), second);
+    secondController.setDirty(false);
+    QTRY_VERIFY(!m_region->property("layoutDeferred").toBool());
+    QTRY_VERIFY(paneWithId(m_region, QStringLiteral("viewer-3")));
+    QCOMPARE(asMap(m_region->property("displayNode")), newest);
+    QCOMPARE(asMap(m_region->property("node")), newest);
+    QCOMPARE(closed.size(), 0);
+}
+
+void TstPaneIdentity::retiredWorkspaceKeepsDetachedEditorsUntilLocalDiscard_data()
+{
+    QTest::addColumn<QString>("retirementProperty");
+    QTest::addColumn<QVariant>("retirementValue");
+    QTest::newRow("session-retired") << QStringLiteral("sessionId")
+                                    << QVariant(QStringLiteral("session-new"));
+    QTest::newRow("server-retired") << QStringLiteral("serverId")
+                                   << QVariant(QStringLiteral("server-new"));
+    QTest::newRow("document-generation-retired") << QStringLiteral("paneGeneration")
+                                                << QVariant(2.0);
+    QTest::newRow("acceptance-notifies-first") << QStringLiteral("acceptedServerId")
+                                             << QVariant(QStringLiteral("server-new"));
+}
+
+void TstPaneIdentity::retiredWorkspaceKeepsDetachedEditorsUntilLocalDiscard()
+{
+    QFETCH(QString, retirementProperty);
+    QFETCH(QVariant, retirementValue);
+    QSignalSpy warnings(m_engine.get(), &QQmlEngine::warnings);
+    QVERIFY(warnings.isValid());
+    EditorControllerStub controller;
+    const QString original = QStringLiteral("file:///repo/retained.txt");
+    QVERIFY(openInShell(QStringLiteral("ViewerRegion.qml"),
+        {{QStringLiteral("node"), leafNode(QStringLiteral("viewer-1"), original)},
+         {QStringLiteral("serverId"), QStringLiteral("server-old")},
+         {QStringLiteral("acceptedServerId"), QStringLiteral("server-old")},
+         {QStringLiteral("sessionId"), QStringLiteral("session-old")},
+         {QStringLiteral("paneGeneration"), 1.0}}));
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 1);
+    QObject *const pane = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QVERIFY(pane);
+    QObject *const editor = collect(pane, isEditorPane).constFirst();
+    editor->setProperty("controller", QVariant::fromValue<QObject *>(&controller));
+    // Replacing the controller seam does not reopen an already-started page.
+    // Start this document explicitly before asserting its original open history.
+    QVERIFY(QMetaObject::invokeMethod(editor, "start"));
+    QTRY_VERIFY(!controller.opened().isEmpty());
+    controller.setDirty(true);
+    QTRY_VERIFY(pane->property("contentDirty").toBool());
+    QPointer<QObject> retainedPane(pane);
+    QPointer<QObject> retainedEditor(editor);
+    const QStringList opened = controller.opened();
+    const QByteArray changedProperty = retirementProperty.toUtf8();
+    m_region->setProperty(changedProperty.constData(), retirementValue);
+    QTRY_VERIFY(m_region->property("contextRetired").toBool());
+    QVERIFY(controller.detached());
+    QVERIFY(editor->property("serverContextRetired").toBool());
+    const quint64 frozenRecoveryContext = controller.recoveryContextRevision();
+    const QVariantMap newest = leafNode(QStringLiteral("viewer-1"),
+                                        QStringLiteral("file:///new/current.bin"));
+    setNode(newest);
+    m_region->setProperty("serverId", QStringLiteral("server-new"));
+    m_region->setProperty("sessionId", QStringLiteral("session-new"));
+    m_region->setProperty("acceptedServerId", QStringLiteral("server-new"));
+    m_region->setProperty("layoutGeneration", 3.0);
+    m_region->setProperty("paneGeneration", 3.0);
+    QSignalSpy unexpectedResolve(&m_viewers, &ch::ViewerModel::pathResolveError);
+    QVERIFY(unexpectedResolve.isValid());
+    m_app.setActiveSessionRepoRoot(QStringLiteral("/new"));
+    const auto restoreDefaults = qScopeGuard([this] { m_viewers.setDefaultKinds({}); });
+    m_viewers.setDefaultKinds({{QStringLiteral("txt"), QStringLiteral("binary")}});
+    controller.setDirty(false); // Undoing to baseline must not unpin a retired page.
+    QCoreApplication::processEvents();
+    QCOMPARE(unexpectedResolve.size(), 0);
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-1")), pane);
+    QCOMPARE(collect(pane, isEditorPane).constFirst(), editor);
+    QCOMPARE(asObject(editor->property("controller")), &controller);
+    QCOMPARE(pane->property("url").toUrl(), QUrl(original));
+    QCOMPARE(pane->property("sessionId").toString(), QStringLiteral("session-old"));
+    QCOMPARE(pane->property("acceptedServerId").toString(), QStringLiteral("server-old"));
+    QCOMPARE(controller.opened(), opened);
+    QCOMPARE(controller.recoveryContextRevision(), frozenRecoveryContext);
+    QVERIFY(asMap(m_region->property("paneStamps")).isEmpty());
+    QCOMPARE(asMap(m_region->property("node")), newest);
+    QVERIFY(m_region->property("layoutDeferred").toBool());
+    QVERIFY(pane->property("layoutBlocked").toBool());
+    QVERIFY(!pane->property("canReload").toBool());
+    QVERIFY(qobject_cast<QQuickItem *>(pane)->isVisible());
+    QTRY_VERIFY(qobject_cast<QQuickItem *>(pane)->height() > 0);
+    QObject *const warning = childNamed(m_region, QStringLiteral("viewerLayoutDeferredWarning"));
+    QVERIFY(warning && warning->property("visible").toBool());
+    QVariant reloaded;
+    QVERIFY(QMetaObject::invokeMethod(pane, "reloadCurrent", Q_RETURN_ARG(QVariant, reloaded)));
+    QVERIFY(!reloaded.toBool());
+    QSignalSpy closed(m_region, SIGNAL(closePaneRequested(QString)));
+    QSignalSpy urls(m_region, SIGNAL(paneUrlReported(QString,QString)));
+    QVERIFY(closed.isValid() && urls.isValid());
+    QVERIFY(QMetaObject::invokeMethod(pane, "requestClose"));
+    QObject *const dialog = childNamed(pane, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(dialog);
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QTRY_VERIFY(retainedPane.isNull());
+    QTRY_VERIFY(retainedEditor.isNull());
+    QTRY_VERIFY(!m_region->property("contextRetired").toBool());
+    QTRY_VERIFY(!m_region->property("layoutDeferred").toBool());
+    QTRY_VERIFY(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QObject *const current = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QCOMPARE(current->property("url").toUrl(), QUrl(QStringLiteral("file:///new/current.bin")));
+    QCOMPARE(current->property("sessionId").toString(), QStringLiteral("session-new"));
+    QCOMPARE(current->property("acceptedServerId").toString(), QStringLiteral("server-new"));
+    QCOMPARE(asMap(m_region->property("node")), newest);
+    QCOMPARE(closed.size(), 0);
+    QCOMPARE(urls.size(), 0);
+    QVERIFY2(warnings.isEmpty(), "retired workspace emitted QML warnings");
+}
+
+void TstPaneIdentity::retiredWorkspaceCloseDoesNotMixNewOwnerWithOtherRetainedEditors()
+{
+    EditorControllerStub firstController;
+    EditorControllerStub secondController;
+    QVERIFY(openInShell(QStringLiteral("ViewerRegion.qml"),
+        {{QStringLiteral("node"), branchNode(QStringLiteral("horizontal"),
+            {leafNode(QStringLiteral("viewer-1"), QStringLiteral("file:///repo/first.txt")),
+             leafNode(QStringLiteral("viewer-2"), QStringLiteral("file:///repo/second.txt")),
+             leafNode(QStringLiteral("viewer-clean"), QStringLiteral("file:///repo/clean.bin"))})},
+         {QStringLiteral("serverId"), QStringLiteral("server-old")},
+         {QStringLiteral("acceptedServerId"), QStringLiteral("server-old")},
+         {QStringLiteral("sessionId"), QStringLiteral("session-old")}}));
+    QTRY_COMPARE(collect(m_region, isEditorPane).size(), 2);
+    QObject *const first = paneWithId(m_region, QStringLiteral("viewer-1"));
+    QObject *const second = paneWithId(m_region, QStringLiteral("viewer-2"));
+    QVERIFY(first && second);
+    collect(first, isEditorPane).constFirst()->setProperty(
+        "controller", QVariant::fromValue<QObject *>(&firstController));
+    collect(second, isEditorPane).constFirst()->setProperty(
+        "controller", QVariant::fromValue<QObject *>(&secondController));
+    firstController.setDirty(true);
+    secondController.setDirty(true);
+    QTRY_VERIFY(first->property("contentDirty").toBool());
+    QTRY_VERIFY(second->property("contentDirty").toBool());
+    m_region->setProperty("sessionId", QStringLiteral("session-new"));
+    QTRY_VERIFY(m_region->property("contextRetired").toBool());
+    QVERIFY(firstController.detached() && secondController.detached());
+    QTRY_VERIFY(!paneWithId(m_region, QStringLiteral("viewer-clean")));
+    const QVariantMap current = leafNode(QStringLiteral("viewer-1"),
+                                         QStringLiteral("file:///new/current.bin"));
+    setNode(current);
+    QSignalSpy closed(m_region, SIGNAL(closePaneRequested(QString)));
+    QVERIFY(closed.isValid());
+    QPointer<QObject> retiredFirst(first);
+    QVERIFY(QMetaObject::invokeMethod(first, "requestClose"));
+    QObject *const firstDialog = childNamed(first, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(firstDialog);
+    QTRY_VERIFY(firstDialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(firstDialog, "accept"));
+    QTRY_VERIFY(retiredFirst.isNull());
+    QVERIFY(m_region->property("contextRetired").toBool());
+    QVERIFY(!paneWithId(m_region, QStringLiteral("viewer-1")));
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-2")), second);
+    QVERIFY(secondController.dirty());
+    QVERIFY(qobject_cast<QQuickItem *>(second)->isVisible());
+    QCOMPARE(asMap(m_region->property("node")), current);
+    QVERIFY(QMetaObject::invokeMethod(second, "requestClose"));
+    QObject *const secondDialog = childNamed(second, QStringLiteral("viewerCloseUnsavedDialog"));
+    QVERIFY(secondDialog);
+    QTRY_VERIFY(secondDialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(secondDialog, "accept"));
+    QTRY_VERIFY(!m_region->property("contextRetired").toBool());
+    QTRY_VERIFY(paneWithId(m_region, QStringLiteral("viewer-1")));
+    QCOMPARE(paneWithId(m_region, QStringLiteral("viewer-1"))->property("url").toUrl(),
+             QUrl(QStringLiteral("file:///new/current.bin")));
+    QCOMPARE(closed.size(), 0);
+}
+
 void TstPaneIdentity::supersededAddressProbesCannotNavigate()
 {
     const QUrl initial(QStringLiteral("file:///tmp/current.bin"));
@@ -2701,8 +3186,9 @@ void TstPaneIdentity::supersededAddressProbesCannotNavigate()
                                       Q_ARG(QVariant, QString())));
     QVERIFY(accepted.toBool());
     QCOMPARE(pane->property("probePath").toString(), QString());
-    emit m_viewers.directoryListed(oldProbe, {});
-    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"));
+    emit m_viewers.directoryListed(oldProbe, {}, QStringLiteral("old-request"));
+    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"),
+                                  QStringLiteral("old-request"));
     QCOMPARE(pane->property("url").toUrl(), newer);
 
     // Same-URL navigation must retire the probe too: urlChanged cannot do it.
@@ -2712,15 +3198,32 @@ void TstPaneIdentity::supersededAddressProbesCannotNavigate()
                                       Q_ARG(QVariant, QString())));
     QVERIFY(accepted.toBool());
     QCOMPARE(pane->property("probePath").toString(), QString());
-    emit m_viewers.directoryListed(oldProbe, {});
+    emit m_viewers.directoryListed(oldProbe, {}, QStringLiteral("old-request"));
     QCOMPARE(pane->property("url").toUrl(), newer);
 
     // A direct host URL publication is another newer intent.
     pane->setProperty("probePath", oldProbe);
     pane->setProperty("url", initial);
     QCOMPARE(pane->property("probePath").toString(), QString());
-    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"));
+    emit m_viewers.directoryError(oldProbe, QStringLiteral("late failure"),
+                                  QStringLiteral("old-request"));
     QCOMPARE(pane->property("url").toUrl(), initial);
+
+    // A second attempt at the same path is a newer intent even though its
+    // address is identical. A late reply cannot turn that attempt into a file
+    // or directory before its own reply arrives.
+    const QString currentRequest = QStringLiteral("probe-current");
+    pane->setProperty("probeRequestId", currentRequest);
+    pane->setProperty("probePath", oldProbe);
+    emit m_viewers.directoryListed(oldProbe, {}, QStringLiteral("probe-earlier"));
+    emit m_viewers.directoryError(oldProbe, QStringLiteral("peer failure"),
+                                  QStringLiteral("probe-peer"));
+    QCOMPARE(pane->property("url").toUrl(), initial);
+    QCOMPARE(pane->property("probePath").toString(), oldProbe);
+    emit m_viewers.directoryListed(oldProbe, {}, currentRequest);
+    QCOMPARE(pane->property("url").toUrl(), QUrl(QStringLiteral("file:///tmp/old/")));
+    QCOMPARE(pane->property("probePath").toString(), QString());
+    QCOMPARE(pane->property("probeRequestId").toString(), QString());
 }
 
 void TstPaneIdentity::liveTerminalDiagnosticsRemainVisibleWithoutDisconnecting()
@@ -3564,6 +4067,51 @@ void TstPaneIdentity::discardingARecoveredBufferLeavesTheEditorShowingTheFile()
              "discarding the recovered buffer still marked the file dirty");
 }
 
+void TstPaneIdentity::recoveryOffersRetireWithTheirContext_data()
+{
+    QTest::addColumn<QString>("changedProperty");
+    QTest::newRow("server-gap") << QStringLiteral("recoveryServerId");
+    QTest::newRow("session") << QStringLiteral("recoverySessionId");
+    QTest::newRow("pane") << QStringLiteral("recoveryPaneId");
+    QTest::newRow("controller") << QStringLiteral("controller");
+}
+
+void TstPaneIdentity::recoveryOffersRetireWithTheirContext()
+{
+    QFETCH(QString, changedProperty);
+    EditorControllerStub original;
+    EditorControllerStub replacement;
+    QObject *const pane =
+        openInShell(QStringLiteral("EditorPaneView.qml"), recoveryPaneProps(&original));
+    QVERIFY(pane);
+    QObject *const dialog = childNamed(pane, QStringLiteral("editorRecoveryDialog"));
+    QVERIFY(dialog);
+    emit original.contentLoaded(QStringLiteral("disk baseline"), QStringLiteral("revision-a"));
+    emit original.recoveryAvailable(QStringLiteral("former context snapshot"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    EditorControllerStub *current = &original;
+    if (changedProperty == QLatin1String("controller")) {
+        pane->setProperty("controller", QVariant::fromValue<QObject *>(&replacement));
+        current = &replacement;
+    } else {
+        const QByteArray property = changedProperty.toUtf8();
+        const QVariant previous = pane->property(property.constData());
+        pane->setProperty(property.constData(), QString());
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+        pane->setProperty(property.constData(), previous);
+    }
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(pane, "restoreRecovered"));
+    QVERIFY(original.reported().isEmpty());
+    QVERIFY(replacement.reported().isEmpty());
+    emit current->contentLoaded(QStringLiteral("current disk baseline"), QStringLiteral("revision-b"));
+    emit current->recoveryAvailable(QStringLiteral("current context snapshot"));
+    QTRY_VERIFY(dialog->property("visible").toBool());
+    QVERIFY(QMetaObject::invokeMethod(dialog, "accept"));
+    QCOMPARE(current->reported(), QStringList{QStringLiteral("current context snapshot")});
+    QTRY_VERIFY(!dialog->property("visible").toBool());
+}
+
 // ---------------------------------------------------------------------------
 void TstPaneIdentity::theViewerPaneStopsWaitingForAProbeThatNeverAnswers()
 {
@@ -3652,28 +4200,37 @@ void TstPaneIdentity::theDirectoryListingTakesOnlyTheAnswerToItsOwnRequest()
     // Another pane listing the same directory. ONE ViewerModel serves them all,
     // so its reply arrives here too — and it answers nothing this view asked,
     // so it must not replace what is on screen.
-    emit m_viewers.directoryListed(path, entries);
+    emit m_viewers.directoryListed(path, entries, QStringLiteral("peer-request"));
     QCOMPARE(view->property("entries").toList().size(), 0);
 
     // Nor may somebody else's failure be painted over a listing this view is
     // perfectly happy with.
-    emit m_viewers.directoryError(path, QStringLiteral("permission denied"));
+    emit m_viewers.directoryError(path, QStringLiteral("permission denied"),
+                                  QStringLiteral("peer-request"));
     QCOMPARE(view->property("errorText").toString(), settled);
 
-    // The other direction: a reply the view IS waiting for is taken, and one
-    // for a different directory is not. `requestedPath` stands in for a request
-    // this transport-less fixture cannot leave outstanding on its own.
+    // The view is now awaiting a second request for the SAME path. Replies
+    // from an earlier reload or a peer pane must leave that request pending.
+    const QString currentRequest = QStringLiteral("current-request");
     view->setProperty("requestedPath", path);
+    view->setProperty("requestedRequestId", currentRequest);
     view->setProperty("loading", true);
-    emit m_viewers.directoryListed(QStringLiteral("/somewhere/else/"), entries);
+    emit m_viewers.directoryListed(path, entries, QStringLiteral("earlier-request"));
+    emit m_viewers.directoryError(path, QStringLiteral("late failure"),
+                                  QStringLiteral("peer-request"));
+    QCOMPARE(view->property("entries").toList().size(), 0);
+    QVERIFY(view->property("loading").toBool());
+    QCOMPARE(view->property("errorText").toString(), settled);
+    emit m_viewers.directoryListed(QStringLiteral("/somewhere/else/"), entries, currentRequest);
     QCOMPARE(view->property("entries").toList().size(), 0);
     QVERIFY2(view->property("loading").toBool(),
              "a listing of another directory settled this view");
 
-    emit m_viewers.directoryListed(path, entries);
+    emit m_viewers.directoryListed(path, entries, currentRequest);
     QCOMPARE(view->property("entries").toList().size(), 1);
     QVERIFY2(!view->property("loading").toBool(), "the view's own answer did not settle it");
     QCOMPARE(view->property("requestedPath").toString(), QString());
+    QCOMPARE(view->property("requestedRequestId").toString(), QString());
 }
 
 // ---------------------------------------------------------------------------
@@ -4021,7 +4578,10 @@ void TstPaneIdentity::reconnectRefreshPreservesDirtyEditorAndRetiresOldIntents()
     QTRY_COMPARE(server.layoutWriteCount(), 1);
     QCOMPARE(evalJs(editor, capture), text);
 
-    // A deliberate same-session load is still a document reset, not refresh.
+    // Explicit Discard precedes a deliberate same-session document reset.
+    // A bare authoritative pane-generation change is not itself consent.
+    QVERIFY(QMetaObject::invokeMethod(m_region, "resetPanesForNewTree",
+                                      Q_ARG(QVariant, true)));
     layouts.load(QStringLiteral("dev-reconnect"));
     QTRY_COMPARE(loaded.size(), 3);
     QTRY_VERIFY(preservedEditor.isNull());

@@ -66,7 +66,7 @@ public:
     // Grid bounds. A remote program cannot set these (there is no CSI for
     // resizing this engine), but resize() takes numbers derived from a view's
     // pixel geometry and a font metric, and a zero or absurd result there must
-    // not be able to produce an empty or gigabantic grid.
+    // not be able to produce an empty or oversized grid.
     static constexpr int kMinColumns = 1;
     static constexpr int kMinRows = 1;
     static constexpr int kMaxColumns = 2000;
@@ -208,6 +208,9 @@ private:
         QRgb bg = VtDefaultBackground;
         bool valid = false;
         bool pendingWrap = false;
+        // DECSC/DECRC retain DECAWM as well as position and rendition. Restore
+        // it before pendingWrap so an alt application's mode cannot leak back.
+        bool autowrap = true;
     };
 
     // --- parser-facing operations -------------------------------------------

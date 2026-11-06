@@ -58,6 +58,7 @@
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QUuid>
 #include <QVariantList>
@@ -102,6 +103,13 @@ constexpr int kWindowHeight = 640;
 // character would need a C++ universal-character-name, which is ill-formed
 // below U+00A0) and absent from every string this test puts on the wire.
 constexpr auto kJsSeparator = "@@CH@@";
+
+QString privateProfileRoot(const QTemporaryDir &directory)
+{
+    if (!directory.isValid())
+        qFatal("Unable to create private viewer test profile directory");
+    return directory.path();
+}
 
 QString sq(const QString &value)
 {
@@ -473,8 +481,9 @@ private:
     // Declaration order IS construction order; the engine is declared last so
     // it is destroyed FIRST and no QML tree unbinds against a dead ViewerModel.
     SshConnectionPool m_pool;
+    QTemporaryDir m_profileDirectory;
     CodeharbordClient m_client;
-    ViewerProfiles m_profiles{&m_client};
+    ViewerProfiles m_profiles{&m_client, privateProfileRoot(m_profileDirectory)};
     ViewerModel m_viewers{&m_client};
     std::unique_ptr<SessionBootstrap> m_bootstrap;
     std::unique_ptr<QQmlEngine> m_engine;
@@ -711,17 +720,22 @@ void TstLiveViewers::registryResolvesLiveRemoteUrls()
     QVariantList entries;
     QString listError;
     bool answered = false;
+    const QString requestId = m_viewers.newDirectoryRequestId();
     connect(&m_viewers, &ViewerModel::directoryListed, this,
-            [&](const QString &, const QVariantList &list) {
+            [&](const QString &, const QVariantList &list, const QString &replyId) {
+                if (replyId != requestId)
+                    return;
                 entries = list;
                 answered = true;
             });
     connect(&m_viewers, &ViewerModel::directoryError, this,
-            [&](const QString &, const QString &message) {
+            [&](const QString &, const QString &message, const QString &replyId) {
+                if (replyId != requestId)
+                    return;
                 listError = message;
                 answered = true;
             });
-    m_viewers.listDirectory(m_remoteDir);
+    m_viewers.listDirectory(m_remoteDir, requestId);
     QVERIFY2(waitFor([&] { return answered; }, kRpcTimeoutMs),
              "file.listDirectory never answered");
     disconnect(&m_viewers, nullptr, this, nullptr);

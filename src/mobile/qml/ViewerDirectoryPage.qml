@@ -63,9 +63,14 @@ Item {
         root.navigate(root.remotePath);
     }
 
-    // Every move of this pane's target has to reach the page inside it, whether
-    // or not that page was rebuilt. See Loader.applyTarget() below.
-    onCurrentPathChanged: content.applyTarget()
+    function deactivate() {
+        root.started = false;
+        root.requestedPath = "";
+        root.repoCheckPath = "";
+        root.loading = false;
+        content.unload();
+    }
+    Component.onDestruction: root.deactivate()
 
     // Is `path` a directory? A trailing slash is exactly what
     // ch::ViewerHandlerRegistry reads as "directory", and the same convention is
@@ -174,6 +179,7 @@ Item {
         // kept naming the place the pane was opened at no matter how deep the
         // user had walked.
         root.titleRequested(root.displayTitle(target));
+        content.applyTarget();
         if (!root.service)
             return;
         // The SPEC 9 question, asked for every path this pane shows — file or
@@ -397,7 +403,6 @@ Item {
             Loader {
                 id: content
                 anchors.fill: parent
-                active: root.contentKind !== "directory"
 
                 // The kind -> page table for the file the user tapped down to.
                 // Total: an unrecognised kind lands on the unsupported page
@@ -422,24 +427,35 @@ Item {
                     }
                 }
 
-                source: content.pageFor(root.contentKind)
 
-                // Pushed rather than bound (the loaded page owns these once it
-                // has them) — and pushed AGAIN on every navigation, which is the
-                // part that was missing: a Loader whose `source` string does not
-                // change does not rebuild, so tapping one text file straight
-                // after another left the FIRST file's content on screen under the
-                // second file's address, with nothing to make it re-read.
+                function unload() {
+                    if (content.item && typeof content.item.deactivate === "function")
+                        content.item.deactivate();
+                    content.setSource("");
+                }
+
                 function applyTarget() {
-                    if (!content.item)
+                    if (root.contentKind === "directory") {
+                        content.unload();
                         return;
-                    // Only the page this kind actually wants. When `source` has
-                    // changed, the Loader is about to rebuild the item with these
-                    // properties anyway, and pushing into the outgoing item would
-                    // start a read for a page that is being destroyed.
-                    if (!content.source.toString()
-                             .endsWith(content.pageFor(root.contentKind)))
+                    }
+                    const file = content.pageFor(root.contentKind);
+                    if (!content.item || !content.source.toString().endsWith(file)) {
+                        content.unload();
+                        const properties = {
+                            "repoRoot": root.repoRoot,
+                            "remotePath": root.currentPath,
+                            "paneUrl": root.service
+                                       ? root.service.fileUrlFor(root.currentPath) : "",
+                            "paneId": root.paneId
+                        };
+                        if (file === "ViewerUnsupportedPage.qml")
+                            properties["kind"] = root.contentKind;
+                        // Construct with the final target. Do not start a page
+                        // once empty and again with its real path in onLoaded.
+                        content.setSource(file, properties);
                         return;
+                    }
                     content.item.repoRoot = root.repoRoot;
                     content.item.remotePath = root.currentPath;
                     content.item.paneUrl = root.service
@@ -448,8 +464,6 @@ Item {
                     if (content.item.kind !== undefined)
                         content.item.kind = root.contentKind;
                 }
-
-                onLoaded: content.applyTarget()
             }
 
             // An empty directory and a directory that failed to list looked

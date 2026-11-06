@@ -74,6 +74,7 @@
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QUuid>
 #include <QVariant>
@@ -451,6 +452,13 @@ QString jsCtrlS(const QString &targetExpression)
         .arg(targetExpression);
 }
 
+QString isolatedProfileRoot(const QTemporaryDir& storage)
+{
+    if (!storage.isValid())
+        qFatal("Could not allocate private live-editor WebEngine storage");
+    return storage.path();
+}
+
 } // namespace
 
 class TstLiveEditor : public QObject
@@ -506,7 +514,8 @@ private:
     // EditorController unwatch) against a dead client or a closed transport.
     SshConnectionPool m_pool;
     CodeharbordClient m_client;
-    ViewerProfiles m_profiles{&m_client};
+    QTemporaryDir m_profileStorage;
+    ViewerProfiles m_profiles{&m_client, isolatedProfileRoot(m_profileStorage)};
     ViewerModel m_viewers{&m_client};
     EditorFactory m_editorFactory{&m_client};
     // All recovery artifacts remain under this test's unique remote directory,
@@ -1097,7 +1106,20 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
         outcome.restoredContent = editor.getValue();
         outcome.restoredStatus = root.querySelector(".ch-editor-state").textContent;
         outcome.restoredObservation = observations[observations.length - 1];
-        outcome.restoredReports = reports;
+        outcome.restoredReports = reports.slice();
+        // Recovery is unsaved against the real disk baseline, not against the
+        // recovered text itself. Undoing a subsequent edit must keep it dirty.
+        bridge.bufferRestored.emit("recovered work", "disk baseline", "r20", "", false);
+        bridge.fileStateChanged.emit("modified");
+        editor.pushUndoStop();
+        editor.executeEdits("recovery-regression", [{
+            range: editor.getModel().getFullModelRange(), text: "recovered work + edit"
+        }]);
+        editor.pushUndoStop();
+        editor.getModel().undo();
+        outcome.recoveredAfterUndo = editor.getValue();
+        outcome.recoveredObservation = observations[observations.length - 1];
+        outcome.recoveredStatus = root.querySelector(".ch-editor-state").textContent;
         host.dispose();
         host = undefined;
         // The disposed mount must neither retain a global Ctrl+S binding nor
@@ -1140,6 +1162,12 @@ void TstLiveEditor::repeatedSaveAfterAnEditAndRevertReconcilesDirtyState()
              (QJsonArray{true, QStringLiteral("r10")}));
     QCOMPARE(outcome.value(QStringLiteral("restoredReports")).toArray(),
              (QJsonArray{QStringLiteral("newer RAM")}));
+    QCOMPARE(outcome.value(QStringLiteral("recoveredAfterUndo")).toString(),
+             QStringLiteral("recovered work"));
+    QCOMPARE(outcome.value(QStringLiteral("recoveredObservation")).toArray(),
+             (QJsonArray{true, QStringLiteral("r20")}));
+    QCOMPARE(outcome.value(QStringLiteral("recoveredStatus")).toString(),
+             QStringLiteral("modified \u2022"));
     QCOMPARE(monacoValue(), before);
 }
 

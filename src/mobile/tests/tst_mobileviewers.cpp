@@ -142,6 +142,8 @@ private slots:
     void readsAreBoundedByTheSameCapTheDesktopApplies();
     void utf8TextAndBase64BytesAreDecodedDifferently();
     void anUntrustworthyReadReplyIsRefusedRatherThanRendered();
+    void aMissingTruncationFlagIsRefused_data();
+    void aMissingTruncationFlagIsRefused();
     void aWriteEchoesItsRevisionAndReportsTheNewOne();
     void aWriteConfirmedWithoutARevisionIsAFailure();
     void aReadWithoutARevisionIsRefusedBeforeItBecomesABuffer();
@@ -280,7 +282,7 @@ void TstMobileViewers::utf8TextAndBase64BytesAreDecodedDifferently()
 
     m_service->readFile(QStringLiteral("/repo/a.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"},
+                  {{"encoding", "utf-8"}, {"truncated", false},
                    {"content", "héllo"},
                    {"revision", "r1"}});
     QCOMPARE(reads.size(), 1);
@@ -294,7 +296,7 @@ void TstMobileViewers::utf8TextAndBase64BytesAreDecodedDifferently()
     // wall of U+FFFD may be shown as though it were the file.
     m_service->readFile(QStringLiteral("/repo/a.bin"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(
                                    QByteArray("\x00\x01\xff", 3).toBase64())},
                    {"revision", "r2"}});
@@ -312,13 +314,13 @@ void TstMobileViewers::anUntrustworthyReadReplyIsRefusedRatherThanRendered()
     // how a base64 payload ends up on screen as the base64 alphabet.
     m_service->readFile(QStringLiteral("/repo/x"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "latin-1"}, {"content", "abc"}});
+                  {{"encoding", "latin-1"}, {"content", "abc"}, {"truncated", false}});
     QCOMPARE(errors.size(), 1);
 
     // (2) A base64 payload that is not valid base64.
     m_service->readFile(QStringLiteral("/repo/y"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"}, {"content", "!!!not base64!!!"}});
+                  {{"encoding", "base64"}, {"content", "!!!not base64!!!"}, {"truncated", false}});
     QCOMPARE(errors.size(), 2);
 
     // (3) A `truncated` that is not a boolean. Coerced with toBool() it would
@@ -333,7 +335,7 @@ void TstMobileViewers::anUntrustworthyReadReplyIsRefusedRatherThanRendered()
     // (4) No content at all.
     m_service->readFile(QStringLiteral("/repo/w"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}});
+                  {{"encoding", "utf-8"}, {"truncated", false}});
     QCOMPARE(errors.size(), 4);
 
     // (5) A transport/server error is forwarded with the server's own wording.
@@ -415,6 +417,14 @@ void TstMobileViewers::aWriteConfirmedWithoutARevisionIsAFailure()
     // waiting to happen (SPEC 8.6).
     QCOMPARE(written.size(), 0);
     QCOMPARE(errors.size(), 1);
+
+    // An empty token is create-only, not the revision of the file just written.
+    m_service->writeFile(QStringLiteral("/repo/a.txt"), QStringLiteral("c"),
+                         QStringLiteral("r1"));
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
+                  {{"revision", ""}});
+    QCOMPARE(written.size(), 0);
+    QCOMPARE(errors.size(), 2);
 }
 
 void TstMobileViewers::aDirectoryListingIsOrderedDirectoriesFirstThenByName()
@@ -587,7 +597,7 @@ void TstMobileViewers::aSecondRequestForACachedImageCostsNoRoundTrip()
     const QString path = QStringLiteral("/repo/logo.png");
     m_service->requestImage(path);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
 
     QSignalSpy ready(m_service, &MobileViewerService::imageReady);
@@ -627,7 +637,7 @@ void TstMobileViewers::theImageProviderAnswersOnlyFromTheCache()
     const QString path = QStringLiteral("/repo/pic with spaces.png");
     m_service->requestImage(path);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
     QCOMPARE(m_service->cachedImageBytes(path), pngBytes());
 
@@ -795,21 +805,21 @@ void TstMobileViewers::aReadWithoutARevisionIsRefusedBeforeItBecomesABuffer()
 
     m_service->readFile(QStringLiteral("/repo/a.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "body"}});
+                  {{"encoding", "utf-8"}, {"content", "body"}, {"truncated", false}});
     QCOMPARE(reads.size(), 0);
     QCOMPARE(errors.size(), 1);
 
     // A non-string revision is the same failure, not a coercion.
     m_service->readFile(QStringLiteral("/repo/b.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "body"}, {"revision", 7}});
+                  {{"encoding", "utf-8"}, {"content", "body"}, {"revision", 7}, {"truncated", false}});
     QCOMPARE(reads.size(), 0);
     QCOMPARE(errors.size(), 2);
 
     // An EMPTY file is still a perfectly good read, as long as it is guarded.
     m_service->readFile(QStringLiteral("/repo/empty.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", ""}, {"revision", "r9"}});
+                  {{"encoding", "utf-8"}, {"content", ""}, {"revision", "r9"}, {"truncated", false}});
     QCOMPARE(reads.size(), 1);
     QCOMPARE(reads.at(0).at(1).toString(), QString());
     QCOMPARE(reads.at(0).at(3).toString(), QStringLiteral("r9"));
@@ -819,7 +829,7 @@ void TstMobileViewers::aReadWithoutARevisionIsRefusedBeforeItBecomesABuffer()
     QSignalSpy ready(m_service, &MobileViewerService::imageReady);
     m_service->requestImage(QStringLiteral("/repo/logo.png"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
     QCOMPARE(ready.size(), 1);
 }
@@ -839,7 +849,7 @@ void TstMobileViewers::aReplyLargerThanTheCapIsRefused()
                             QLatin1Char('a'));
     m_service->readFile(QStringLiteral("/repo/huge.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"},
+                  {{"encoding", "utf-8"}, {"truncated", false},
                    {"content", oversized},
                    {"revision", "r1"}});
     QCOMPARE(reads.size(), 0);
@@ -850,7 +860,7 @@ void TstMobileViewers::aReplyLargerThanTheCapIsRefused()
                         QLatin1Char('a'));
     m_service->readFile(QStringLiteral("/repo/big.txt"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"},
+                  {{"encoding", "utf-8"}, {"truncated", false},
                    {"content", atCap},
                    {"revision", "r2"}});
     QCOMPARE(reads.size(), 1);
@@ -898,7 +908,7 @@ void TstMobileViewers::theProviderReportsTheSizeTheCallerWillActuallyGet()
     const QString path = QStringLiteral("/repo/photo.jpg");
     m_service->requestImage(path);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(rotatedJpegBytes().toBase64())}});
     QCOMPARE(m_service->cachedImageBytes(path), rotatedJpegBytes());
 
@@ -982,7 +992,7 @@ void TstMobileViewers::thePdfSpoolIsAppPrivateDigestNamedAndEmptied()
     // And the destructor is the backstop for a page that never released.
     m_service->requestPdf(path);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(
                                    QByteArrayLiteral("%PDF-1.7 body").toBase64())}});
     QVERIFY(QFile::exists(spooled));
@@ -1001,7 +1011,7 @@ void TstMobileViewers::aReplyThatOutlivesTheServiceIsDropped()
     const qint64 id = takeRequest().value(QStringLiteral("id")).toInteger();
     delete m_service;
     m_service = nullptr;
-    respondResult(id, {{"encoding", "utf-8"},
+    respondResult(id, {{"encoding", "utf-8"}, {"truncated", false},
                        {"content", "body"},
                        {"revision", "r1"}});
     // Reaching here without a crash IS the assertion; the QPointer guard is what
@@ -1027,7 +1037,7 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     const qint64 abandoned = takeRequest().value(QStringLiteral("id")).toInteger();
     m_service->releasePdf(pdf); // the pane has been retargeted
     respondResult(abandoned,
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(
                                    QByteArrayLiteral("%PDF-1.7 x").toBase64())}});
     // Nothing announced, nothing failed, and — the point — nothing written.
@@ -1044,12 +1054,12 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     m_service->releasePdf(pdf);
     m_service->requestPdf(pdf);
     const qint64 second = takeRequest().value(QStringLiteral("id")).toInteger();
-    respondResult(first, {{"encoding", "base64"},
+    respondResult(first, {{"encoding", "base64"}, {"truncated", false},
                           {"content", QString::fromLatin1(
                                           QByteArrayLiteral("stale").toBase64())}});
     QCOMPARE(pdfReady.size(), 0); // the stale reply is nobody's
     respondResult(second,
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(
                                    QByteArrayLiteral("%PDF-1.7 live").toBase64())}});
     QCOMPARE(pdfReady.size(), 1);
@@ -1068,7 +1078,7 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     const qint64 imageId = takeRequest().value(QStringLiteral("id")).toInteger();
     m_service->forgetImage(png);
     respondResult(imageId,
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
     QCOMPARE(imageReady.size(), 0);
     QVERIFY(m_service->cachedImageBytes(png).isEmpty());
@@ -1077,7 +1087,7 @@ void TstMobileViewers::aReleasedRequestStillInFlightLeavesNothingBehind()
     // ...and a re-request after the release still ends up with usable bytes.
     m_service->requestImage(png);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"},
+                  {{"encoding", "base64"}, {"truncated", false},
                    {"content", QString::fromLatin1(pngBytes().toBase64())}});
     QCOMPARE(imageReady.size(), 1);
     QCOMPARE(m_service->cachedImageBytes(png), pngBytes());
@@ -1192,9 +1202,9 @@ void TstMobileViewers::aSupersededRequestCannotCompleteItsReplacement()
     const qint64 oldRead = takeRequest().value(QStringLiteral("id")).toInteger();
     m_service->readFile(path);
     const qint64 newRead = takeRequest().value(QStringLiteral("id")).toInteger();
-    respondResult(oldRead, {{"encoding", "utf-8"}, {"content", "old"}, {"revision", "r1"}});
+    respondResult(oldRead, {{"encoding", "utf-8"}, {"content", "old"}, {"revision", "r1"}, {"truncated", false}});
     QVERIFY(reads.isEmpty());
-    respondResult(newRead, {{"encoding", "utf-8"}, {"content", "new"}, {"revision", "r2"}});
+    respondResult(newRead, {{"encoding", "utf-8"}, {"content", "new"}, {"revision", "r2"}, {"truncated", false}});
     QCOMPARE(reads.size(), 1);
     QCOMPARE(reads.first().at(1).toString(), QStringLiteral("new"));
     QCOMPARE(reads.first().at(3).toString(), QStringLiteral("r2"));
@@ -1275,14 +1285,14 @@ void TstMobileViewers::aTransportChangeRetiresRequestsAndCachedResources()
     const QString image = QStringLiteral("/repo/shared.png");
     m_service->requestImage(image);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "base64"}, {"content", QString::fromLatin1(pngBytes().toBase64())}});
+                  {{"encoding", "base64"}, {"content", QString::fromLatin1(pngBytes().toBase64())}, {"truncated", false}});
     QVERIFY(!m_service->cachedImageBytes(image).isEmpty());
 
     const QString pdf = QStringLiteral("/repo/shared.pdf");
     QSignalSpy ready(m_service, &MobileViewerService::pdfReady);
     m_service->requestPdf(pdf);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF-1.7\n"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF-1.7\n"}, {"truncated", false}});
     QCOMPARE(ready.size(), 1);
     const QString spool = ready.first().at(1).toUrl().toLocalFile();
     QVERIFY(QFile::exists(spool));
@@ -1350,7 +1360,7 @@ void TstMobileViewers::twoViewerServicesOwnIndependentPdfSpools()
     QSignalSpy firstReady(m_service, &MobileViewerService::pdfReady);
     m_service->requestPdf(remote);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF first service"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF first service"}, {"truncated", false}});
     QCOMPARE(firstReady.size(), 1);
     const QString firstPath = firstReady.first().at(1).toUrl().toLocalFile();
     const QString firstDirectory = QFileInfo(firstPath).absolutePath();
@@ -1361,7 +1371,7 @@ void TstMobileViewers::twoViewerServicesOwnIndependentPdfSpools()
         QSignalSpy secondReady(&second, &MobileViewerService::pdfReady);
         second.requestPdf(remote);
         respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                      {{"encoding", "utf-8"}, {"content", "%PDF second service"}});
+                      {{"encoding", "utf-8"}, {"content", "%PDF second service"}, {"truncated", false}});
         QCOMPARE(secondReady.size(), 1);
         const QString secondPath = secondReady.first().at(1).toUrl().toLocalFile();
         secondDirectory = QFileInfo(secondPath).absolutePath();
@@ -1386,7 +1396,7 @@ void TstMobileViewers::aPdfSpoolWriteFailurePublishesNothing()
     QSignalSpy errors(m_service, &MobileViewerService::pdfError);
     m_service->requestPdf(QStringLiteral("/repo/first.pdf"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF original"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF original"}, {"truncated", false}});
     QCOMPARE(ready.size(), 1);
     const QString firstPath = ready.first().at(1).toUrl().toLocalFile();
     const QString directory = QFileInfo(firstPath).absolutePath();
@@ -1398,7 +1408,7 @@ void TstMobileViewers::aPdfSpoolWriteFailurePublishesNothing()
     const QStringList before = QDir(directory).entryList(QDir::AllEntries | QDir::NoDotAndDotDot);
     m_service->requestPdf(remote);
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF must not be published"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF must not be published"}, {"truncated", false}});
     QCOMPARE(ready.size(), 1);
     QCOMPARE(errors.size(), 1);
     QCOMPARE(QDir(directory).entryList(QDir::AllEntries | QDir::NoDotAndDotDot), before);
@@ -1416,7 +1426,7 @@ void TstMobileViewers::aPdfSpoolPermissionFailurePublishesNothing()
     QSignalSpy errors(m_service, &MobileViewerService::pdfError);
     m_service->requestPdf(QStringLiteral("/repo/first.pdf"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF original"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF original"}, {"truncated", false}});
     QCOMPARE(ready.size(), 1);
     const QString firstPath = ready.first().at(1).toUrl().toLocalFile();
     const QString directory = QFileInfo(firstPath).absolutePath();
@@ -1433,12 +1443,52 @@ void TstMobileViewers::aPdfSpoolPermissionFailurePublishesNothing()
     }
     m_service->requestPdf(QStringLiteral("/repo/denied.pdf"));
     respondResult(takeRequest().value(QStringLiteral("id")).toInteger(),
-                  {{"encoding", "utf-8"}, {"content", "%PDF denied"}});
+                  {{"encoding", "utf-8"}, {"content", "%PDF denied"}, {"truncated", false}});
     QCOMPARE(ready.size(), 1);
     QCOMPARE(errors.size(), 1);
     QCOMPARE(QDir(directory).entryList(QDir::Files).size(), 1);
     QVERIFY(QFile::exists(firstPath));
 #endif
+}
+
+void TstMobileViewers::aMissingTruncationFlagIsRefused_data()
+{
+    QTest::addColumn<QString>("operation");
+    QTest::newRow("text") << QStringLiteral("text");
+    QTest::newRow("image") << QStringLiteral("image");
+    QTest::newRow("pdf") << QStringLiteral("pdf");
+}
+
+void TstMobileViewers::aMissingTruncationFlagIsRefused()
+{
+    QFETCH(QString, operation);
+    QSignalSpy reads(m_service, &MobileViewerService::fileRead);
+    QSignalSpy images(m_service, &MobileViewerService::imageReady);
+    QSignalSpy pdfs(m_service, &MobileViewerService::pdfReady);
+    QSignalSpy fileErrors(m_service, &MobileViewerService::fileError);
+    QSignalSpy imageErrors(m_service, &MobileViewerService::imageError);
+    QSignalSpy pdfErrors(m_service, &MobileViewerService::pdfError);
+    const QString path = QStringLiteral("/repo/prefix");
+    QJsonObject result{{"encoding", "utf-8"}, {"content", "a plausible prefix"},
+                       {"revision", "r1"}};
+    if (operation == QLatin1String("image")) {
+        result.insert(QStringLiteral("encoding"), QStringLiteral("base64"));
+        result.insert(QStringLiteral("content"), QString::fromLatin1(pngBytes().toBase64()));
+        m_service->requestImage(path);
+    } else if (operation == QLatin1String("pdf")) {
+        result.insert(QStringLiteral("content"), QStringLiteral("%PDF-1.7\n"));
+        m_service->requestPdf(path);
+    } else {
+        m_service->readFile(path);
+    }
+    // ReadFileResult requires the flag. Its absence cannot certify that any of
+    // these otherwise readable payloads is a complete document.
+    respondResult(takeRequest().value(QStringLiteral("id")).toInteger(), result);
+    QVERIFY(reads.isEmpty());
+    QVERIFY(images.isEmpty());
+    QVERIFY(pdfs.isEmpty());
+    QCOMPARE(fileErrors.size() + imageErrors.size() + pdfErrors.size(), 1);
+    QVERIFY(m_service->cachedImageBytes(path).isEmpty());
 }
 
 // QGuiApplication, not QCoreApplication: MobileImageProvider decodes into a

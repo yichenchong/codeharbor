@@ -286,6 +286,10 @@ graph TD
     `willContinue`, so a mid-run turn boundary would have announced "finished".
     Gated by `remote/test/oh-my-pi-live.test.ts`, which runs a REAL `omp` and
     asserts the bridge receives `starting → running → idle_unseen → stopped`.
+    The real-model gate is opt-in with `CH_LIVE_OMP=1` and environment-supplied
+    model credentials; it uses isolated agent state rather than the user's installed
+    profile. An ordinary `npm test` does not make a paid model call just because
+    `omp` is installed (see DEVELOPMENT, Test suites).
 - **Stop gate:** ✅ MET — `tst_liveagent` runs the REAL hook on the remote side
   (one node process per firing) into the REAL bridge, over an SSH AgentStatus
   channel, and observes the ordered transitions

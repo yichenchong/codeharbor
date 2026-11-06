@@ -58,7 +58,9 @@ import { JsonSizeLimitError, stringifyJson } from "./json.ts";
 // legitimately takes the same label.
 // Bumped 4 -> 5 to persist Dev Session pin state. The migration only adds the
 // NOT NULL column with a false default, so existing sessions remain unpinned.
-export const WORKSPACE_SCHEMA_VERSION = 5;
+// Bumped 5 -> 6 to repair terminal constraints already stamped current by older
+// migrations: global targets are unique, while reusable slot labels are not.
+export const WORKSPACE_SCHEMA_VERSION = 6;
 
 // The authoritative DDL (C2). Read relative to this module so it resolves the
 // same whether invoked from src/ or from a built dist/ alongside sql/.
@@ -866,6 +868,9 @@ const MIGRATIONS: ReadonlyArray<{
             }
         },
     },
+    // Fix databases already marked v5 by the old partial-index/one-index-only
+    // migrations. Do not replay v3: duplicate labels are legitimate since v4.
+    { version: 6, apply: (db) => migrateTerminalPaneConstraints(db) },
 ];
 
 // Quote a SQL IDENTIFIER: wrap it in double quotes and double any embedded
@@ -879,30 +884,56 @@ function quoteIdentifier(name: string): string {
     return `"${name.replace(/"/g, '""')}"`;
 }
 
-// The unique index over exactly `columns` of `terminal_panes`, in order, or
-// null when the table does not enforce that combination. A table-level UNIQUE
+// The unique indexes over exactly `columns` of `terminal_panes`. Key order does
+// not affect uniqueness; callers distinguish full rules from partial variants.
+// A table-level UNIQUE
 // shows up as an sqlite_autoindex, a migration-added one under its own name,
 // and both answer PRAGMA index_list. Asking rather than using CREATE UNIQUE
 // INDEX IF NOT EXISTS: that only matches on the index NAME, so on a FRESH
 // database (where step v1 applied a schema.sql whose CREATE TABLE already
 // carries the constraint) it would add a second index over the same columns
-// and charge every write for it twice. The NAME, not just a yes/no, because v4
-// has to remove one of these again and how it does that depends on which kind
-// it is.
-function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): string | null {
+// and charge every write for it twice. Names rather than just a yes/no because
+// obsolete address rules must be removed, and autoindexes require a rebuild.
+// A partial index only protects selected rows, so it cannot satisfy v3's
+// global identity constraint. v4 opts in to finding those indexes as well:
+// removing an obsolete address constraint must also remove subset variants.
+function terminalPaneUniqueIndexesOver(
+    db: DatabaseSync, columns: string[], includePartial = false,
+): string[] {
     const indexes = db.prepare("PRAGMA index_list(terminal_panes)").all() as unknown as Array<{
         name: string;
         unique: number;
+        partial: number;
     }>;
+    const matches: string[] = [];
     for (const index of indexes) {
-        if (index.unique !== 1) continue;
+        if (index.unique !== 1 || (!includePartial && index.partial !== 0)) continue;
         const found = db
             .prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`)
             .all() as unknown as Array<{ name: string | null }>;
         if (found.length !== columns.length) continue;
-        if (found.every((c, i) => c.name === columns[i])) return index.name;
+        if (columns.every((column) => found.some((c) => c.name === column))) matches.push(index.name);
     }
-    return null;
+    return matches;
+}
+
+// Migration index names are preferences, not proof of what an existing index
+// enforces. A partial or unrelated index may already own the preferred name.
+// Preserve it and choose a free name for the global constraint; the caller
+// holds the migration's write lock, so another connection cannot claim it.
+function ensureTerminalPaneUniqueIndex(
+    db: DatabaseSync, columns: string[], preferredName: string,
+): void {
+    if (terminalPaneUniqueIndexesOver(db, columns).length !== 0) return;
+    const occupied = db.prepare("SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE");
+    let name = preferredName;
+    for (let suffix = 2; occupied.get(name) !== undefined; suffix++) {
+        name = `${preferredName}_${suffix}`;
+    }
+    db.exec(
+        `CREATE UNIQUE INDEX ${quoteIdentifier(name)} ON terminal_panes ` +
+            `(${columns.map(quoteIdentifier).join(", ")})`,
+    );
 }
 
 // Schema v3: make a terminal pane's identity unique, in both of the ways it is
@@ -964,7 +995,7 @@ function terminalPaneUniqueIndexOver(db: DatabaseSync, columns: string[]): strin
 //     this repair is actually for.)
 //
 //  4. CONSTRAIN, skipping whichever constraint the table already carries.
-function migrateTerminalPaneIdentity(db: DatabaseSync): void {
+function migrateTerminalPaneTargets(db: DatabaseSync): void {
     const targeted = db
         .prepare(
             "SELECT rowid AS rowid, id, dev_session_id, tmux_target FROM terminal_panes WHERE tmux_target IS NOT NULL ORDER BY rowid",
@@ -979,6 +1010,7 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
     const takenTargets = new Set<string>();
     // A generated replacement must not take a later row's existing shell.
     const reservedTargets = new Set(targeted.map((row) => tmuxSafeName(row.tmux_target)));
+    const changes: Array<{ rowid: number; target: string | null }> = [];
     for (const row of targeted) {
         const repaired = tmuxSafeName(row.tmux_target);
         let next: string | null = repaired;
@@ -998,8 +1030,24 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
                     : null;
         }
         if (next !== null) takenTargets.add(next);
-        if (next !== row.tmux_target) assignTarget.run(next, row.rowid);
+        if (next !== row.tmux_target) changes.push({ rowid: row.rowid, target: next });
     }
+    // Vacate all changing names before claiming replacements. A partial unique
+    // index can otherwise reject a transient collision with a later row that
+    // this same repair is about to move. NULL is explicitly allowed by schema.
+    for (const change of changes) assignTarget.run(null, change.rowid);
+    for (const change of changes) {
+        if (change.target !== null) assignTarget.run(change.target, change.rowid);
+    }
+    ensureTerminalPaneUniqueIndex(db, ["tmux_target"], "terminal_panes_tmux_target_unique");
+}
+
+function migrateTerminalPaneIdentity(db: DatabaseSync): void {
+    // The shared repair vacates changing targets to NULL. Remove obsolete
+    // named label predicates before those transitions on legacy upgrades too;
+    // v3 still de-duplicates labels and adds its temporary full rule below.
+    dropNamedTerminalPaneAddressIndexes(db);
+    migrateTerminalPaneTargets(db);
 
     const named = db
         .prepare(
@@ -1037,16 +1085,9 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
         assignName.run(renamed, row.rowid);
     }
 
-    if (terminalPaneUniqueIndexOver(db, ["tmux_target"]) === null) {
-        db.exec(
-            "CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON terminal_panes (tmux_target)",
-        );
-    }
-    if (terminalPaneUniqueIndexOver(db, ["dev_session_id", "name"]) === null) {
-        db.exec(
-            "CREATE UNIQUE INDEX terminal_panes_address_unique ON terminal_panes (dev_session_id, name)",
-        );
-    }
+    ensureTerminalPaneUniqueIndex(
+        db, ["dev_session_id", "name"], "terminal_panes_address_unique",
+    );
 }
 
 // Schema v4: undo v3's UNIQUE (dev_session_id, name).
@@ -1070,15 +1111,33 @@ function migrateTerminalPaneIdentity(db: DatabaseSync): void {
 //   * An sqlite_autoindex, on a database first created while schema.sql still
 //     declared the table-level UNIQUE. SQLite cannot drop a table constraint,
 //     so the table is rebuilt without it and the rows are copied across. The
-//     UNIQUE (tmux_target) rule is re-declared on the new table: THAT one still
-//     holds, and dropping the old table takes its index with it.
-function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
-    const index = terminalPaneUniqueIndexOver(db, ["dev_session_id", "name"]);
-    if (index === null) return;
-    if (!index.startsWith("sqlite_autoindex_")) {
-        db.exec(`DROP INDEX ${quoteIdentifier(index)}`);
-        return;
+//     target rule remains enforced, and unrelated named indexes/triggers are
+//     replayed only after the copy, so migration does not fire audit triggers.
+function dropNamedTerminalPaneAddressIndexes(db: DatabaseSync): boolean {
+    let hasTableConstraint = false;
+    for (const index of terminalPaneUniqueIndexesOver(db, ["dev_session_id", "name"], true)) {
+        if (index.startsWith("sqlite_autoindex_")) hasTableConstraint = true;
+        else db.exec(`DROP INDEX ${quoteIdentifier(index)}`);
     }
+    return hasTableConstraint;
+}
+
+function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
+    if (dropNamedTerminalPaneAddressIndexes(db)) rebuildTerminalPanesWithoutAddressUnique(db);
+}
+
+function rebuildTerminalPanesWithoutAddressUnique(db: DatabaseSync): void {
+    // The old table owns these schema objects: DROP TABLE removes them even
+    // though only its address constraint is obsolete. Preserve their original
+    // DDL, including quoted names, predicates, expressions and trigger bodies.
+    const preserved = db.prepare(
+        "SELECT sql FROM sqlite_schema WHERE tbl_name = 'terminal_panes' " +
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name",
+    ).all() as unknown as Array<{ sql: string }>;
+    // Retain a named global rule verbatim instead of adding a redundant table
+    // autoindex for the same target. Otherwise restore the table-level rule.
+    const hasNamedTargetRule = terminalPaneUniqueIndexesOver(db, ["tmux_target"])
+        .some((index) => !index.startsWith("sqlite_autoindex_"));
     db.exec(`
         CREATE TABLE terminal_panes_v4 (
             id                TEXT    NOT NULL PRIMARY KEY,
@@ -1092,8 +1151,8 @@ function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
             position          INTEGER NOT NULL DEFAULT 0,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL,
-            FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id),
-            UNIQUE (tmux_target)
+            FOREIGN KEY (dev_session_id) REFERENCES dev_sessions (id)
+            ${hasNamedTargetRule ? "" : ", UNIQUE (tmux_target)"}
         );
         INSERT INTO terminal_panes_v4
             SELECT id, server_id, dev_session_id, name, working_directory, tmux_target,
@@ -1102,6 +1161,19 @@ function migrateDropTerminalPaneAddressUnique(db: DatabaseSync): void {
         DROP TABLE terminal_panes;
         ALTER TABLE terminal_panes_v4 RENAME TO terminal_panes;
     `);
+    for (const object of preserved) db.exec(object.sql);
+}
+
+// v6 also reaches workspaces an older build already upgraded to v5. Remove
+// named label rules before target changes: an obsolete NULL-filtered label
+// rule must not reject temporarily vacated targets. Defer only a necessary
+// table rebuild until target repair has established the global target rule.
+function migrateTerminalPaneConstraints(db: DatabaseSync): void {
+    const needsRebuild = dropNamedTerminalPaneAddressIndexes(db);
+    if (terminalPaneUniqueIndexesOver(db, ["tmux_target"]).length === 0) {
+        migrateTerminalPaneTargets(db);
+    }
+    if (needsRebuild) rebuildTerminalPanesWithoutAddressUnique(db);
 }
 
 // Is `version` already at or past what this build targets — i.e. is there no
@@ -1197,11 +1269,11 @@ function migrate(db: DatabaseSync): void {
 }
 
 function schemaVersion(db: DatabaseSync): number {
+    let row: { version: unknown } | undefined;
     try {
-        const row = db
+        row = db
             .prepare("SELECT version FROM schema_version WHERE id = 1")
-            .get() as { version: number } | undefined;
-        return row?.version ?? 0;
+            .get() as { version: unknown } | undefined;
     } catch (err) {
         // Exactly ONE failure means "unmigrated": the schema_version table is
         // not there yet. Every other failure — a file that is not a SQLite
@@ -1210,9 +1282,18 @@ function schemaVersion(db: DatabaseSync): number {
         // sent migrate() on to BEGIN IMMEDIATE and the full schema.sql and
         // buried the real cause under whichever of those failed second. Report
         // it instead.
-        if (err instanceof Error && /no such table/i.test(err.message)) return 0;
+        if (err instanceof Error && /^no such table: schema_version$/i.test(err.message)) return 0;
         throw err;
     }
+    if (!row) return 0;
+    if (
+        typeof row.version !== "number" ||
+        !Number.isSafeInteger(row.version) ||
+        row.version < 0
+    ) {
+        throw new Error(`workspace database has an invalid schema version: ${String(row.version)}`);
+    }
+    return row.version;
 }
 
 // The compiled form of the nested listing (see Workspace.listStatements).

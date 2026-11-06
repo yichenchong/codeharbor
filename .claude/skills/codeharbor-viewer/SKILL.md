@@ -17,7 +17,7 @@ The tools come from the `codeharbor` MCP server, namespaced by Claude Code as
 | --- | --- |
 | `viewer_list` | pane ids, what each shows, which has focus |
 | `viewer_open` | show a file / directory / URL in a pane, optionally a new one |
-| `viewer_split` | split a pane, leaving both halves as they were |
+| `viewer_split` | keep the existing pane and add an empty pane; return the new pane id |
 | `viewer_focus` | make a pane the active one |
 | `viewer_close` | close a pane |
 | `viewer_reload` | re-fetch what a pane is showing |
@@ -55,14 +55,22 @@ are refused.
 
 The tool result names a reason:
 
-- `not_active_session` — the user is looking at a different Dev Session. Say so;
-  do not retry. Only the session on screen can be driven.
+- `not_active_session` — a different Dev Session is active. Say so; do not retry.
+  Retained old editors on screen do not change which session is active.
 - `unknown_pane` — re-run `viewer_list`; the pane was closed or the layout moved.
 - `bad_request` — the address or argument was rejected; the message says which.
-- `unsaved_changes` — save the editor or open a separate new pane. Do not close
-  the unsaved editor to bypass the refusal.
+- `unsaved_changes` — save the active editor or use a new pane when the layout is
+  not held. Do not close the unsaved editor to bypass the refusal.
 - `timeout` / `failed` — CodeHarbor is not reachable (the user disconnected, or
   the desktop is busy). Fall back to the terminal and mention it once.
+
+If a remote-layout warning holds unsaved work, resolve that hold before trying
+another layout mutation. A **previous-workspace** warning is stricter: those old
+editors are visible/copyable but permanently detached, so Save and Reload cannot
+work. Ask the user to copy and locally close the retained documents; do not retry
+mutations or use `viewer_close` to bypass the hold. During that retention,
+`viewer_list` reports current authoritative panes with no focused pane, not the
+old visible editors.
 
 ## Shell fallback
 
@@ -85,6 +93,6 @@ CodeHarbor creates: `OMP_DEV_SESSION_ID` and `OMP_TERMINAL_ID` (which pane) and
 `CODEHARBOR_CONTROL_SOCKET` (which window owns it). A shell that was already
 running before CodeHarbor attached has none of them. Check with
 `echo "$CODEHARBOR_CONTROL_SOCKET"`; if it is empty, tell the user to start the
-agent in a fresh CodeHarbor terminal pane. The socket is never guessed — without
-it a command would risk driving a different CodeHarbor window — so a missing one
-is refused rather than worked around.
+agent in a fresh CodeHarbor terminal pane. The socket must be an absolute path
+with no NUL bytes and is never guessed — without it a command would risk driving
+a different CodeHarbor window — so a missing or malformed one is refused.

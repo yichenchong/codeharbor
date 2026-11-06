@@ -33,7 +33,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 
 import { execFileRunner, killSession, listSessions, paneActivity, SPAWN_FAILED } from "../src/tmux.ts";
 import type { CommandResult, CommandRunner } from "../src/tmux.ts";
@@ -282,5 +282,55 @@ test(
                 `killing ${JSON.stringify(candidate[0].name)} changed another session`,
             );
         }
+    },
+);
+
+test(
+    "a missing session named like an attached client cannot kill that client's session",
+    { skip: SKIP, timeout: 15_000 },
+    async (t) => {
+        const sentinel = `${SESSION}_client_fallback`;
+        t.after(async () => {
+            await runner(["kill-server"]);
+        });
+        const created = await runner([
+            "new-session", "-d", "-s", sentinel, "sleep 60",
+        ]);
+        assert.equal(created.code, 0, created.stderr);
+
+        // Control mode supplies a real attached tmux client without touching a
+        // user's tty. It still participates in cmd_find_get_session's fallback
+        // from a missing exact session name to a client name.
+        const client = spawn(
+            "tmux",
+            ["-L", SOCKET, "-f", "/dev/null", "-C", "attach-session", "-t", `=${sentinel}`],
+            { env: PRODUCTION_ENV, timeout: 10_000 },
+        );
+        t.after(() => { client.kill(); });
+        client.stderr.resume();
+        const ready = Promise.withResolvers<void>();
+        let output = "";
+        const onData = (chunk: Buffer) => {
+            output = (output + chunk.toString()).slice(-4096);
+            if (output.includes("%session-changed ")) {
+                client.stdout.removeListener("data", onData);
+                ready.resolve();
+            }
+        };
+        client.stdout.on("data", onData);
+        client.once("error", ready.reject);
+        client.once("exit", (code) => ready.reject(new Error(`control client exited: ${code}`)));
+        await ready.promise;
+        const clients = await runner(["list-clients", "-F", "#{client_name}"]);
+        assert.equal(clients.code, 0, clients.stderr);
+        const names = clients.stdout.trim().split("\n");
+        assert.equal(names.length, 1, clients.stdout);
+        assert.notEqual(names[0], sentinel);
+        await killSession({ name: names[0] }, runner);
+        assert.deepEqual(
+            (await listSessions(runner)).map((session) => session.name),
+            [sentinel],
+            "an absent session name must not resolve through an attached client",
+        );
     },
 );

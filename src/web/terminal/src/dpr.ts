@@ -27,6 +27,8 @@ export interface DevicePixelRatioWindow {
     devicePixelRatio: number;
     dispatchEvent?: (event: Event) => boolean;
     Event?: typeof Event;
+    addEventListener?: (type: "resize", listener: () => void) => void;
+    removeEventListener?: (type: "resize", listener: () => void) => void;
 }
 
 export interface DevicePixelRatioState {
@@ -65,6 +67,20 @@ export function createDevicePixelRatioController(
         overridden: false,
     };
     let overridden = false;
+    let preference = 0;
+
+    // A native screen/zoom change must update an active override even when no
+    // AppSettings notification follows it. Synthetic resize events dispatched
+    // by set() see the already-current actual value and cannot recurse.
+    const onResize = (): void => {
+        const observedActual = nativeDescriptor?.get
+            ? Number(nativeDescriptor.get.call(view))
+            : overridden ? state.actual : Number(view.devicePixelRatio);
+        if (Number.isFinite(observedActual) && observedActual > 0
+            && observedActual !== state.actual) {
+            controller.set(preference);
+        }
+    };
 
     function notifyXterm(): void {
         if (typeof view.dispatchEvent !== "function") {
@@ -78,7 +94,8 @@ export function createDevicePixelRatioController(
         get state(): DevicePixelRatioState {
             return state;
         },
-        set(preference: number): DevicePixelRatioState {
+        set(value: number): DevicePixelRatioState {
+            preference = value;
             const observedActual = nativeDescriptor?.get
                 ? Number(nativeDescriptor.get.call(view))
                 : overridden ? state.actual : Number(view.devicePixelRatio);
@@ -143,8 +160,10 @@ export function createDevicePixelRatioController(
             return state;
         },
         restore(): void {
+            view.removeEventListener?.("resize", onResize);
             controller.set(0);
         },
     };
+    view.addEventListener?.("resize", onResize);
     return controller;
 }

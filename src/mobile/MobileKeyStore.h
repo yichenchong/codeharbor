@@ -122,9 +122,9 @@ class SshConnectionPool;
 //          NSURLIsExcludedFromBackupKey (MobileKeyStoreIos.mm). Without that a
 //          saved key would be copied into iCloud and then onto every device the
 //          user restores, which is not the decision they made.
-//        * READ ON DEMAND, never held. The bytes are loaded when a connect or a
-//          keyInfo() needs them and wiped when it is done; only the NAME lives in
-//          memory between uses.
+//        * READ ON DEMAND after relaunch, rather than cached by this store.
+//          A just-saved import remains loaded until forgetSession(); the pool
+//          also retains an installed identity for authentication/reconnect.
 //
 //      The cost, stated rather than buried: the key is at rest on the device,
 //      protected by the app sandbox and the file mode and nothing else. A saved
@@ -153,6 +153,12 @@ class SshConnectionPool;
 // restore onto another device, and does NOT stop anyone who has unlocked this
 // device and can read this app's files. That is the whole of the protection, and
 // it is why saving is a per-key decision the user makes rather than a default.
+//
+// MEMORY LIMITS: explicit clearing makes credentials unavailable through this
+// store and attempts to overwrite its writable buffers. It is not secure
+// erasure: Qt implicit sharing, parsers, QML/IME, allocators and the SSH backend
+// can hold other copies. Deleting a saved file likewise unlinks it; it does not
+// promise physical erasure from flash, snapshots or filesystem recovery.
 //
 // ---------------------------------------------------------------------------
 // THREADING
@@ -267,18 +273,19 @@ public:
         return m_lastFailureAllowsSessionOnly;
     }
 
-    // Re-adopt a reference read back out of a saved profile's identityFile, so a
-    // remembered server still offers its key after a relaunch. Idempotent, and a
-    // no-op returning the existing name when this reference is already known.
+    // Re-adopt identityFile from a saved profile: a user-managed reference or an
+    // app-private saved-key path. An exact saved path retains its existing name
+    // and saved-file deletion policy, rather than creating an external alias.
+    // Idempotent for an already-known user-managed reference.
     // Returns an empty string with lastError() set for a reference this platform
     // cannot resolve — a profile copied from another device, say — which is a
     // thing to explain rather than to fail on at connect time.
     Q_INVOKABLE QString registerReference(QString reference, QString name);
 
-    // What to store in the profile's identityFile for `name`: the reference for a
-    // referenced key, and deliberately EMPTY for an in-memory import, which has
-    // nothing durable to record. This is the ONLY value that ever leaves this
-    // class for persistence, and it is never key material.
+    // What to store in the profile's identityFile for `name`: a user-managed
+    // reference or the path of an opt-in saved key. Deliberately EMPTY for a
+    // session-only import, which has nothing durable to record. This value is
+    // never key material; registerReference() recovers the same key on reload.
     Q_INVOKABLE QString referenceFor(QString name) const;
 
     // ---- path 3: saved on this device (opt-in, per key) --------------------
@@ -331,9 +338,8 @@ public:
     // and return whether that succeeded:
     //   * in-memory name -> SshConnectionPool::setInMemoryIdentity(armoured PEM)
     //   * referenced name -> resolve the reference to bytes, then the same
-    //   * saved name -> read the saved file, then the same; the bytes are wiped
-    //     again as soon as the pool has them, so a saved key is not held in
-    //     memory between connects merely because it is on the device
+    //   * saved name -> use its loaded import, or read the saved file on demand;
+    //     release the temporary after installing the pool's own identity
     //   * empty name -> clearInMemoryIdentity(); the ladder falls back to
     //     password / keyboard-interactive
     // Always clears first, so a previous attempt's key can never leak into a
@@ -369,7 +375,7 @@ public:
     //   name                  as known
     //   referenced            true for a user-managed file, false otherwise
     //   saved                 true when a copy is kept on THIS device (path 3)
-    //   reference             referenceFor() — empty unless `referenced`
+    //   reference             referenceFor() — empty for a session-only import
     //   format                "openssh-key-v1" | "pem"
     //   keyType               "ssh-ed25519", "ecdsa-sha2-nistp256", ... ; empty
     //                         for a legacy PEM, whose type is not readable

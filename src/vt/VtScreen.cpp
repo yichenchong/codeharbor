@@ -756,7 +756,7 @@ void VtScreen::eraseInDisplay(int mode)
         }
         break;
     default:
-        break;
+        return; // An unsupported erase mode must not cancel a deferred wrap.
     }
     m_pendingWrap = false;
 }
@@ -774,7 +774,7 @@ void VtScreen::eraseInLine(int mode)
         eraseCells(m_cursorY, 0, m_columns);
         break;
     default:
-        break;
+        return;
     }
     m_pendingWrap = false;
 }
@@ -1218,8 +1218,12 @@ void VtScreen::setMode(int mode, bool enable, bool privateMode)
         // The mode everything modern uses: save the cursor, switch, and start
         // from a blank alt screen; on the way out, restore both.
         if (enable) {
-            saveCursor();
-            enterAltScreen(true);
+            // Already-active entry is a no-op, including the alt buffer's
+            // independently saved cursor; saving here would overwrite DECSC.
+            if (!m_altActive) {
+                saveCursor();
+                enterAltScreen(true);
+            }
         } else {
             leaveAltScreen();
             restoreCursor();
@@ -1287,6 +1291,7 @@ void VtScreen::saveCursor()
     slot.bg = m_bg;
     slot.valid = true;
     slot.pendingWrap = m_pendingWrap;
+    slot.autowrap = m_autowrap;
 }
 
 void VtScreen::restoreCursor()
@@ -1303,6 +1308,7 @@ void VtScreen::restoreCursor()
     m_attrs = slot.attrs;
     m_fg = slot.fg;
     m_bg = slot.bg;
+    m_autowrap = slot.autowrap;
     moveCursor(slot.x, slot.y);
     m_pendingWrap = slot.pendingWrap && m_autowrap && m_cursorX == m_columns - 1;
 }

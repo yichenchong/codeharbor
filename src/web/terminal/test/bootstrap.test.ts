@@ -48,3 +48,40 @@ test("a failed channel handshake shows an error and permits another connection",
         dom.window.close();
     }
 });
+
+test("page teardown cancels a pending handshake without retiring its replacement", () => {
+    const dom = new JSDOM('<div id="preview">waiting</div>', { runScripts: "outside-only" });
+    try {
+        const callbacks: Array<(channel: { objects: Record<string, unknown> }) => void> = [];
+        Object.assign(dom.window, {
+            qt: { webChannelTransport: {} },
+            QWebChannel: class {
+                constructor(_transport: unknown,
+                    connected: (channel: { objects: Record<string, unknown> }) => void) {
+                    callbacks.push(connected);
+                }
+            },
+        });
+        const module = dom.window.eval(`${bundle}\nterminalModule;`) as typeof TerminalPage;
+        const root = dom.window.document.getElementById("preview")!;
+        module.connectTerminal(root);
+        assert.equal(callbacks.length, 1);
+
+        dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+        module.connectTerminal(root);
+        assert.equal(callbacks.length, 2, "teardown releases the old pending handshake");
+
+        callbacks[0]({ objects: {} });
+        assert.equal(root.textContent, "waiting",
+            "a retired handshake must not mount or replace the new page's content");
+        module.connectTerminal(root);
+        assert.equal(callbacks.length, 2,
+            "the retired callback must not clear its replacement's connection guard");
+
+        callbacks[1]({ objects: {} });
+        assert.equal(root.querySelector(".ch-terminal-status")?.getAttribute("data-state"), "error",
+            "the current handshake still handles its own missing bridge");
+    } finally {
+        dom.window.close();
+    }
+});

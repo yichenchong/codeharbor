@@ -19,7 +19,7 @@ provides:
 | --- | --- |
 | `viewer_list` | pane ids, what each shows, which has focus |
 | `viewer_open` | show a file / directory / URL in a pane, optionally a new one |
-| `viewer_split` | split a pane, leaving both halves as they were |
+| `viewer_split` | keep the existing pane and add an empty pane; return the new pane id |
 | `viewer_focus` | make a pane the active one |
 | `viewer_close` | close a pane |
 | `viewer_reload` | re-fetch what a pane is showing |
@@ -41,8 +41,9 @@ provides:
 
 ## Rules
 
-- **`viewer_list` before naming a pane.** Ids look like `viewer-1`, are per Dev
-  Session, and are recycled; omitting `pane` targets the focused pane.
+- **`viewer_list` before naming a pane.** Ids look like `viewer-1` and are per Dev
+  Session; use the current list, not an invented or stale id. Omitting `pane`
+  targets the focused pane.
 - **`viewer_open` with `newPane: true`** when the user should see the new thing
   alongside what is already open.
 - **Never close a pane you did not open** without asking: `viewer_close` does not
@@ -54,11 +55,19 @@ provides:
 
 ## Refusal codes
 
-`not_active_session` (the user is looking at a different Dev Session — say so, do
-not retry; only the session on screen can be driven), `unknown_pane` (re-list),
-`busy` (too many commands in flight — slow down), `bad_request` (the message names
-the bad field), `unsaved_changes` (save the editor or open a separate new pane;
-do not close it to bypass the refusal), `timeout` / `failed` (CodeHarbor is not reachable).
+`not_active_session` (a different Dev Session is active — say so, do not retry),
+`unknown_pane` (re-list), `busy` (too many commands in flight — slow down),
+`bad_request` (the message names the bad field), `unsaved_changes` (save the active
+editor or use a new pane when the layout is not held; do not close it to bypass
+the refusal), `timeout` / `failed` (CodeHarbor is not reachable).
+
+If a remote-layout warning holds unsaved work, resolve that hold before trying
+another layout mutation. A **previous-workspace** warning is stricter: those old
+editors are visible/copyable but permanently detached, so Save and Reload cannot
+work. Ask the user to copy and locally close the retained documents; do not retry
+mutations or use `viewer_close` to bypass the hold. During that retention,
+`viewer_list` reports current authoritative panes with no focused pane, not the
+old visible editors.
 
 ## Shell fallback
 
@@ -80,9 +89,9 @@ CodeHarbor creates (`TerminalController::tmuxNewSessionCommand`):
 `CODEHARBOR_CONTROL_SOCKET` says which CodeHarbor window owns it. A shell that was
 already running before CodeHarbor attached to its tmux session has none of them.
 Check with `echo "$CODEHARBOR_CONTROL_SOCKET"`; if empty, ask the user to start the
-agent in a fresh CodeHarbor terminal pane. The socket is never derived: several
-windows each have their own, and guessing would drive the wrong one, so a missing
-value is refused instead.
+agent in a fresh CodeHarbor terminal pane. The socket must be an absolute path
+with no NUL bytes and is never derived: several windows each have their own, and
+guessing would drive the wrong one, so a missing or malformed value is refused.
 
 ## How it works, if you need to debug it
 

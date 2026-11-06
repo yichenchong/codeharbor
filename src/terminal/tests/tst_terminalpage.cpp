@@ -57,6 +57,7 @@
 #include <QQmlEngine>
 #include <QStandardPaths>
 #include <QString>
+#include <QTemporaryDir>
 #include <QUrl>
 #include <QScopeGuard>
 #include <QSignalSpy>
@@ -78,6 +79,13 @@ namespace {
 // Chromium's first start (zygote + renderer) is slow on a cold cache.
 constexpr int kPageLoadTimeoutMs = 60000;
 constexpr int kProbeTimeoutMs = 20000;
+
+QString privateProfileRoot(const QTemporaryDir& directory)
+{
+    if (!directory.isValid())
+        qFatal("could not create private terminal browser profile storage");
+    return directory.path();
+}
 
 // Thin host: it owns nothing but a Loader, because the pane under test is the
 // REAL src/qml/TerminalPaneView.qml from the CodeHarbor module's qrc — the same
@@ -770,7 +778,8 @@ private:
     void closeTerminalMenu();
 
     ch::CodeharbordClient m_client;
-    ch::ViewerProfiles m_profiles{&m_client};
+    QTemporaryDir m_profileDirectory;
+    ch::ViewerProfiles m_profiles{&m_client, privateProfileRoot(m_profileDirectory)};
     ch::ViewerModel m_viewers{&m_client};
     // Disconnected for the renderer tests, so attach() refuses and the pane
     // shows its "not connected" chrome — exactly what a user sees before a
@@ -1247,7 +1256,9 @@ void TstTerminalPage::rightClickSendsNothingToTheRemoteSide()
     QVERIFY(waitForRendererInputTransport());
 
     m_controller->ingestOutput(QByteArrayLiteral("\x1b[?1000h"));
-    QTest::qWait(500);
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsMenuState), QStringLiteral("|mouse=vt200"),
+                       kProbeTimeoutMs),
+             "mouse reporting never became active, so no remote report could be expected");
 
     const QString reply = evalJs(QString::fromLatin1(kJsComparePresses));
     qInfo().noquote() << "presses seen at the document (reached,cancelled):" << reply;
@@ -1390,7 +1401,8 @@ void TstTerminalPage::copyShortcutReachesTheSystemClipboard()
     QVERIFY2(clipboard != nullptr, "this platform has no clipboard");
     const QString marker = QStringLiteral("copy-shortcut-marker-5150");
     m_controller->ingestOutput(marker.toUtf8() + QByteArrayLiteral("\r\n"));
-    QTest::qWait(300);
+    QVERIFY2(waitForJs(QString::fromLatin1(kJsScreenText), marker, kProbeTimeoutMs),
+             "the copy marker never reached the terminal buffer");
     // A sentinel rather than an empty clipboard: "the marker is not there" is
     // also true of a copy that silently wrote nothing at all.
     const QString sentinel = QStringLiteral("clipboard-untouched-sentinel");

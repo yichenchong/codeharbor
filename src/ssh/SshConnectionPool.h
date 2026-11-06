@@ -541,6 +541,8 @@ signals:
     void sessionClosing();
 
 private:
+    friend class SshConnectionPoolTestAccess;
+    friend class SshChannelDevice;
     void clearDiagnostics();
     void appendDiagnostic(const QString& message);
     void setState(State next);
@@ -551,6 +553,9 @@ private:
     bool authenticate(const QString& user, const QString& configIdentityFile);
     QString authenticationFailure() const;
     void closeSession();
+    // A discovered transport loss changes state without discarding unread
+    // channel bytes. Normal disconnect/reconnect still owns session teardown.
+    void refreshConnectionState();
 #endif
     // Whether the libssh session an in-flight handshake was using has already
     // been freed — asked by applyHostKeyPolicy(), which is compiled in BOTH
@@ -609,11 +614,12 @@ private:
     // accepted, the server also wants X" instead of a flat "authentication
     // failed". Method NAMES only: no secret is ever recorded here.
     QStringList m_partialMethods;
-    // Whether the server of the most recent handshake offered public-key
-    // authentication at all. Without it authenticationFailure() would lecture the
-    // user about ssh-agent and identity files on a password-only server, where no
-    // key was ever sent.
-    bool m_publicKeyOffered = false;
+    // A failed initial "none" request tells us nothing about the server's
+    // methods. Once learned, retain all supported methods it offered during
+    // this attempt so failure advice never invents a password-only server or
+    // key attempts that did not happen.
+    bool m_authMethodsKnown = false;
+    AuthMethods m_authMethodsOffered;
 #endif
 };
 

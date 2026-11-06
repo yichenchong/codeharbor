@@ -57,6 +57,15 @@ Item {
             root.service.forgetImage(paths[i]);
     }
 
+    // Loader deletes an outgoing page later. Retire its ownership before a
+    // replacement can request this same path; destruction must then be inert.
+    function deactivate() {
+        root.started = false;
+        root.imageSource = "";
+        root.loading = false;
+        root.releaseBytes();
+    }
+
     function reload() {
         root.releaseBytes();
         root.errorText = "";
@@ -83,7 +92,7 @@ Item {
         root.reload();
     }
 
-    Component.onDestruction: root.releaseBytes()
+    Component.onDestruction: root.deactivate()
 
     Connections {
         target: root.service

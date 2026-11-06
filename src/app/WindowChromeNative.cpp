@@ -35,8 +35,8 @@ WindowChromeNative::~WindowChromeNative()
 void WindowChromeNative::registerMaximizeButton(QObject *window, QObject *button)
 {
 #ifdef Q_OS_WIN
-    auto *nextWindow = qobject_cast<QWindow *>(window);
-    auto *nextButton = qobject_cast<QQuickItem *>(button);
+    const QPointer<QWindow> nextWindow = qobject_cast<QWindow *>(window);
+    const QPointer<QQuickItem> nextButton = qobject_cast<QQuickItem *>(button);
     if (!nextWindow || !nextButton) {
         clear();
         return;
@@ -47,7 +47,10 @@ void WindowChromeNative::registerMaximizeButton(QObject *window, QObject *button
         return;
     }
 
+    const QPointer<WindowChromeNative> guard(this);
     clear();
+    if (!guard || !nextWindow || !nextButton || m_window || m_button)
+        return;
     m_window = nextWindow;
     m_button = nextButton;
     // Watch the window itself, not just the message queue: the handle cached on
@@ -66,7 +69,9 @@ void WindowChromeNative::registerMaximizeButton(QObject *window, QObject *button
 void WindowChromeNative::clear()
 {
 #ifdef Q_OS_WIN
-    setNativeButtonState(false, false);
+    // Detach before writing QML properties: their change handlers may destroy
+    // the button, re-register another one, or tear down this helper.
+    const QPointer<QQuickItem> button = m_button;
     if (m_window)
         m_window->removeEventFilter(this);
     m_window = nullptr;
@@ -74,6 +79,10 @@ void WindowChromeNative::clear()
     m_hwnd = nullptr;
     m_stylesInstalled = false;
     m_nativeDown = false;
+    if (button)
+        button->setProperty("nativeHovered", false);
+    if (button)
+        button->setProperty("nativeDown", false);
 #endif
 }
 
@@ -141,10 +150,11 @@ bool WindowChromeNative::eventFilter(QObject *watched, QEvent *event)
             // Dropping m_stylesInstalled with it matters too: the hit-test
             // answers HTCLIENT on the strength of that flag, and a window with
             // no surface has no styles installed on anything.
-            setNativeButtonState(false, false);
             m_hwnd = nullptr;
             m_stylesInstalled = false;
             m_nativeDown = false;
+            if (!setNativeButtonState(false, false))
+                return false;
             break;
         case QPlatformSurfaceEvent::SurfaceCreated:
             // The surface exists by now, so winId() inside installShellStyles()
@@ -152,7 +162,8 @@ bool WindowChromeNative::eventFilter(QObject *watched, QEvent *event)
             // window does not carry the shell styles either, so re-caching the
             // handle and re-applying them is one call.
             installShellStyles(m_window);
-            setNativeButtonState(false, false);
+            if (!setNativeButtonState(false, false))
+                return false;
             break;
         }
     }
@@ -179,16 +190,21 @@ QRect WindowChromeNative::maximizeButtonRect() const
     return QRect(topLeft, size);
 }
 
-void WindowChromeNative::setNativeButtonState(bool hovered, bool down)
+bool WindowChromeNative::setNativeButtonState(bool hovered, bool down)
 {
-    if (!m_button)
-        return;
+    const QPointer<WindowChromeNative> guard(this);
+    const QPointer<QQuickItem> button = m_button;
+    if (!button)
+        return true;
 
     // The native hit-test takes the pointer outside QML's normal mouse event
-    // path. These explicit states preserve the same hover/pressed appearance
-    // and leave the real AbstractButton signal as the one action route.
-    m_button->setProperty("nativeHovered", hovered);
-    m_button->setProperty("nativeDown", down);
+    // path. Property notifications still run synchronously and may destroy
+    // either participant or register a replacement button.
+    button->setProperty("nativeHovered", hovered);
+    if (!guard || !button || m_button != button)
+        return false;
+    button->setProperty("nativeDown", down);
+    return guard && button && m_button == button;
 }
 
 bool WindowChromeNative::nativeEventFilter(const QByteArray &eventType, void *message,
@@ -209,7 +225,8 @@ bool WindowChromeNative::nativeEventFilter(const QByteArray &eventType, void *me
         const POINT screenPoint{GET_X_LPARAM(msg->lParam), GET_Y_LPARAM(msg->lParam)};
         const bool inMaximizeButton = maximizeButtonRect().contains(
             QPoint(screenPoint.x, screenPoint.y));
-        setNativeButtonState(inMaximizeButton, m_nativeDown);
+        if (!setNativeButtonState(inMaximizeButton, m_nativeDown))
+            return false;
 
         if (inMaximizeButton) {
             // HTMAXBUTTON is what makes the Windows 11 Snap Layouts flyout
@@ -254,7 +271,8 @@ bool WindowChromeNative::nativeEventFilter(const QByteArray &eventType, void *me
             return false;
         const bool clicked = msg->wParam == HTMAXBUTTON;
         m_nativeDown = false;
-        setNativeButtonState(false, false);
+        if (!setNativeButtonState(false, false))
+            return true;
         if (clicked)
             QMetaObject::invokeMethod(m_button, "clicked", Qt::DirectConnection);
         return true;
@@ -263,7 +281,8 @@ bool WindowChromeNative::nativeEventFilter(const QByteArray &eventType, void *me
         if (msg->wParam != HTMAXBUTTON)
             return false;
         m_nativeDown = false;
-        setNativeButtonState(false, false);
+        if (!setNativeButtonState(false, false))
+            return true;
         QMetaObject::invokeMethod(m_button, "clicked", Qt::DirectConnection);
         return true;
     default:

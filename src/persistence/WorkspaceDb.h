@@ -185,7 +185,8 @@ struct UpdateTerminalPaneParams {
 // one. Concretely, a result that is not the expected JSON kind (an object per
 // record, an array for list()), a present record member of the wrong type or an
 // out-of-int-range/fractional position, an acknowledgement without boolean
-// `ok:true`, and, for getLayout/setLayout, a SessionLayout row whose `tree` is
+// `ok:true`, a resolveTerminalPane reply for another row/server/session,
+// and, for getLayout/setLayout, a SessionLayout row whose `tree` is
 // missing or fails split-tree validation. getLayout is the sole
 // method for which a JSON null result is legitimate — it means "this region has
 // no persisted layout" and delivers std::nullopt with no error. An existing but
@@ -217,8 +218,9 @@ public:
     // v3's UNIQUE (dev_session_id, name): a slot label is not an identity, and
     // a closed pane keeps its row and its label while a new pane takes the same
     // label. 5 adds the server-owned Dev Session pinned bit with a false
-    // default for every existing row.
-    static constexpr int kSchemaVersion = 5;
+    // default for every existing row. 6 repairs legacy constraints left behind
+    // in databases upgraded before the corrected v4 migration.
+    static constexpr int kSchemaVersion = 6;
 
     using ListCallback =
         std::function<void(QVector<GroupNode>, std::optional<RpcError>)>;
@@ -314,6 +316,9 @@ public:
     // wins when both are, and only it is sent. Setting NEITHER is refused HERE,
     // with -32602 and no request on the wire. It used to go out as an empty
     // `name`, asking the server to look up — or create — a pane called "".
+    // A successful reply must match the requested server/session and row id
+    // (or legacy slot name). A mismatched or missing identity fails with -32603
+    // instead of authorizing attachment to another pane's remote shell.
     void resolveTerminalPane(const ResolveTerminalPaneParams& params,
                              TerminalPaneCallback cb);
     void updateTerminalPane(const UpdateTerminalPaneParams& params,

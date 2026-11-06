@@ -274,6 +274,7 @@ private slots:
     void transportChangingRebindSkipsTheSupersededDrain();
     void transportChangingDeletionStillFailsOldRequests();
     void transportClosedGenerationIdentifiesASupersededLoss();
+    void transportBoundGenerationPreventsDuplicatePeerInitialization();
     void transportChangingDefersSynchronousIngressUntilInvalidationFinishes();
     void transportChangingDefersEofWithoutLosingItsFinalResponse();
     void rebindDuringReadDiscardsTheOldChunk();
@@ -300,6 +301,47 @@ private:
     CodeharbordClient* m_client = nullptr;
     static int s_seq;
 };
+
+void TstRpcClient::transportBoundGenerationPreventsDuplicatePeerInitialization()
+{
+    ScriptedDevice original;
+    ScriptedDevice intermediate;
+    ScriptedDevice replacement;
+    m_client->setTransport(&original);
+    int completions = 0;
+    const auto teardown = qScopeGuard([&] { m_client->setTransport(nullptr); });
+    connect(m_client, &CodeharbordClient::transportBound, m_client,
+            [&](quint64) {
+                if (m_client->transport() == &intermediate)
+                    m_client->setTransport(&replacement);
+            });
+
+    connect(m_client, &CodeharbordClient::transportBound, m_client,
+            [&](quint64 generation) {
+                if (generation != m_client->transportGeneration())
+                    return;
+                m_client->call(QStringLiteral("workspace.list"), QJsonObject{},
+                               [&](QJsonValue result, std::optional<RpcError> error) {
+                                   QVERIFY(!error.has_value());
+                                   QVERIFY(result.isArray());
+                                   ++completions;
+                               });
+            });
+    m_client->setTransport(&intermediate);
+
+    QVERIFY(intermediate.takeWritten().isEmpty());
+    const QByteArray requests = replacement.takeWritten();
+    const QList<QByteArray> lines = requests.split('\n');
+    QCOMPARE(lines.size(), 2); // one request and its trailing delimiter
+    const QJsonObject request = QJsonDocument::fromJson(lines.first()).object();
+    QCOMPARE(request.value(QStringLiteral("method")).toString(),
+             QStringLiteral("workspace.list"));
+    replacement.deliver(jsonLine({{"jsonrpc", "2.0"},
+                                  {"id", request.value(QStringLiteral("id"))},
+                                  {"result", QJsonArray{}}}));
+    QCOMPARE(completions, 1);
+    QCOMPARE(m_client->pendingCount(), 0);
+}
 
 void TstRpcClient::rebindDuringReadDiscardsTheOldChunk()
 {

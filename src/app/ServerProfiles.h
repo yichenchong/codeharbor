@@ -196,7 +196,7 @@ signals:
     // bury its own message.
     //
     // Emitted after the write and after the lock is released, so a handler may
-    // safely mutate the store again.
+    // safely mutate or destroy the store. Destruction stops later notifications.
     void saveDegraded(QString reason);
     // Persistence failed. The in-memory list is still usable, but these edits
     // have not been confirmed on disk. Emitted after releasing the merge lock;

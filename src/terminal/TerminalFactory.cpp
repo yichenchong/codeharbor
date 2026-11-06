@@ -46,6 +46,19 @@ constexpr int kDefaultRows = 24;
 // one-shot object is reclaimed regardless.
 constexpr int kKillWatchdogMs = 30000;
 
+QString resolutionKey(const QString& kind, const QString& devSessionId, const QString& identity)
+{
+    // Length-frame opaque values, and namespace the addressing modes. Neither
+    // slashes nor prefix-looking data can collapse two different lookups.
+    return kind + QLatin1Char(':') + QString::number(devSessionId.size())
+        + QLatin1Char(':') + devSessionId + identity;
+}
+
+QString rowKey(const QString& devSessionId, const QString& terminalId)
+{
+    return resolutionKey(QStringLiteral("row"), devSessionId, terminalId);
+}
+
 } // namespace
 
 namespace ch {
@@ -374,8 +387,7 @@ QString TerminalFactory::tmuxKillSessionCommand(const QString& target)
 
 QString TerminalFactory::paneKey(const QString& devSessionId, const QString& paneName)
 {
-    // `/` cannot appear in a UUID, so no pair of ids can collide on it.
-    return devSessionId + QLatin1Char('/') + paneName;
+    return resolutionKey(QStringLiteral("legacy"), devSessionId, paneName);
 }
 
 void TerminalFactory::setWorkspace(WorkspaceDb* workspace)
@@ -502,11 +514,13 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
 
     const ResolveTerminalPaneParams params =
         resolveParamsFor(m_serverId, devSessionId, paneName, terminalPaneId, workingDir);
-    // The row id when the leaf has one, the legacy slot address otherwise. Two
-    // shapes in one map is safe: a UUID contains no "/", so no row id can ever
-    // read as a "<devSession>/<label>" pair.
+    // Row lookups are scoped by Dev Session on the server; the cache and
+    // single-flight key must retain that scope too. Otherwise a stale layout
+    // carrying another session's row id can bypass the server's ownership gate.
+    // Addressing modes have distinct namespaces and opaque ids are length-framed.
     const bool byRow = !params.id.value.isEmpty();
-    const QString key = byRow ? params.id.value : paneKey(devSessionId, paneName);
+    const QString key = byRow ? rowKey(devSessionId, params.id.value)
+                              : paneKey(devSessionId, paneName);
     // Record which resolution this pane is now waiting on. NOTHING about its
     // agent-status identity is decided here: the pane's identity comes from
     // the server's ANSWER, and it is adopted in finishResolution() only if
@@ -650,7 +664,7 @@ bool TerminalFactory::resolveTarget(TerminalController* controller,
                 // Remember the answer under the row id too, so the backfill
                 // this is about to trigger does not make the next attach pay
                 // for a second round trip under the new key.
-                self->m_resolved.insert(answer.terminalId, answer);
+                self->m_resolved.insert(rowKey(answer.devSessionId, answer.terminalId), answer);
             }
             self->finishResolution(key, answer.target, QString());
             // AFTER the waiters have their target: the backfill republishes the

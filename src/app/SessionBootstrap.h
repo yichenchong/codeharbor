@@ -122,8 +122,9 @@ public:
     // `repoRoot` no longer has to EXIST: when it holds no usable service, the
     // client installs one there before wiring anything (see
     // ensureRemoteService()). Installing requires an absolute directory other
-    // than the filesystem root, including its dot/parent-path aliases. Node.js
-    // on the server is still a prerequisite nothing here can install.
+    // than the filesystem root, including dot/parent-path and remote symlink
+    // aliases. Node.js on the server is still a prerequisite nothing here can
+    // install.
     bool connectAndWire(const QString& host, quint16 port, const QString& user,
                         const QString& nodePath, const QString& repoRoot,
                         const QString& identityFile = QString());
@@ -278,7 +279,8 @@ public:
     // Marker-less installs are included on purpose, and only here. The connect
     // path never overwrites a directory a person populated by hand, because
     // nobody asked it to; this is the user asking, for one attempt. The one
-    // location still refused is a git checkout — see ensureRemoteService().
+    // location still refused is one running a source-checkout entry point —
+    // see ensureRemoteService().
     void requestRemoteUpgrade();
     // Drop an armed request that will never be spent (the connect chain it was
     // made for ended without reaching the install).
@@ -341,6 +343,8 @@ public:
     // Kernel ownership covers recovery too and disappears after the final
     // process holding it exits. The persistent .codeharbor-provision.lock file
     // must not be removed; using an existing service needs no flock.
+    // Scratch and release-marker symlinks/special files are refused before
+    // recovery or marker writes can follow them outside the installation.
     //
     // Unpacking straight over the live installation was the original design,
     // and it is what turned a failed update into a lost workspace: a truncated
@@ -468,6 +472,8 @@ protected:
     // stderr. stdout lines beginning "codeharbor: " are republished through
     // provisioning() AS THEY ARRIVE, which is the only reason this waits on an
     // event loop instead of blocking.
+    // Collected stdout is capped at 1 MiB (larger reports fail and close the
+    // channel); only the final 64 Ki characters of diagnostics are retained.
     //
     // A test seam for the same reason connectPool() is one: the provisioning
     // decision tree has to be drivable with canned server answers, and there is

@@ -463,14 +463,15 @@ QString MobileAppController::storeProfile(const QVariantMap& profile)
     return id;
 }
 
-void MobileAppController::connectToServer(QVariantMap profile)
+QString MobileAppController::connectToServer(QVariantMap profile)
 {
     const QString id = storeProfile(profile);
     if (id.isEmpty())
-        return;
+        return {};
 
     m_app->serverProfiles()->setActiveId(id);
     m_app->connectToProfile(id);
+    return id;
 }
 
 QString MobileAppController::saveServer(QVariantMap profile)

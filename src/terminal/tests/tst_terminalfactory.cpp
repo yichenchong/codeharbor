@@ -18,6 +18,7 @@
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
+#include <QHash>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -37,6 +38,7 @@
 #include <QTemporaryDir>
 
 #include <limits>
+#include <optional>
 
 #include "AgentStatusMonitor.h"
 #include "CodeharbordClient.h"
@@ -182,18 +184,25 @@ public:
             return {};
         const QByteArray line = m_pending.left(newline);
         m_pending.remove(0, newline + 1);
-        return QJsonDocument::fromJson(line).object();
+        const QJsonObject request = QJsonDocument::fromJson(line).object();
+        m_requestServers.insert(
+            request.value(QStringLiteral("id")).toInt(),
+            request.value(QStringLiteral("params")).toObject()
+                .value(QStringLiteral("serverId")).toString());
+        return request;
     }
 
     // Answer request `id` with one `terminal_panes` row, in the wire shape
-    // remote/src/workspace.ts returns.
+    // remote/src/workspace.ts returns. Server ownership comes from the captured
+    // request, not the factory's current peer; an explicit override still lets
+    // a negative test construct a foreign or malformed reply.
     void answerWithRow(int id, const QString& rowId, const QString& devSessionId,
                        const QString& name, const QString& tmuxTarget,
-                       const QString& harness)
+                       const QString& harness, std::optional<QString> serverId = std::nullopt)
     {
         const QJsonObject row{
             {QStringLiteral("id"), rowId},
-            {QStringLiteral("serverId"), QStringLiteral("srv-1")},
+            {QStringLiteral("serverId"), serverId.value_or(m_requestServers.value(id))},
             {QStringLiteral("devSessionId"), devSessionId},
             {QStringLiteral("name"), name},
             {QStringLiteral("workingDirectory"), QStringLiteral("/repo")},
@@ -241,6 +250,7 @@ private:
     CodeharbordClient m_client;
     WorkspaceDb m_db{&m_client};
     QByteArray m_pending;
+    QHash<int, QString> m_requestServers;
 };
 
 int asInt(AgentState state) { return static_cast<int>(state); }
@@ -321,6 +331,8 @@ private slots:
     void newTmuxChildrenUseCurrentEndpointsWithoutInheritedCapabilities();
     void paneKeysAddressOneSlotOfOneDevSession();
     void resolveAddressesAPaneByItsRowIdAndNeverByItsLabel();
+    void rowResolutionRetainsItsDevSessionScope_data();
+    void rowResolutionRetainsItsDevSessionScope();
     void detachAndKillWithoutAnAttachmentAreNoOps();
     void killCommandQuotesAdversarialTargets();
     void attachCommandQuotesAdversarialIdsAndWorkingDir();
@@ -952,8 +964,8 @@ if (!inherited.agent && !inherited.control) {
         factory.setControlSocket(stage == 0 ? firstControlPath : secondControlPath);
         if (stage == 0) {
             QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
-            QVERIFY(factory.resolveTarget(controller, QStringLiteral("s1"), QString(),
-                                          QStringLiteral("row-A"), fixture.path()));
+            QVERIFY(factory.resolveTarget(controller, advertisedDev, QString(),
+                                          advertisedTerminal, fixture.path()));
             const QJsonObject request = rpc.takeRequest();
             QVERIFY(!request.isEmpty());
             rpc.answerWithRow(request.value(QStringLiteral("id")).toInt(),
@@ -1086,21 +1098,14 @@ if (!inherited.agent && !inherited.control) {
 // addresses could collapse onto one cache entry.
 void TstTerminalFactory::paneKeysAddressOneSlotOfOneDevSession()
 {
-    QCOMPARE(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1")),
-             QStringLiteral("dev-a/terminal-1"));
     QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1"))
             != TerminalFactory::paneKey(QStringLiteral("dev-b"), QStringLiteral("terminal-1")));
     QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-1"))
             != TerminalFactory::paneKey(QStringLiteral("dev-a"), QStringLiteral("terminal-10")));
-    // The join is unambiguous because of what the LEFT half is, not because of
-    // any escaping: a Dev Session id is a server-minted UUID, so it cannot
-    // contain the separator and the key can only be cut in one place. Pinned
-    // here so a future key format keeps that property in mind.
-    const QString devSessionId = QStringLiteral("2f1c9a30-4c1b-4e3e-8d0e-6a1f9b2c3d4e");
-    QVERIFY(!devSessionId.contains(QLatin1Char('/')));
-    QCOMPARE(TerminalFactory::paneKey(devSessionId, QStringLiteral("terminal-1"))
-                 .left(devSessionId.size()),
-             devSessionId);
+    QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev/a"), QStringLiteral("b"))
+            != TerminalFactory::paneKey(QStringLiteral("dev"), QStringLiteral("a/b")));
+    QVERIFY(TerminalFactory::paneKey(QStringLiteral("dev:4"), QStringLiteral(":slot"))
+            != TerminalFactory::paneKey(QStringLiteral("dev"), QStringLiteral(":4:slot")));
 }
 
 // THE fix, stated as a contract. A layout leaf that carries a `terminal_panes`
@@ -2080,6 +2085,80 @@ void TstTerminalFactory::aPaneReportsItsOutputUnderTheRowIdTheServerAnswered()
     // recycled by closed panes, which is why it is never an identity.
     QCOMPARE(monitor.stateFor(QStringLiteral("s1"), QStringLiteral("terminal-1")),
              asInt(AgentState::Unknown));
+}
+
+void TstTerminalFactory::rowResolutionRetainsItsDevSessionScope_data()
+{
+    QTest::addColumn<bool>("cached");
+    QTest::addColumn<QString>("firstSession");
+    QTest::addColumn<QString>("firstRow");
+    QTest::addColumn<QString>("secondSession");
+    QTest::addColumn<QString>("secondRow");
+    QTest::newRow("in-flight") << false << QStringLiteral("s1") << QStringLiteral("row-A")
+                              << QStringLiteral("s2") << QStringLiteral("row-A");
+    QTest::newRow("cached") << true << QStringLiteral("s1") << QStringLiteral("row-A")
+                           << QStringLiteral("s2") << QStringLiteral("row-A");
+    QTest::newRow("opaque-in-flight") << false << QStringLiteral("s1/segment")
+                                     << QStringLiteral("row-A") << QStringLiteral("s1")
+                                     << QStringLiteral("segment/row-A");
+    QTest::newRow("opaque-cached") << true << QStringLiteral("s1/segment")
+                                  << QStringLiteral("row-A") << QStringLiteral("s1")
+                                  << QStringLiteral("segment/row-A");
+}
+
+void TstTerminalFactory::rowResolutionRetainsItsDevSessionScope()
+{
+    QFETCH(bool, cached);
+    QFETCH(QString, firstSession);
+    QFETCH(QString, firstRow);
+    QFETCH(QString, secondSession);
+    QFETCH(QString, secondRow);
+    RpcPair rpc;
+    QVERIFY(rpc.start());
+    OfflineFactory factory(nullptr);
+    factory.setWorkspace(rpc.db());
+    factory.setServerId(QStringLiteral("srv-1"));
+    factory.setWorkspaceReady(true);
+    auto* first = factory.create();
+    auto* second = factory.create();
+    QSignalSpy resolved(&factory, &TerminalFactory::targetResolved);
+
+    QVERIFY(factory.resolveTarget(first, firstSession, QStringLiteral("terminal-1"),
+                                  firstRow, QStringLiteral("/repo")));
+    const QJsonObject firstRequest = rpc.takeRequest();
+    QVERIFY(!firstRequest.isEmpty());
+    const auto answerFirst = [&]() {
+        rpc.answerWithRow(firstRequest.value(QStringLiteral("id")).toInt(),
+                          firstRow, firstSession,
+                          QStringLiteral("terminal-1"), QStringLiteral("ch_s1_row-A"), QString());
+    };
+    if (cached) {
+        answerFirst();
+        QTRY_COMPARE(resolved.count(), 1);
+    }
+
+    // A stale layout can carry the same row id after switching Dev Sessions.
+    // The server must decide whether that row belongs to this new context,
+    // even when the previous context already has a cached or in-flight answer.
+    QVERIFY(factory.resolveTarget(second, secondSession, QStringLiteral("terminal-1"),
+                                  secondRow, QStringLiteral("/repo")));
+    const QJsonObject secondRequest = rpc.takeRequest();
+    QVERIFY2(!secondRequest.isEmpty(), "the old context bypassed the server ownership check");
+    QCOMPARE(secondRequest.value(QStringLiteral("params")).toObject()
+                 .value(QStringLiteral("devSessionId")).toString(), secondSession);
+    if (!cached) {
+        answerFirst();
+        QTRY_COMPARE(resolved.count(), 1);
+    }
+    QCOMPARE(qvariant_cast<TerminalController*>(resolved.at(0).at(0)), first);
+    QCOMPARE(resolved.at(0).at(1).toString(), QStringLiteral("ch_s1_row-A"));
+    rpc.answerWithError(secondRequest.value(QStringLiteral("id")).toInt(),
+                        QStringLiteral("terminal does not belong to this Dev Session"));
+    QTRY_COMPARE(resolved.count(), 2);
+    QCOMPARE(qvariant_cast<TerminalController*>(resolved.at(1).at(0)), second);
+    QVERIFY(resolved.at(1).at(1).toString().isEmpty());
+    QVERIFY(!factory.attach(second, QStringLiteral("ch_s1_row-A"),
+                            QStringLiteral("/repo"), 80, 24));
 }
 
 // The BACKFILL half of the same answer, and specifically what happens the

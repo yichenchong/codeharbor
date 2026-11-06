@@ -12,6 +12,7 @@ import { isResourceLimit } from "../src/files.ts";
 import {
     applyConnectionPragmas,
     closeDefaultWorkspace,
+    type GroupNode,
     isDatabaseBusy,
     MAX_LAYOUT_TREE_BYTES,
     openWorkspace,
@@ -4610,5 +4611,588 @@ test("deleting a pane from an exact-cap layout preserves geometry when normalize
         );
     } finally {
         ws.close();
+    }
+});
+
+test("migration rejects invalid stored schema versions without advancing or altering the database", async (t) => {
+    for (const legacyV1 of [false, true]) {
+        for (const invalid of ["not-a-version", "no such table", 4.5, -1]) {
+            await t.test(`${legacyV1 ? "v1" : "current"} schema with version ${String(invalid)}`, async () => {
+                const dbPath = await tmpDbPath();
+                try {
+                    const fixture = openWorkspace(dbPath);
+                    seed(fixture);
+                    if (legacyV1) {
+                        downgradeToV2(fixture);
+                        fixture.db.exec("DROP TABLE server_identity");
+                        fixture.db.exec("DROP INDEX idx_dev_sessions_group_pinned");
+                        fixture.db.exec("ALTER TABLE dev_sessions DROP COLUMN pinned");
+                    }
+                    fixture.db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(invalid);
+                    const schemaSql = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+                    const originalSchema = fixture.db.prepare(schemaSql).all();
+                    const originalRows = [
+                        "groups", "dev_sessions", "viewer_panes", "terminal_panes", "session_layouts",
+                    ].map((table) => ({
+                        table,
+                        rows: fixture.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all(),
+                    }));
+                    fixture.close();
+
+                    // Close an unexpectedly accepted workspace before asserting
+                    // rejection, so the before-case also releases its fixture.
+                    assert.throws(() => openWorkspace(dbPath).close(), Error);
+                    const unchanged = new DatabaseSync(dbPath);
+                    try {
+                        applyConnectionPragmas(unchanged);
+                        const row = unchanged.prepare("SELECT version FROM schema_version WHERE id = 1")
+                            .get() as { version: unknown };
+                        assert.equal(row.version, invalid);
+                        assert.deepEqual(unchanged.prepare(schemaSql).all(), originalSchema);
+                        for (const { table, rows } of originalRows) {
+                            assert.deepEqual(
+                                unchanged.prepare(`SELECT * FROM ${table} ORDER BY id`).all(),
+                                rows,
+                            );
+                        }
+                    } finally {
+                        unchanged.close();
+                    }
+                } finally {
+                    await cleanup(dbPath);
+                }
+            });
+        }
+    }
+});
+
+test("the v3 migration enforces target uniqueness beyond a legacy partial unique index", async () => {
+    const dbPath = await tmpDbPath();
+    try {
+        const legacy = openWorkspace(dbPath);
+        const { session, terminal } = seed(legacy);
+        downgradeToV2(legacy);
+        legacy.db.exec(
+            "CREATE UNIQUE INDEX terminal_target_subset ON terminal_panes (tmux_target) WHERE name = 'protected'",
+        );
+        legacy.close();
+
+        const upgraded = openWorkspace(dbPath);
+        try {
+            assert.equal(upgraded.getTerminalPane(terminal.id).tmuxTarget, terminal.tmuxTarget);
+            const other = upgraded.createTerminalPane({
+                serverId: SERVER, devSessionId: session.id, name: "not-protected",
+            });
+            // The application's preflight rejects a conflicting adoption too,
+            // but the database backstop must cover rows outside the old filter.
+            assert.throws(
+                () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                    .run(terminal.tmuxTarget, other.id),
+                /UNIQUE constraint failed/,
+            );
+            assert.equal(upgraded.getTerminalPane(other.id).tmuxTarget, other.tmuxTarget);
+            assert.throws(
+                () => upgraded.updateTerminalPane({ id: other.id, tmuxTarget: terminal.tmuxTarget }),
+                isInvalidParams,
+            );
+        } finally {
+            upgraded.close();
+        }
+    } finally {
+        await cleanup(dbPath);
+    }
+});
+
+test("the v4 migration removes every legacy full and partial label uniqueness constraint", async () => {
+    for (const tableConstraint of [false, true]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { session, terminal } = seed(legacy);
+            if (tableConstraint) downgradeToV3Autoindex(legacy);
+            else legacy.db.prepare("UPDATE schema_version SET version = 3 WHERE id = 1").run();
+            legacy.db.exec(`
+                CREATE UNIQUE INDEX terminal_address_first ON terminal_panes (dev_session_id, name);
+                CREATE UNIQUE INDEX terminal_address_second ON terminal_panes (dev_session_id, name);
+                CREATE UNIQUE INDEX terminal_address_reversed ON terminal_panes (name, dev_session_id);
+                CREATE UNIQUE INDEX terminal_address_subset ON terminal_panes (dev_session_id, name)
+                    WHERE name = 'shell';
+            `);
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            try {
+                const fresh = upgraded.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+                assert.notEqual(fresh.id, terminal.id);
+                assert.notEqual(fresh.tmuxTarget, terminal.tmuxTarget);
+                assert.equal(upgraded.getTerminalPane(terminal.id).tmuxTarget, terminal.tmuxTarget);
+                const oldest = upgraded.resolveTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+                assert.equal(oldest.id, terminal.id);
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, fresh.id),
+                    /UNIQUE constraint failed/,
+                );
+            } finally {
+                upgraded.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+test("the v3 migration preserves occupied canonical index names while enforcing global terminal identity", async () => {
+    for (const partial of [true, false]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { group, session, viewer, terminal } = seed(legacy);
+            downgradeToV2(legacy);
+            if (partial) {
+                legacy.db.exec(`
+                    CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON terminal_panes (tmux_target)
+                        WHERE name = 'protected';
+                    CREATE UNIQUE INDEX terminal_panes_address_unique ON terminal_panes (dev_session_id, name)
+                        WHERE name = 'shell';
+                `);
+            } else {
+                // The preferred names may belong to unrelated maintenance
+                // constraints, which the migration must not replace or drop.
+                legacy.db.exec(`
+                    CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON groups (name);
+                    CREATE UNIQUE INDEX terminal_panes_address_unique ON viewer_panes (url);
+                `);
+            }
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            try {
+                assert.deepEqual(upgraded.getSession(session.id), session);
+                assert.equal(upgraded.getTerminalPane(terminal.id).tmuxTarget, terminal.tmuxTarget);
+                const fresh = upgraded.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+                assert.notEqual(fresh.id, terminal.id);
+                assert.notEqual(fresh.tmuxTarget, terminal.tmuxTarget);
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, fresh.id),
+                    /UNIQUE constraint failed/,
+                );
+                assert.equal(upgraded.getTerminalPane(fresh.id).tmuxTarget, fresh.tmuxTarget);
+                assert.equal(upgraded.resolveTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                }).id, terminal.id);
+                if (!partial) {
+                    assert.throws(
+                        () => upgraded.createGroup({ serverId: SERVER, name: group.name }),
+                        /UNIQUE constraint failed/,
+                    );
+                    assert.throws(
+                        () => upgraded.createViewerPane({
+                            serverId: SERVER, devSessionId: session.id, url: viewer.url,
+                        }),
+                        /UNIQUE constraint failed/,
+                    );
+                }
+            } finally {
+                upgraded.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+test("the v6 migration repairs obsolete label constraints already stamped v5 and preserves current fast opens", async () => {
+    for (const tableConstraint of [false, true]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { session, terminal } = seed(legacy);
+            if (tableConstraint) downgradeToV3Autoindex(legacy);
+            else legacy.db.exec(
+                "CREATE UNIQUE INDEX leftover_address ON terminal_panes (dev_session_id, name)",
+            );
+            // Reproduce the old v4 result: it dropped one named index, leaving
+            // another named/table-level rule behind, then recorded schema 5.
+            legacy.db.exec(`
+                CREATE UNIQUE INDEX old_first_address ON terminal_panes (dev_session_id, name);
+                DROP INDEX old_first_address;
+                UPDATE schema_version SET version = 5 WHERE id = 1;
+            `);
+            legacy.db.exec("PRAGMA foreign_keys = OFF");
+            legacy.db.prepare(
+                "INSERT INTO terminal_panes (id, server_id, dev_session_id, name, tmux_target, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ).run("legacy-orphan", SERVER, "missing-legacy-parent", "orphan", "ch_legacy_orphan", 1, 1);
+            legacy.db.exec("PRAGMA foreign_keys = ON");
+            const original = legacy.list(SERVER);
+            const orphan = legacy.getTerminalPane("legacy-orphan");
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            try {
+                assert.deepEqual(upgraded.list(SERVER), original);
+                assert.deepEqual(upgraded.getTerminalPane(orphan.id), orphan);
+                const version = upgraded.db.prepare("SELECT version FROM schema_version WHERE id = 1")
+                    .get() as { version: number };
+                assert.equal(version.version, WORKSPACE_SCHEMA_VERSION);
+                const fresh = upgraded.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+                assert.notEqual(fresh.id, terminal.id);
+                assert.notEqual(fresh.tmuxTarget, terminal.tmuxTarget);
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, fresh.id),
+                    /UNIQUE constraint failed/,
+                );
+                const accepted = upgraded.list(SERVER);
+                const writer = openWorkspace(dbPath);
+                try {
+                    writer.db.exec("BEGIN IMMEDIATE");
+                    // Current opens must not acquire a migration write lock,
+                    // even when another daemon currently owns one.
+                    const reopened = openWorkspace(dbPath);
+                    try {
+                        assert.deepEqual(reopened.list(SERVER), accepted);
+                        assert.deepEqual(reopened.getTerminalPane(orphan.id), orphan);
+                    } finally {
+                        reopened.close();
+                    }
+                } finally {
+                    writer.db.exec("ROLLBACK");
+                    writer.close();
+                }
+            } finally {
+                upgraded.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+test("the v6 migration repairs partial-only v5 targets without renaming valid duplicate labels", async () => {
+    for (const indexName of ["terminal_target_subset", "terminal_panes_tmux_target_unique"]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { session, terminal } = seed(legacy);
+            const duplicate = legacy.createTerminalPane({
+                serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                workingDirectory: "/keep/working", startupCommand: "printf keep", harness: "generic",
+            });
+            downgradeToV2(legacy);
+            legacy.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                .run(terminal.tmuxTarget, duplicate.id);
+            legacy.db.exec(
+                `CREATE UNIQUE INDEX ${quotedIdentifier(indexName)} ON terminal_panes (tmux_target) WHERE name = 'protected'`,
+            );
+            legacy.db.exec("UPDATE schema_version SET version = 5 WHERE id = 1");
+            const original = legacy.list(SERVER);
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            try {
+                assert.deepEqual(upgraded.getTerminalPane(terminal.id), terminal);
+                const repaired = upgraded.getTerminalPane(duplicate.id);
+                assert.equal(repaired.name, terminal.name);
+                assert.ok(repaired.tmuxTarget);
+                assert.notEqual(repaired.tmuxTarget, terminal.tmuxTarget);
+                assert.deepEqual({ ...repaired, tmuxTarget: duplicate.tmuxTarget }, duplicate);
+                const expected = original;
+                expected[0].sessions[0].terminalPanes[1] = repaired;
+                assert.deepEqual(upgraded.list(SERVER), expected);
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, repaired.id),
+                    /UNIQUE constraint failed/,
+                );
+                const reopened = openWorkspace(dbPath);
+                try {
+                    assert.deepEqual(reopened.list(SERVER), expected);
+                    assert.deepEqual(reopened.getTerminalPane(repaired.id), repaired);
+                    assert.equal(reopened.resolveTerminalPane({
+                        serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                    }).id, terminal.id);
+                } finally {
+                    reopened.close();
+                }
+            } finally {
+                upgraded.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+test("the v6 migration rolls back target repairs and constraint changes if version recording fails", async () => {
+    const dbPath = await tmpDbPath();
+    try {
+        const legacy = openWorkspace(dbPath);
+        const { session, terminal } = seed(legacy);
+        const duplicate = legacy.createTerminalPane({
+            serverId: SERVER, devSessionId: session.id, name: terminal.name,
+        });
+        downgradeToV2(legacy);
+        legacy.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+            .run(terminal.tmuxTarget, duplicate.id);
+        legacy.db.exec(`
+            CREATE UNIQUE INDEX terminal_panes_tmux_target_unique ON terminal_panes (tmux_target)
+                WHERE name = 'protected';
+            CREATE UNIQUE INDEX terminal_panes_address_unique ON terminal_panes (dev_session_id, name)
+                WHERE name = 'protected';
+            UPDATE schema_version SET version = 5 WHERE id = 1;
+            CREATE TRIGGER reject_upgrade_version BEFORE UPDATE OF version ON schema_version
+                BEGIN SELECT RAISE(ABORT, 'injected version storage failure'); END;
+        `);
+        const schemaSql = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        const originalSchema = legacy.db.prepare(schemaSql).all();
+        const original = legacy.list(SERVER);
+        legacy.close();
+
+        assert.throws(() => openWorkspace(dbPath).close(), Error);
+        const unchangedDb = new DatabaseSync(dbPath);
+        try {
+            applyConnectionPragmas(unchangedDb);
+            const unchanged = new Workspace(unchangedDb);
+            assert.deepEqual(unchanged.list(SERVER), original);
+            assert.deepEqual(unchangedDb.prepare(schemaSql).all(), originalSchema);
+            const version = unchangedDb.prepare("SELECT version FROM schema_version WHERE id = 1")
+                .get() as { version: number };
+            assert.equal(version.version, 5);
+            unchangedDb.exec("DROP TRIGGER reject_upgrade_version");
+        } finally {
+            unchangedDb.close();
+        }
+        const retried = openWorkspace(dbPath);
+        try {
+            const repaired = retried.getTerminalPane(duplicate.id);
+            assert.notEqual(repaired.tmuxTarget, terminal.tmuxTarget);
+            assert.equal(repaired.name, terminal.name);
+            const fresh = retried.createTerminalPane({
+                serverId: SERVER, devSessionId: session.id, name: terminal.name,
+            });
+            assert.notEqual(fresh.tmuxTarget, repaired.tmuxTarget);
+            assert.throws(
+                () => retried.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                    .run(terminal.tmuxTarget, repaired.id),
+                /UNIQUE constraint failed/,
+            );
+        } finally {
+            retried.close();
+        }
+    } finally {
+        await cleanup(dbPath);
+    }
+});
+
+test("workspace migrations remove NULL-filtered label rules before vacating duplicated targets", async () => {
+    for (const version of [2, 5]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { session, terminal } = seed(legacy);
+            for (let index = 0; index < 2; index++) {
+                legacy.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+            }
+            downgradeToV2(legacy);
+            legacy.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE dev_session_id = ?")
+                .run(terminal.tmuxTarget, session.id);
+            legacy.db.exec(`
+                CREATE UNIQUE INDEX terminal_target_subset ON terminal_panes (tmux_target)
+                    WHERE name = 'protected';
+                CREATE UNIQUE INDEX terminal_label_null_subset ON terminal_panes (dev_session_id, name)
+                    WHERE tmux_target IS NULL;
+            `);
+            legacy.db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(version);
+            const before = legacy.list(SERVER)[0].sessions[0];
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            let accepted: GroupNode[];
+            try {
+                const after = upgraded.list(SERVER)[0].sessions[0];
+                assert.equal(after.terminalPanes.length, 3);
+                assert.deepEqual(after.layouts, before.layouts);
+                assert.equal(upgraded.getTerminalPane(terminal.id).tmuxTarget, terminal.tmuxTarget);
+                assert.equal(upgraded.getTerminalPane(terminal.id).name, terminal.name);
+                assert.equal(new Set(after.terminalPanes.map((pane) => pane.tmuxTarget)).size, 3);
+                assert.equal(
+                    new Set(after.terminalPanes.map((pane) => pane.name)).size,
+                    version === 2 ? 3 : 1,
+                );
+                for (const pane of before.terminalPanes) {
+                    const repaired = upgraded.getTerminalPane(pane.id);
+                    if (version === 5) assert.equal(repaired.name, pane.name);
+                    else if (pane.id !== terminal.id) assert.notEqual(repaired.name, pane.name);
+                    assert.deepEqual({ ...repaired, name: pane.name, tmuxTarget: pane.tmuxTarget }, pane);
+                    assert.ok(repaired.tmuxTarget);
+                }
+                const fresh = upgraded.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                });
+                assert.notEqual(fresh.tmuxTarget, terminal.tmuxTarget);
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, fresh.id),
+                    /UNIQUE constraint failed/,
+                );
+                accepted = upgraded.list(SERVER);
+            } finally {
+                upgraded.close();
+            }
+            const reopened = openWorkspace(dbPath);
+            try {
+                assert.deepEqual(reopened.list(SERVER), accepted);
+                assert.equal(reopened.resolveTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                }).id, terminal.id);
+            } finally {
+                reopened.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+function installTerminalMaintenanceSchema(ws: Workspace): void {
+    ws.db.exec(`
+        CREATE UNIQUE INDEX "startup""constraint" ON terminal_panes (startup_command);
+        CREATE UNIQUE INDEX "target""constraint" ON terminal_panes (tmux_target);
+        CREATE TABLE workspace_terminal_audit (event TEXT NOT NULL, pane_id TEXT NOT NULL);
+        CREATE TRIGGER "audit""insert" AFTER INSERT ON terminal_panes
+            BEGIN INSERT INTO workspace_terminal_audit VALUES ('insert', NEW.id); END;
+        CREATE TRIGGER "audit""update" AFTER UPDATE ON terminal_panes
+            BEGIN INSERT INTO workspace_terminal_audit VALUES ('update', NEW.id); END;
+        CREATE TRIGGER "audit""delete" AFTER DELETE ON terminal_panes
+            BEGIN INSERT INTO workspace_terminal_audit VALUES ('delete', OLD.id); END;
+    `);
+}
+
+test("terminal table rebuilds retain maintenance constraints and future-write triggers without auditing the copy", async () => {
+    for (const version of [3, 5]) {
+        const dbPath = await tmpDbPath();
+        try {
+            const legacy = openWorkspace(dbPath);
+            const { session, terminal } = seed(legacy);
+            downgradeToV3Autoindex(legacy);
+            installTerminalMaintenanceSchema(legacy);
+            legacy.db.prepare("UPDATE schema_version SET version = ? WHERE id = 1").run(version);
+            const before = legacy.list(SERVER);
+            legacy.close();
+
+            const upgraded = openWorkspace(dbPath);
+            try {
+                assert.deepEqual(upgraded.list(SERVER), before);
+                assert.deepEqual(upgraded.db.prepare("SELECT * FROM workspace_terminal_audit").all(), []);
+                assert.equal(uniqueTmuxTargetIndexes(upgraded).length, 1);
+                assert.throws(
+                    () => upgraded.createTerminalPane({
+                        serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                        startupCommand: terminal.startupCommand,
+                    }),
+                    /UNIQUE constraint failed/,
+                );
+                const fresh = upgraded.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                    startupCommand: "fresh command",
+                });
+                assert.throws(
+                    () => upgraded.updateTerminalPane({
+                        id: fresh.id, startupCommand: terminal.startupCommand,
+                    }),
+                    /UNIQUE constraint failed/,
+                );
+                assert.equal(upgraded.getTerminalPane(fresh.id).startupCommand, "fresh command");
+                assert.throws(
+                    () => upgraded.db.prepare("UPDATE terminal_panes SET tmux_target = ? WHERE id = ?")
+                        .run(terminal.tmuxTarget, fresh.id),
+                    /UNIQUE constraint failed/,
+                );
+                upgraded.updateTerminalPane({ id: fresh.id, startupCommand: "changed command" });
+                upgraded.deleteTerminalPane({ id: fresh.id });
+                const audit = upgraded.db.prepare(
+                    "SELECT event, pane_id FROM workspace_terminal_audit ORDER BY rowid",
+                ).all() as unknown as Array<{ event: string; pane_id: string }>;
+                assert.deepEqual(audit.map((row) => row.event), ["insert", "update", "delete"]);
+                assert.equal(audit.every((row) => row.pane_id === fresh.id), true);
+                assert.equal(upgraded.getTerminalPane(terminal.id).startupCommand, terminal.startupCommand);
+            } finally {
+                upgraded.close();
+            }
+        } finally {
+            await cleanup(dbPath);
+        }
+    }
+});
+
+test("terminal table rebuild rollback restores maintenance constraints and audit triggers", async () => {
+    const dbPath = await tmpDbPath();
+    try {
+        const legacy = openWorkspace(dbPath);
+        const { session, terminal } = seed(legacy);
+        downgradeToV3Autoindex(legacy);
+        installTerminalMaintenanceSchema(legacy);
+        legacy.db.exec(`
+            UPDATE schema_version SET version = 5 WHERE id = 1;
+            CREATE TRIGGER reject_rebuild_version BEFORE UPDATE OF version ON schema_version
+                BEGIN SELECT RAISE(ABORT, 'injected rebuild version failure'); END;
+        `);
+        const schemaSql = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        const beforeSchema = legacy.db.prepare(schemaSql).all();
+        const before = legacy.list(SERVER);
+        legacy.close();
+
+        assert.throws(() => openWorkspace(dbPath).close(), Error);
+        const db = new DatabaseSync(dbPath);
+        try {
+            applyConnectionPragmas(db);
+            const unchanged = new Workspace(db);
+            assert.deepEqual(db.prepare(schemaSql).all(), beforeSchema);
+            assert.deepEqual(unchanged.list(SERVER), before);
+            assert.deepEqual(db.prepare("SELECT * FROM workspace_terminal_audit").all(), []);
+            const version = db.prepare("SELECT version FROM schema_version WHERE id = 1")
+                .get() as { version: number };
+            assert.equal(version.version, 5);
+            db.exec("DROP TRIGGER reject_rebuild_version");
+        } finally {
+            db.close();
+        }
+        const retried = openWorkspace(dbPath);
+        try {
+            assert.deepEqual(retried.list(SERVER), before);
+            assert.deepEqual(retried.db.prepare("SELECT * FROM workspace_terminal_audit").all(), []);
+            assert.throws(
+                () => retried.createTerminalPane({
+                    serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                    startupCommand: terminal.startupCommand,
+                }),
+                /UNIQUE constraint failed/,
+            );
+            const fresh = retried.createTerminalPane({
+                serverId: SERVER, devSessionId: session.id, name: terminal.name,
+                startupCommand: "after retry",
+            });
+            const audit = retried.db.prepare(
+                "SELECT event, pane_id FROM workspace_terminal_audit ORDER BY rowid",
+            ).all() as unknown as Array<{ event: string; pane_id: string }>;
+            assert.deepEqual(audit.map((row) => row.event), ["insert"]);
+            assert.equal(audit[0].pane_id, fresh.id);
+        } finally {
+            retried.close();
+        }
+    } finally {
+        await cleanup(dbPath);
     }
 });

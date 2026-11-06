@@ -26,6 +26,11 @@ namespace ch {
 
 namespace {
 
+// Provisioning reports are small; a noisy or broken login command must not
+// turn the multi-minute install budget into an unbounded GUI-process buffer.
+constexpr qsizetype kMaximumScriptOutputBytes = 1024 * 1024;
+constexpr qsizetype kMaximumScriptDiagnosticChars = 64 * 1024;
+
 // Quote one argv element for the remote login shell. SSH exec requests carry a
 // single command string that the server hands to the user's shell, so paths
 // with spaces (or anything else shell-special) must be protected.
@@ -528,6 +533,14 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                        "flock or unpack the remote release manually"))
                  + QStringLiteral(" >&2; exit 1; fi");
     steps << QStringLiteral("mkdir -p ") + root;
+    // A syntactically non-root path can still resolve to / through symlinks.
+    // Check on the server before creating even the installation lock.
+    steps << QStringLiteral("__ch_root=$(cd ") + root
+                 + QStringLiteral(" && pwd -P)");
+    steps << QStringLiteral("if [ \"$__ch_root\" = / ]; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: refusing to install into the filesystem root"))
+                 + QStringLiteral(" >&2; exit 1; fi");
     // Acquire before reading/recovering ANY shared journal. A ready sentinel
     // proves completeness, not that the process which wrote it has died.
     steps << QStringLiteral("if [ -L ") + installLock
@@ -543,6 +556,20 @@ QString SessionBootstrap::remoteProvisionScript(const QString& repoRoot,
                  + shellQuote(QStringLiteral(
                        "codeharbor: cannot acquire the installation lock; "
                        "another installer may own this directory"))
+                 + QStringLiteral(" >&2; exit 1; fi");
+    // Recovery reads through the scratch directory before recreating it, and
+    // marker writes use redirection/cp. Neither may follow a pre-existing link
+    // into a different tree or open a FIFO/device.
+    steps << QStringLiteral("if [ -L ") + scratch
+                 + QStringLiteral(" ] || { [ -e ") + scratch
+                 + QStringLiteral(" ] && [ ! -d ") + scratch
+                 + QStringLiteral(" ]; } || [ -L ") + marker
+                 + QStringLiteral(" ] || { [ -e ") + marker
+                 + QStringLiteral(" ] && [ ! -f ") + marker
+                 + QStringLiteral(" ]; }; then echo ")
+                 + shellQuote(QStringLiteral(
+                       "codeharbor: unsafe provisioning scratch or release marker "
+                       "path; expected a real directory and a regular file"))
                  + QStringLiteral(" >&2; exit 1; fi");
 
     // ---- the undo ---------------------------------------------------------
@@ -1362,6 +1389,9 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
                 if (!diagnostics.isEmpty())
                     diagnostics += QStringLiteral("; ");
                 diagnostics += trimmed;
+                if (diagnostics.size() > kMaximumScriptDiagnosticChars)
+                    diagnostics.remove(
+                        0, diagnostics.size() - kMaximumScriptDiagnosticChars);
                 if (self)
                     emit self->channelDiagnostic(role, trimmed);
             });
@@ -1384,14 +1414,22 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     qsizetype published = 0;
     bool finished = false;
     bool timedOut = false;
+    bool outputOverflow = false;
 
     // Drain whatever has arrived and republish every COMPLETE progress line.
     // `published` is how far the republishing has got, so a line split across
     // two reads is emitted once and whole.
-    const auto drain = [self, &device, &collected, &published] {
-        if (!self)
+    const auto drain = [self, &device, &collected, &published, &outputOverflow,
+                        &loop] {
+        if (!self || outputOverflow)
             return;
-        collected += device.readAll();
+        collected += device.read(kMaximumScriptOutputBytes - collected.size() + 1);
+        if (collected.size() > kMaximumScriptOutputBytes) {
+            collected.truncate(kMaximumScriptOutputBytes);
+            outputOverflow = true;
+            loop.quit();
+            return;
+        }
         qsizetype newline = collected.indexOf('\n', published);
         while (newline >= 0) {
             const QString line =
@@ -1468,6 +1506,13 @@ bool SessionBootstrap::runRemoteScript(const QString& script, int timeoutMs,
     if (m_cancelRequested) {
         if (error)
             *error = QStringLiteral("cancelled");
+        return false;
+    }
+    if (outputOverflow) {
+        if (error)
+            *error = QStringLiteral("the remote command exceeded the %1-byte "
+                                    "output limit")
+                         .arg(kMaximumScriptOutputBytes);
         return false;
     }
     if (timedOut) {
@@ -1758,7 +1803,14 @@ bool SessionBootstrap::ensureRemoteService()
     setState(resume);
     if (!self || m_cancelRequested)
         return false;
-    if (!ran || !installLog.contains(installedMarker())) {
+    // A path/URL in a progress line may itself contain "codeharbor: installed".
+    // Only the dedicated verdict line (including its entry-path separator)
+    // can claim that the swap committed.
+    const QString verdict = installedMarker() + QLatin1Char(' ');
+    const bool reportedSuccess =
+        installLog.startsWith(verdict)
+        || installLog.contains(QLatin1Char('\n') + verdict);
+    if (!ran || !reportedSuccess) {
         const QString reason =
             tr("Could not install the CodeHarbor remote service into \"%1\" on "
                "%2 from %3: %4")
@@ -2317,6 +2369,12 @@ bool SessionBootstrap::connectAndWireFromEnvironment()
 {
     if (qEnvironmentVariableIsEmpty("CH_LIVE_SSH"))
         return false;  // normal desktop launch: no server, nothing to wire
+    // Refuse before changing the trust scope or known-host store. The direct
+    // entry point's guard is too late for this wrapper's configuration writes.
+    if (m_attempting || m_connectRequested) {
+        emit error(QStringLiteral("a connection attempt is already in progress"));
+        return false;
+    }
 
     const QString host = qEnvironmentVariable("CH_LIVE_HOST");
     const QString user = qEnvironmentVariable("CH_LIVE_USER");

@@ -133,9 +133,9 @@ public:
     // an empty `terminalPaneId` is the legacy label lookup, and the mobile pane
     // picker fills the row id in for every leaf that has one.
     //
-    // `cols`/`rows` at or below 0 mean "the view has not reported a size yet",
-    // which lets the factory open at the conventional 80x24 rather than snapping
-    // an already-laid-out pane back to it.
+    // `cols`/`rows` at or below 0 mean "the view has not reported a size yet".
+    // Positive geometry resizes both the local screen and an existing PTY;
+    // an initial open with no geometry uses the factory's conventional 80x24.
     Q_INVOKABLE void open(const QString &devSessionId,
                           const QString &paneId,
                           const QString &terminalPaneId,

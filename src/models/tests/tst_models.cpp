@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
@@ -98,6 +99,8 @@ private slots:
     void identifierWrappersAreHashable();
     void updateTerminalStatesFinishesEveryRowBeforeSignalling();
     void updateTerminalStatesStopsSignallingAfterAReentrantReset();
+    void updateTerminalStateObserverMayDestroyTheModel();
+    void resetObserverMayDestroyTheModel();
     void oklchRoundTripsSrgb();
     void paletteRejectsTooSmallRequest();
     void paletteOnlyAppendsToSeed();
@@ -1877,6 +1880,59 @@ void TstModels::updateTerminalStatesStopsSignallingAfterAReentrantReset()
         QCOMPARE(changed.count(), 1);
         QCOMPARE(reset.count(), 1);
         QCOMPARE(model.rowCount(), 0);
+    }
+}
+
+void TstModels::updateTerminalStateObserverMayDestroyTheModel()
+{
+    QPointer<SessionsModel> model = new SessionsModel;
+    GroupRow group;
+    group.group.id = GroupId{QStringLiteral("g")};
+    SessionRow session;
+    session.terminals = {terminal(TerminalState::Ready, AgentState::Idle)};
+    group.sessions = {session, session};
+    model->setGroups({group});
+    int changes = 0;
+    connect(model, &QAbstractItemModel::dataChanged, this, [&] {
+        ++changes;
+        delete model.data();
+    });
+
+    group.sessions[0].terminals[0].agent = AgentState::Error;
+    group.sessions[1].terminals[0].agent = AgentState::Error;
+    model->updateTerminalStates({group});
+
+    QVERIFY(model.isNull());
+    QCOMPARE(changes, 1);
+}
+
+void TstModels::resetObserverMayDestroyTheModel()
+{
+    for (int operation = 0; operation < 3; ++operation) {
+        QPointer<SessionsModel> model = new SessionsModel;
+        int resets = 0;
+        connect(model, &QAbstractItemModel::modelReset, this, [&] {
+            ++resets;
+            delete model.data();
+        });
+
+        switch (operation) {
+        case 0: {
+            GroupRow group;
+            group.sessions = {SessionRow{}};
+            model->setGroups({group});
+            break;
+        }
+        case 1:
+            model->setPinnedOnly(true);
+            break;
+        case 2:
+            model->setShowArchived(true);
+            break;
+        }
+
+        QVERIFY(model.isNull());
+        QCOMPARE(resets, 1);
     }
 }
 

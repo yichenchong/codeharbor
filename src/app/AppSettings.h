@@ -150,7 +150,8 @@ public:
                               const QVariant& value);
 
     // Every named preference back to its documented default, and every generic
-    // key removed. Emits one change signal per property that actually moved.
+    // key removed. Emits one change signal per property that actually moved,
+    // stopping immediately if a synchronous observer destroys this object.
     Q_INVOKABLE void resetToDefaults();
 
 signals:
